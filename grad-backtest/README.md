@@ -241,6 +241,27 @@ Then, if the numbers beat the plain TP/SL/time-stop run, set `TRAILING_STOP`
 backtest sample, not from one chart — a single example proves the mechanism,
 not the parameter.
 
+### Restart safety, rent reclaim, and stuck positions (live mode)
+
+Learned from a night where restarts stranded six positions and 59 empty token
+accounts held ~0.12 SOL of rent:
+
+- **Wallet reconciliation at startup.** The executor scans every token account
+  the wallet holds. Untracked holdings worth at least `MIN_ADOPT_USD` (default
+  $1) are adopted as managed positions with basis = current value and the clock
+  starting now, so a restart can never strand a bag again. Holdings under the
+  threshold are left untouched (nothing the wallet held before the bot is ever
+  burned), and quote tokens are ignored.
+- **Rent reclaim.** Empty token accounts are closed at startup, and each full
+  sell closes its account afterwards (burning any dust first — only on tokens
+  the bot bought). Each close returns ~0.002 SOL. `CLOSE_EMPTY_ACCOUNTS=0`
+  disables both.
+- **Stuck positions.** A position whose sells keep failing for
+  `STUCK_AFTER_MINUTES` (default 15) past its time stop, with at least three
+  consecutive failures, is moved to `state.stuck` so it stops blocking a slot.
+  It stays visible on the dashboard, `panic` still tries to liquidate it, and
+  the log says to sell it manually.
+
 ### Scale-out / partial take-profit (off by default — backtest it first)
 
 A position that reaches +40% and then rugs is worth nothing under a single
