@@ -25,6 +25,14 @@ class ClusterMathTests(unittest.TestCase):
         self.assertEqual((slot, n), (10, 6))
         self.assertAlmostEqual(pct, 48.0, places=1)
 
+    def test_creator_linked_cluster_and_top_ten_pct(self):
+        funders = {"dev": "origin", "w1": "dev", "w2": "dev", "other": "elsewhere"}
+        amounts = {"dev": 0.05, "w1": 0.07, "w2": 0.08, "other": 0.02}
+        members = ba.related_holder_wallets(funders, "dev", set())
+        self.assertEqual(set(members), {"dev", "w1", "w2"})
+        self.assertAlmostEqual(ba.wallets_supply_pct(members, amounts, 1.0), 20.0)
+        self.assertAlmostEqual(ba.top_wallets_supply_pct(amounts, 1.0, 3), 20.0)
+
 
 class GuardReasonShapeTests(unittest.TestCase):
     def test_runner_style_split_clears_single_holder_and_trips_cluster(self):
