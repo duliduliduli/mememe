@@ -50,13 +50,14 @@ LAMPORTS = 1_000_000_000
 TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 TOKEN_ACCOUNT_RENT_SOL = 0.00203928
+SYSTEM_PROGRAM = "11111111111111111111111111111111"
 
 SKIPS_FILE = DATA_DIR / "skips.csv"
 
 TRADE_COLUMNS = [
     "opened_at", "closed_at", "mint", "mode", "position_usd", "exit_usd",
     "net_return", "exit_reason", "buy_signature", "sell_signature", "entry_price_impact_pct",
-    "peak_gain_pct", "entry_market_cap_usd",
+    "peak_gain_pct", "entry_market_cap_usd", "entry_curve_age_seconds", "entry_top_holder_pct",
 ]
 
 
@@ -115,6 +116,15 @@ class Config:
         # and we would be buying the top of someone else's pump, which then dumps into us.
         # Observed live: 15-holder tokens at $5M, $150M caps one minute old. 0 disables.
         self.max_entry_market_cap_usd = float(os.getenv("MAX_ENTRY_MARKET_CAP_USD", "300000"))
+        # Floor: graduation is ~$69k, so a token far below that a minute later was already dumped
+        # into its own pool. SOLL: the creator sold 78% of supply 24s after migration and we bought
+        # at a $450 cap. Overnight, sub-$30k entries went 1 for 7. 0 disables.
+        self.min_entry_market_cap_usd = float(os.getenv("MIN_ENTRY_MARKET_CAP_USD", "25000"))
+        # Bundle guards. A curve that fills in seconds was bought by one party (SOLL graduated 29s
+        # after creation with six buyers), and a wallet holding a big slice of supply at entry is
+        # the one that dumps on us (SOLL's creator held 59% at graduation). 0 disables either.
+        self.min_curve_age_seconds = float(os.getenv("MIN_CURVE_AGE_SECONDS", "120"))
+        self.max_top_holder_pct = float(os.getenv("MAX_TOP_HOLDER_PCT", "20"))
         self.max_entry_lateness_seconds = float(os.getenv("MAX_ENTRY_LATENESS_SECONDS", "60"))
         # Startup wallet reconciliation (live only): adopt untracked holdings worth at least
         # MIN_ADOPT_USD as managed positions so a restart never strands a bag, and close empty
@@ -229,8 +239,12 @@ def entry_guard_reason(
     now: float,
     price_impact_pct: float | None,
     market_cap_usd: float | None = None,
+    curve_age_seconds: float | None = None,
+    top_holder_pct: float | None = None,
 ) -> str | None:
-    """Reject entries that are no longer the trade the backtest models."""
+    """Reject entries that are no longer the trade the backtest models.
+
+    Unknown inputs (None) never block: a failed metadata lookup is logged, not traded on."""
     lateness = now - (graduated_ts + cfg.entry_delay_seconds)
     if lateness > cfg.max_entry_lateness_seconds:
         return f"stale entry: {lateness:.0f}s past target"
@@ -244,6 +258,33 @@ def entry_guard_reason(
         return (
             f"market cap ${market_cap_usd:,.0f} > ${cfg.max_entry_market_cap_usd:,.0f} "
             "(already pumped far past graduation)"
+        )
+    if (
+        market_cap_usd is not None
+        and cfg.min_entry_market_cap_usd > 0
+        and market_cap_usd < cfg.min_entry_market_cap_usd
+    ):
+        return (
+            f"market cap ${market_cap_usd:,.0f} < ${cfg.min_entry_market_cap_usd:,.0f} "
+            "(already dumped since graduation)"
+        )
+    if (
+        curve_age_seconds is not None
+        and cfg.min_curve_age_seconds > 0
+        and curve_age_seconds < cfg.min_curve_age_seconds
+    ):
+        return (
+            f"graduated {curve_age_seconds:.0f}s after creation < {cfg.min_curve_age_seconds:.0f}s "
+            "(curve filled by one buyer: bundle)"
+        )
+    if (
+        top_holder_pct is not None
+        and cfg.max_top_holder_pct > 0
+        and top_holder_pct > cfg.max_top_holder_pct
+    ):
+        return (
+            f"top wallet holds {top_holder_pct:.1f}% of supply > {cfg.max_top_holder_pct:.0f}% "
+            "(one holder can dump the pool)"
         )
     return None
 
@@ -334,6 +375,63 @@ class Rpc:
         """(circulating supply in UI units, decimals) for a mint."""
         value = self.call("getTokenSupply", [mint])["value"]
         return float(value["uiAmountString"]), int(value["decimals"])
+
+    def mint_first_seen(self, mint: str, stop_before_ts: float, max_pages: int = 3) -> float | None:
+        """Block time of the mint's earliest transaction. Stops paging early once it has seen a
+        transaction older than stop_before_ts, since that already proves the token is at least
+        that old, and returns the oldest time seen. None when the history is too long to
+        conclude within max_pages (a busy, established token), which the caller treats as
+        unknown rather than as a rejection."""
+        before: str | None = None
+        oldest: float | None = None
+        for _ in range(max_pages):
+            opts: dict[str, Any] = {"limit": 1000}
+            if before:
+                opts["before"] = before
+            sigs = self.call("getSignaturesForAddress", [mint, opts]) or []
+            times = [s["blockTime"] for s in sigs if s.get("blockTime")]
+            if times:
+                page_oldest = min(times)
+                oldest = page_oldest if oldest is None else min(oldest, page_oldest)
+            if len(sigs) < 1000:
+                return oldest
+            if oldest is not None and oldest < stop_before_ts:
+                return oldest
+            before = sigs[-1]["signature"]
+        return None
+
+    def top_wallet_holder(self, mint: str, exclude: set[str] | None = None) -> tuple[str, int] | None:
+        """(owner, raw amount) of the largest plain-wallet holder among the mint's 20 largest
+        token accounts. Accounts owned by programs (AMM pools, bonding curves, Mayhem vaults)
+        cannot dump on us and are skipped, as are owners in `exclude` (our own wallet)."""
+        exclude = exclude or set()
+        largest = self.call("getTokenLargestAccounts", [mint]).get("value") or []
+        if not largest:
+            return None
+        addresses = [entry["address"] for entry in largest]
+        accounts = self.call("getMultipleAccounts", [addresses, {"encoding": "jsonParsed"}]).get("value") or []
+        owners: list[tuple[str, int]] = []
+        for entry, acct in zip(largest, accounts):
+            if not acct:
+                continue
+            try:
+                owner = acct["data"]["parsed"]["info"]["owner"]
+            except (KeyError, TypeError):
+                continue
+            owners.append((owner, int(entry["amount"])))
+        if not owners:
+            return None
+        owner_accounts = self.call(
+            "getMultipleAccounts", [[owner for owner, _ in owners], {"encoding": "base64"}]
+        ).get("value") or []
+        best: tuple[str, int] | None = None
+        for (owner, amount), acct in zip(owners, owner_accounts):
+            program = acct["owner"] if acct else SYSTEM_PROGRAM  # unfunded wallet: still a wallet
+            if program != SYSTEM_PROGRAM or owner in exclude:
+                continue
+            if best is None or amount > best[1]:
+                best = (owner, amount)
+        return best
 
     def send_raw(self, raw: bytes) -> str:
         return self.call(
@@ -485,6 +583,40 @@ class Executor:
         record_skip(mint, reason)
         log(f"SKIP {mint}: {reason}")
 
+    def entry_metadata(
+        self, mint: str, graduated_ts: float, size_usd: float, tokens: int
+    ) -> tuple[float | None, float | None, float | None, str | None]:
+        """(market cap, seconds from creation to graduation, top wallet holder %, that wallet).
+        Every lookup is optional: a failure is logged and leaves that value None, because an
+        entry must never be blocked, or forced, by a metadata call that timed out."""
+        cfg = self.cfg
+        market_cap = curve_age = top_holder_pct = None
+        top_holder = None
+        supply_ui = decimals = None
+        if cfg.max_entry_market_cap_usd > 0 or cfg.min_entry_market_cap_usd > 0 or cfg.max_top_holder_pct > 0:
+            try:
+                supply_ui, decimals = self.rpc.token_supply(mint)
+                market_cap = entry_market_cap_usd(size_usd, tokens, supply_ui, decimals)
+            except Exception as exc:
+                log(f"WARN {mint}: market cap check unavailable ({describe_error(exc)})")
+        if cfg.min_curve_age_seconds > 0:
+            try:
+                created = self.rpc.mint_first_seen(mint, graduated_ts - cfg.min_curve_age_seconds)
+                if created is not None:
+                    curve_age = max(0.0, graduated_ts - created)
+            except Exception as exc:
+                log(f"WARN {mint}: curve age check unavailable ({describe_error(exc)})")
+        if cfg.max_top_holder_pct > 0 and supply_ui:
+            try:
+                exclude = {self.wallet.pubkey} if self.wallet else set()
+                holder = self.rpc.top_wallet_holder(mint, exclude)
+                if holder:
+                    top_holder, amount = holder
+                    top_holder_pct = amount / (10 ** decimals) / supply_ui * 100
+            except Exception as exc:
+                log(f"WARN {mint}: holder concentration check unavailable ({describe_error(exc)})")
+        return market_cap, curve_age, top_holder_pct, top_holder
+
     def try_enter(self, item: dict[str, Any], sol_price: float) -> None:
         mint = item["mint"]
         daily_pnl = float(self.state["daily"]["realized_pnl_usd"])
@@ -498,16 +630,13 @@ class Executor:
         if tokens <= 0:
             raise RuntimeError("zero-token quote")
         impact = quote_price_impact_pct(quote)
-        market_cap = None
-        if self.cfg.max_entry_market_cap_usd > 0:
-            try:
-                supply_ui, decimals = self.rpc.token_supply(mint)
-                market_cap = entry_market_cap_usd(size_usd, tokens, supply_ui, decimals)
-            except Exception as exc:
-                # Never block an entry because a metadata lookup failed; log and continue.
-                log(f"WARN {mint}: market cap check unavailable ({describe_error(exc)})")
-        guard = entry_guard_reason(self.cfg, item["graduated_ts"], now_ts(), impact, market_cap)
+        market_cap, curve_age, top_holder_pct, top_holder = self.entry_metadata(mint, item["graduated_ts"], size_usd, tokens)
+        guard = entry_guard_reason(
+            self.cfg, item["graduated_ts"], now_ts(), impact, market_cap, curve_age, top_holder_pct
+        )
         if guard:
+            if top_holder and "top wallet" in guard:
+                guard += f" [{top_holder}]"
             self.skip(mint, guard)
             return
         # Honeypot guard: a token you can buy but not sell has no reverse route.
@@ -544,6 +673,8 @@ class Executor:
                 "buy_signature": buy_sig,
                 "entry_price_impact_pct": impact,
                 "entry_market_cap_usd": round(market_cap) if market_cap else None,
+                "entry_curve_age_seconds": round(curve_age) if curve_age is not None else None,
+                "entry_top_holder_pct": round(top_holder_pct, 1) if top_holder_pct is not None else None,
                 "peak_usd": size_usd,
             }
         )
@@ -678,6 +809,8 @@ class Executor:
                     "buy_signature": "adopted",
                     "entry_price_impact_pct": None,
                     "entry_market_cap_usd": None,
+                    "entry_curve_age_seconds": None,
+                    "entry_top_holder_pct": None,
                     "peak_usd": value,
                     "adopted": True,
                 }
@@ -706,6 +839,8 @@ class Executor:
                 "sell_signature": sell_sig,
                 "entry_price_impact_pct": pos.get("entry_price_impact_pct"),
                 "entry_market_cap_usd": pos.get("entry_market_cap_usd"),
+                "entry_curve_age_seconds": pos.get("entry_curve_age_seconds"),
+                "entry_top_holder_pct": pos.get("entry_top_holder_pct"),
                 "peak_gain_pct": round(peak_gain * 100, 1) if peak_gain is not None else None,
             }
         )
@@ -784,6 +919,8 @@ class Executor:
                 "sell_signature": sig,
                 "entry_price_impact_pct": pos.get("entry_price_impact_pct"),
                 "entry_market_cap_usd": pos.get("entry_market_cap_usd"),
+                "entry_curve_age_seconds": pos.get("entry_curve_age_seconds"),
+                "entry_top_holder_pct": pos.get("entry_top_holder_pct"),
                 "peak_gain_pct": round(peak_gain * 100, 1) if peak_gain is not None else None,
             }
         )
@@ -844,7 +981,9 @@ class Executor:
             f"time_stop={self.cfg.time_stop_minutes:.0f}m trail={self.cfg.trailing_stop:.0%} "
             f"scale_out={self.cfg.scale_out_at:.0%}x{self.cfg.scale_out_fraction:.0%} moon_bag={self.cfg.moon_bag:.0%} "
             f"slippage={self.cfg.slippage_bps}/{self.cfg.sell_slippage_bps}bps(buy/sell) "
-            f"max_mcap=${self.cfg.max_entry_market_cap_usd:,.0f} adopt>=${self.cfg.min_adopt_usd} "
+            f"mcap=${self.cfg.min_entry_market_cap_usd:,.0f}-${self.cfg.max_entry_market_cap_usd:,.0f} "
+            f"curve_age>={self.cfg.min_curve_age_seconds:.0f}s top_holder<={self.cfg.max_top_holder_pct:.0f}% "
+            f"adopt>=${self.cfg.min_adopt_usd} "
             f"stuck_after={self.cfg.stuck_after_minutes:.0f}m "
             f"retries={self.cfg.entry_retries} daily_loss_limit=${self.cfg.daily_loss_limit_usd}")
         if self.cfg.mode == "live":
