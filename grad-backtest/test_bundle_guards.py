@@ -122,10 +122,53 @@ class MultiWalletBundleGuardTests(unittest.TestCase):
         cfg = executor.Config()
         self.assertEqual(cfg.max_bundle_slot_pct, 30)
         self.assertEqual(cfg.max_cluster_pct, 30)
+        self.assertEqual(cfg.max_ancestry_cluster_pct, 20)
+        self.assertEqual(cfg.max_transfer_cluster_pct, 12)
+        self.assertEqual(cfg.max_coordinated_buy_pct, 20)
+        self.assertEqual(cfg.max_repeat_cohort_pct, 12)
         self.assertEqual(cfg.max_dev_cluster_pct, 15)
         self.assertEqual(cfg.max_top10_wallet_pct, 50)
         self.assertEqual(cfg.max_early_buy_pct, 30)
         self.assertTrue(cfg.bundle_fail_closed)
+
+    def test_mike_apeson_pattern_is_blocked_by_transfer_graph(self):
+        """Regression: immediate funders looked unrelated at 34.8% coverage, but the
+        supply-weighted token-transfer graph showed the coordinated holder cohort."""
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        cfg = executor.Config()
+        bundle = {
+            "complete": True,
+            "cluster_pct": 0.0,
+            "ancestry_cluster_pct": 0.0,
+            "transfer_cluster_pct": 24.0,
+            "coordinated_buy_pct": 8.0,
+            "dev_cluster_pct": 0.0,
+            "top10_wallet_pct": 17.4,
+            "early_buy_pct": 0.0,
+            "funder_coverage_pct": 34.8,
+        }
+        reason = executor.entry_guard_reason(cfg, GRAD, ENTRY, 1.0, 64_000, 600, 8, bundle)
+        self.assertIn("token-transfer cluster", reason)
+        self.assertIn("partial-coverage", reason)
+
+    def test_partial_coverage_tightens_every_bundle_limit(self):
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        cfg = executor.Config()
+        bundle = {"complete": True, "cluster_pct": 22.0, "funder_coverage_pct": 35.0}
+        reason = executor.entry_guard_reason(cfg, GRAD, ENTRY, 1.0, 64_000, 600, 8, bundle)
+        self.assertIn("20.1%", reason)
+        bundle["funder_coverage_pct"] = 80.0
+        self.assertIsNone(executor.entry_guard_reason(cfg, GRAD, ENTRY, 1.0, 64_000, 600, 8, bundle))
+
+    def test_repeat_launch_cohort_is_blocked(self):
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        cfg = executor.Config()
+        bundle = {"complete": True, "repeat_cohort_pct": 16.0, "funder_coverage_pct": 100.0}
+        reason = executor.entry_guard_reason(cfg, GRAD, ENTRY, 1.0, 64_000, 600, 8, bundle)
+        self.assertIn("repeat-launch wallet cohort", reason)
 
     def test_connected_cluster_is_blocked(self):
         executor, p = fresh()
@@ -224,6 +267,16 @@ def token_account(owner):
 
 
 class TopWalletHolderTests(unittest.TestCase):
+    def test_helius_das_expands_holder_sample_beyond_twenty(self):
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        rows = [{"owner": f"w{i}", "amount": str(100 - i)} for i in range(50)]
+        owners = {"value": [{"owner": executor.SYSTEM_PROGRAM} for _ in rows]}
+        fake = FakeRpc(executor, {"getTokenAccounts": {"token_accounts": rows}, "getMultipleAccounts": owners})
+        holders = fake.rpc.plain_wallet_holders("m", limit=50)
+        self.assertEqual(len(holders), 50)
+        self.assertFalse(any(method == "getTokenLargestAccounts" for method, _ in fake.calls))
+
     def test_pool_and_program_vaults_ignored(self):
         executor, p = fresh()
         self.addCleanup(p.stop)
@@ -242,7 +295,8 @@ class TopWalletHolderTests(unittest.TestCase):
         ]}
         fake = FakeRpc(executor, {"getTokenLargestAccounts": largest, "getMultipleAccounts": [accounts, owner_accounts]})
         self.assertEqual(fake.rpc.top_wallet_holder("m"), ("dev", 1180000000000000))
-        self.assertEqual(fake.calls[1][1][0], ["ta_pool", "ta_dev", "ta_mayhem", "ta_small"])
+        multiple = [params for method, params in fake.calls if method == "getMultipleAccounts"]
+        self.assertEqual(multiple[0][0], ["ta_pool", "ta_dev", "ta_mayhem", "ta_small"])
 
     def test_excludes_our_wallet_and_handles_empty(self):
         executor, p = fresh()
@@ -254,6 +308,21 @@ class TopWalletHolderTests(unittest.TestCase):
         self.assertEqual(fake.rpc.top_wallet_holder("m", {"us"}), ("them", 40))
         fake = FakeRpc(executor, {"getTokenLargestAccounts": {"value": []}})
         self.assertIsNone(fake.rpc.top_wallet_holder("m"))
+
+
+class WalletGraphCacheTests(unittest.TestCase):
+    def test_positive_funder_survives_rpc_recreation(self):
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        cfg = executor.Config()
+        first = executor.Rpc(cfg)
+        first.origin_funder = lambda wallet, before: "treasury"
+        self.assertEqual(first.cached_origin_funder("w", GRAD), "treasury")
+        first.save_wallet_graph_cache()
+
+        second = executor.Rpc(cfg)
+        second.origin_funder = lambda wallet, before: (_ for _ in ()).throw(AssertionError("cache miss"))
+        self.assertEqual(second.cached_origin_funder("w", GRAD), "treasury")
 
 
 class BundleSnapshotTests(unittest.TestCase):
@@ -284,10 +353,14 @@ class BundleSnapshotTests(unittest.TestCase):
         self.assertTrue(snapshot["complete"])
         self.assertAlmostEqual(snapshot["bundle_slot_pct"], 54.0)
         self.assertAlmostEqual(snapshot["cluster_pct"], 54.0)
+        self.assertAlmostEqual(snapshot["ancestry_cluster_pct"], 54.0)
+        self.assertAlmostEqual(snapshot["coordinated_buy_pct"], 54.0)
         self.assertAlmostEqual(snapshot["dev_cluster_pct"], 54.0)
         self.assertAlmostEqual(snapshot["top10_wallet_pct"], 54.0)
         self.assertAlmostEqual(snapshot["early_buy_pct"], 54.0)
         self.assertAlmostEqual(snapshot["funder_coverage_pct"], 100.0)
+        self.assertEqual(snapshot["holder_sample_count"], 6)
+        self.assertEqual(snapshot["bundle_confidence"], "high")
 
 
 class EntryIntegrationTests(unittest.TestCase):
@@ -301,7 +374,10 @@ class EntryIntegrationTests(unittest.TestCase):
 
     def wire(self, supply_ui=2e9, out_tokens=23_700_000, created=GRAD - 29, holder_amount=0):
         ex = self.ex
-        ex.jup.quote = lambda a, b, amt, **kw: {"outAmount": str(out_tokens * 10**6) if b != self.executor.WSOL else "1000000", "priceImpactPct": "0.01"}
+        ex.jup.quote = lambda a, b, amt, **kw: {
+            "outAmount": str(out_tokens * 10**6) if b != self.executor.WSOL else "95000000",
+            "priceImpactPct": "0.01",
+        }
         responses = {
             "getTokenSupply": {"value": {"uiAmountString": str(supply_ui), "decimals": 6}},
             "getSignaturesForAddress": [sigs([GRAD, created])],
@@ -383,6 +459,17 @@ class EntryIntegrationTests(unittest.TestCase):
         skips = self.enter()
         self.assertEqual(skips, "")
         self.assertEqual(len(self.ex.state["positions"]), 1)
+
+    def test_weak_reverse_liquidity_is_rejected(self):
+        self.wire(out_tokens=150_000, created=GRAD - 3600, holder_amount=100_000_000)
+        original = self.ex.jup.quote
+        self.ex.jup.quote = lambda a, b, amt, **kw: (
+            {"outAmount": "50000000", "priceImpactPct": "0.01"}
+            if b == self.executor.WSOL else original(a, b, amt, **kw)
+        )
+        skips = self.enter()
+        self.assertIn("round-trip liquidity returns 50.0%", skips)
+        self.assertEqual(self.ex.state["positions"], [])
 
 
 if __name__ == "__main__":

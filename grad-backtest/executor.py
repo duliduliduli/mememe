@@ -40,12 +40,15 @@ import requests
 
 from bundle_analysis import (
     CEX_FUNDERS,
+    ancestry_clusters,
     bundle_slot_pct,
     cluster_supply_pct,
     cluster_wallets,
+    coordinated_buy_pct,
     early_buy_pct,
     related_holder_wallets,
     top_wallets_supply_pct,
+    transfer_clusters,
     wallets_supply_pct,
 )
 from grad_backtest import KNOWN_QUOTES, WSOL, candidate_mints
@@ -56,6 +59,7 @@ TRADES_FILE = DATA_DIR / "live_trades.csv"
 LOG_FILE = DATA_DIR / "executor.log"
 STOP_FLAG = DATA_DIR / "executor.stop"
 PANIC_FLAG = DATA_DIR / "executor.panic"
+WALLET_GRAPH_CACHE_FILE = DATA_DIR / "wallet_graph_cache.json"
 
 USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 LAMPORTS = 1_000_000_000
@@ -69,9 +73,13 @@ SKIPS_FILE = DATA_DIR / "skips.csv"
 TRADE_COLUMNS = [
     "opened_at", "closed_at", "mint", "mode", "position_usd", "exit_usd",
     "net_return", "exit_reason", "buy_signature", "sell_signature", "entry_price_impact_pct",
+    "entry_round_trip_pct",
     "peak_gain_pct", "entry_market_cap_usd", "entry_curve_age_seconds", "entry_top_holder_pct",
     "entry_bundle_slot_pct", "entry_cluster_pct", "entry_dev_cluster_pct",
+    "entry_ancestry_cluster_pct", "entry_transfer_cluster_pct", "entry_coordinated_buy_pct",
+    "entry_repeat_cohort_pct",
     "entry_top10_wallet_pct", "entry_early_buy_pct", "entry_funder_coverage_pct",
+    "entry_holder_sample_count", "entry_bundle_confidence",
 ]
 
 
@@ -170,6 +178,9 @@ class Config:
         self.helius_poll_timeout_seconds = max(1.0, float(os.getenv("HELIUS_POLL_TIMEOUT_SECONDS", "5")))
         self.max_entries_per_cycle = max(1, int(os.getenv("MAX_ENTRIES_PER_CYCLE", "1")))
         self.max_price_impact_pct = float(os.getenv("MAX_PRICE_IMPACT_PCT", "5"))
+        # A route existing is not enough: require that the just-quoted tokens can immediately
+        # be sold back for most of the input. This is an executable liquidity check, not a UI badge.
+        self.min_entry_round_trip_pct = percent_env("MIN_ENTRY_ROUND_TRIP_PCT", 80)
         # Pump.fun tokens graduate around $69k and genuine ones sit near $30k-200k at entry. A
         # market cap far above that 30s after migration means a bundled buy already pumped it
         # and we would be buying the top of someone else's pump, which then dumps into us.
@@ -188,14 +199,25 @@ class Config:
         # (0.30 == 30%), so percent_env accepts both forms during rollout.
         self.max_bundle_slot_pct = percent_env("MAX_BUNDLE_SLOT_PCT", 30)
         self.max_cluster_pct = percent_env("MAX_CLUSTER_PCT", 30)
+        self.max_ancestry_cluster_pct = percent_env("MAX_ANCESTRY_CLUSTER_PCT", 20)
+        self.max_transfer_cluster_pct = percent_env("MAX_TRANSFER_CLUSTER_PCT", 12)
+        self.max_coordinated_buy_pct = percent_env("MAX_COORDINATED_BUY_PCT", 20)
+        self.max_repeat_cohort_pct = percent_env("MAX_REPEAT_COHORT_PCT", 12)
         self.max_dev_cluster_pct = percent_env("MAX_DEV_CLUSTER_PCT", 15)
         self.max_top10_wallet_pct = percent_env("MAX_TOP10_WALLET_PCT", 50)
         self.max_early_buy_pct = percent_env("MAX_EARLY_BUY_PCT", 30)
         self.min_funder_coverage_pct = percent_env("MIN_FUNDER_COVERAGE_PCT", 30)
+        self.high_confidence_funder_coverage_pct = percent_env("HIGH_CONFIDENCE_FUNDER_COVERAGE_PCT", 60)
+        self.partial_coverage_limit_multiplier = max(
+            0.1, min(1.0, float(os.getenv("PARTIAL_COVERAGE_LIMIT_MULTIPLIER", "0.67")))
+        )
+        self.coordinated_window_slots = max(0, int(os.getenv("COORDINATED_WINDOW_SLOTS", "12")))
+        self.coordinated_min_wallets = max(2, int(os.getenv("COORDINATED_MIN_WALLETS", "3")))
         self.bundle_log_only = os.getenv("BUNDLE_LOG_ONLY", "0") == "1"
         self.bundle_fail_closed = os.getenv("BUNDLE_FAIL_CLOSED", "1") == "1"
         self.bundle_lookup_timeout_ms = max(250, int(os.getenv("BUNDLE_LOOKUP_TIMEOUT_MS", "1500")))
-        self.bundle_max_wallets = min(20, max(2, int(os.getenv("BUNDLE_MAX_WALLETS", "20"))))
+        self.bundle_max_wallets = min(100, max(2, int(os.getenv("BUNDLE_MAX_WALLETS", "50"))))
+        self.wallet_graph_cache_days = max(1.0, float(os.getenv("WALLET_GRAPH_CACHE_DAYS", "30")))
         self.max_entry_lateness_seconds = float(os.getenv("MAX_ENTRY_LATENESS_SECONDS", "60"))
         # Startup wallet reconciliation (live only): adopt untracked holdings worth at least
         # MIN_ADOPT_USD as managed positions so a restart never strands a bag, and close empty
@@ -363,17 +385,27 @@ def entry_guard_reason(
         if not bundle.get("complete", False) and cfg.bundle_fail_closed:
             detail = bundle.get("error") or "required holder/funding history was incomplete"
             return f"bundle data unavailable ({detail})"
+        coverage = bundle.get("funder_coverage_pct")
+        confidence_multiplier = 1.0
+        if coverage is not None and coverage < cfg.high_confidence_funder_coverage_pct:
+            confidence_multiplier = cfg.partial_coverage_limit_multiplier
         checks = (
             ("bundle_slot_pct", cfg.max_bundle_slot_pct, "same-slot wallets"),
             ("cluster_pct", cfg.max_cluster_pct, "connected funding cluster"),
+            ("ancestry_cluster_pct", cfg.max_ancestry_cluster_pct, "shared two-hop funding cluster"),
+            ("transfer_cluster_pct", cfg.max_transfer_cluster_pct, "token-transfer cluster"),
+            ("coordinated_buy_pct", cfg.max_coordinated_buy_pct, "coordinated wallet burst"),
+            ("repeat_cohort_pct", cfg.max_repeat_cohort_pct, "repeat-launch wallet cohort"),
             ("dev_cluster_pct", cfg.max_dev_cluster_pct, "creator-linked wallet cluster"),
             ("top10_wallet_pct", cfg.max_top10_wallet_pct, "top ten wallets"),
             ("early_buy_pct", cfg.max_early_buy_pct, "first three slots"),
         )
         for key, limit, label in checks:
             value = bundle.get(key)
-            if value is not None and limit > 0 and value > limit:
-                return f"{label} hold {value:.1f}% of supply > {limit:.1f}%"
+            effective_limit = limit * confidence_multiplier
+            if value is not None and limit > 0 and value > effective_limit:
+                confidence = " under partial-coverage rules" if confidence_multiplier < 1 else ""
+                return f"{label} hold {value:.1f}% of supply > {effective_limit:.1f}%{confidence}"
     return None
 
 
@@ -413,11 +445,19 @@ class Rpc:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.session = requests.Session()
+        self.wallet_graph_cache: dict[str, Any] = {"version": 1, "funders": {}, "appearances": {}}
+        try:
+            loaded = json.loads(WALLET_GRAPH_CACHE_FILE.read_text())
+            if isinstance(loaded, dict) and isinstance(loaded.get("funders"), dict):
+                self.wallet_graph_cache = loaded
+                self.wallet_graph_cache.setdefault("appearances", {})
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            pass
 
-    def call(self, method: str, params: list[Any]) -> Any:
+    def call(self, method: str, params: Any) -> Any:
         return with_backoff(lambda: self._call(method, params), method)
 
-    def _call(self, method: str, params: list[Any]) -> Any:
+    def _call(self, method: str, params: Any) -> Any:
         resp = self.session.post(
             self.cfg.rpc_url,
             json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
@@ -503,8 +543,38 @@ class Rpc:
     def plain_wallet_holders(
         self, mint: str, exclude: set[str] | None = None, limit: int = 20
     ) -> list[tuple[str, int]]:
-        """Largest plain-wallet holders, combining multiple token accounts per owner."""
+        """Largest plain-wallet holders, combining multiple token accounts per owner.
+
+        Helius DAS is used first because Solana's standard getTokenLargestAccounts is
+        hard-capped at 20. The standard method remains a compatibility fallback.
+        """
         exclude = exclude or set()
+        try:
+            # DAS does not promise balance ordering, so inspect the full first page and sort
+            # locally rather than asking it for only N arbitrary accounts.
+            das = self.call("getTokenAccounts", {"mint": mint, "page": 1, "limit": 1000}) or {}
+            rows = das.get("token_accounts") or das.get("tokenAccounts") or []
+            totals: dict[str, int] = {}
+            for row in rows:
+                owner = row.get("owner")
+                amount = row.get("amount")
+                if owner and owner not in exclude and amount is not None:
+                    totals[owner] = totals.get(owner, 0) + int(amount)
+            if totals:
+                ordered = sorted(totals.items(), key=lambda item: item[1], reverse=True)[:limit]
+                owner_accounts = self.call(
+                    "getMultipleAccounts", [[owner for owner, _ in ordered], {"encoding": "base64"}]
+                ).get("value") or []
+                wallets = [
+                    (owner, amount)
+                    for (owner, amount), acct in zip(ordered, owner_accounts)
+                    if (acct["owner"] if acct else SYSTEM_PROGRAM) == SYSTEM_PROGRAM
+                ]
+                if wallets:
+                    return wallets
+        except Exception:
+            # DAS availability varies by Helius plan; retain the proven 20-account path.
+            pass
         largest = self.call("getTokenLargestAccounts", [mint]).get("value") or []
         if not largest:
             return []
@@ -564,6 +634,64 @@ class Rpc:
                     return sender
         return None
 
+    def cached_origin_funder(self, wallet: str, before_ts: float) -> str | None:
+        """Origin funder with a persistent TTL cache shared across token analyses."""
+        entries = self.wallet_graph_cache.setdefault("funders", {})
+        cached = entries.get(wallet)
+        now = now_ts()
+        if isinstance(cached, dict):
+            age = now - float(cached.get("checked_at") or 0)
+            ttl = self.cfg.wallet_graph_cache_days * 86400 if cached.get("funder") else 3600
+            if age <= ttl:
+                return cached.get("funder")
+        funder = self.origin_funder(wallet, before_ts)
+        entries[wallet] = {"funder": funder, "checked_at": now}
+        return funder
+
+    def save_wallet_graph_cache(self) -> None:
+        try:
+            # Bound a long-running Railway volume: retain the most recently checked wallets.
+            funders = self.wallet_graph_cache.setdefault("funders", {})
+            if len(funders) > 10_000:
+                newest = sorted(
+                    funders.items(), key=lambda item: float(item[1].get("checked_at") or 0), reverse=True
+                )[:10_000]
+                self.wallet_graph_cache["funders"] = dict(newest)
+            appearances = self.wallet_graph_cache.setdefault("appearances", {})
+            if len(appearances) > 10_000:
+                keep = set(self.wallet_graph_cache["funders"])
+                self.wallet_graph_cache["appearances"] = {
+                    wallet: history for wallet, history in appearances.items() if wallet in keep
+                }
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = WALLET_GRAPH_CACHE_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.wallet_graph_cache, separators=(",", ":")))
+            os.replace(tmp, WALLET_GRAPH_CACHE_FILE)
+        except OSError as exc:
+            log(f"WARN wallet graph cache could not be saved ({describe_error(exc)})")
+
+    def _lookup_funders(self, wallets: set[str], before_ts: float) -> dict[str, str | None]:
+        results: dict[str, str | None] = {wallet: None for wallet in wallets}
+        if not wallets:
+            return results
+        timeout = self.cfg.bundle_lookup_timeout_ms / 1000
+        workers = min(12, len(wallets))
+        total_timeout = timeout * ((len(wallets) + workers - 1) // workers) + 0.5
+        pool = ThreadPoolExecutor(max_workers=workers)
+        futures = {pool.submit(self.cached_origin_funder, wallet, before_ts): wallet for wallet in wallets}
+        try:
+            for future in as_completed(futures, timeout=total_timeout):
+                wallet = futures[future]
+                try:
+                    results[wallet] = future.result()
+                except Exception:
+                    results[wallet] = None
+        except TimeoutError:
+            pass
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+        return results
+
     def bundle_snapshot(
         self,
         mint: str,
@@ -584,11 +712,12 @@ class Rpc:
             **{
                 "sort-order": "asc",
                 "gte-time": int(created_ts) - 2,
-                "lte-time": int(graduated_ts) + 2,
+                "lte-time": int(graduated_ts + self.cfg.entry_delay_seconds) + 2,
                 "limit": 100,
             },
         )
         buys: list[dict[str, Any]] = []
+        transfer_edges: list[tuple[str, str]] = []
         creator = None
         create_slot = None
         for tx in transactions:
@@ -598,46 +727,88 @@ class Rpc:
             if create_slot is None or int(slot) < create_slot:
                 create_slot = int(slot)
                 creator = tx.get("feePayer") or creator
+            native_payers = {
+                transfer.get("fromUserAccount")
+                for transfer in tx.get("nativeTransfers") or []
+                if int(transfer.get("amount") or 0) >= 100_000
+            }
             amounts: dict[str, float] = {}
             for transfer in tx.get("tokenTransfers") or []:
                 wallet = transfer.get("toUserAccount")
                 if transfer.get("mint") != mint or wallet not in holder_set:
                     continue
-                raw = float(transfer.get("tokenAmount") or transfer.get("rawTokenAmount") or 0)
-                transfer_decimals = int(transfer.get("decimals", decimals))
+                raw_field = transfer.get("rawTokenAmount")
+                if isinstance(raw_field, dict):
+                    raw = float(raw_field.get("tokenAmount") or 0)
+                    transfer_decimals = int(raw_field.get("decimals", decimals))
+                    amount = raw / (10 ** transfer_decimals)
+                else:
+                    raw = float(transfer.get("tokenAmount") or raw_field or 0)
+                    transfer_decimals = int(transfer.get("decimals", decimals))
+                    amount = raw / (10 ** transfer_decimals) if raw_field is not None else raw
                 # Legacy Enhanced Transactions reports tokenAmount in UI units; Parsed Events uses
                 # rawTokenAmount. Prefer the raw field when it is present.
-                amount = raw / (10 ** transfer_decimals) if "rawTokenAmount" in transfer else raw
                 amounts[wallet] = amounts.get(wallet, 0.0) + amount
+                sender = transfer.get("fromUserAccount")
+                # A swap links every buyer to the AMM vault and would create a giant false
+                # cluster. Only retain unpaid wallet-to-wallet distributions.
+                if (
+                    sender
+                    and sender != wallet
+                    and wallet not in native_payers
+                    and str(tx.get("type") or "").upper() != "SWAP"
+                ):
+                    transfer_edges.append((sender, wallet))
             buys.extend({"wallet": wallet, "slot": int(slot), "amount": amount} for wallet, amount in amounts.items())
         if not buys or create_slot is None:
             return {"complete": False, "error": "mint purchase history was empty or not yet indexed"}
 
-        funders: dict[str, str | None] = {wallet: None for wallet in holder_set}
-        timeout = self.cfg.bundle_lookup_timeout_ms / 1000
-        workers = min(8, len(holder_set))
-        total_timeout = timeout * ((len(holder_set) + workers - 1) // workers) + 0.25
-        pool = ThreadPoolExecutor(max_workers=workers)
-        futures = {pool.submit(self.origin_funder, wallet, graduated_ts): wallet for wallet in holder_set}
-        try:
-            for future in as_completed(futures, timeout=total_timeout):
-                wallet = futures[future]
-                try:
-                    funders[wallet] = future.result()
-                except Exception:
-                    funders[wallet] = None
-        except TimeoutError:
-            pass
-        finally:
-            pool.shutdown(wait=False, cancel_futures=True)
-
+        funders = self._lookup_funders(holder_set, graduated_ts)
+        first_hop = {funder for funder in funders.values() if funder and funder not in CEX_FUNDERS}
+        second_hop = self._lookup_funders(first_hop, graduated_ts)
+        ancestry = {
+            wallet: [node for node in (funder, second_hop.get(funder) if funder else None) if node]
+            for wallet, funder in funders.items()
+        }
         covered_amount = sum(wallet_amounts[w] for w, funder in funders.items() if funder)
         tracked_amount = sum(wallet_amounts.values())
         coverage_pct = covered_amount / tracked_amount * 100 if tracked_amount else 0.0
         clusters = cluster_wallets(funders)
         largest_cluster_pct, cluster_members = cluster_supply_pct(clusters, wallet_amounts, supply_ui)
-        dev_members = related_holder_wallets(funders, creator)
+        ancestry_groups = ancestry_clusters(ancestry)
+        ancestry_cluster_pct, ancestry_members = cluster_supply_pct(ancestry_groups, wallet_amounts, supply_ui)
+        transfer_groups = transfer_clusters(transfer_edges, holder_set)
+        transfer_cluster_pct, transfer_members = cluster_supply_pct(transfer_groups, wallet_amounts, supply_ui)
+        appearances = self.wallet_graph_cache.setdefault("appearances", {})
+        previous_launches = {wallet: list(appearances.get(wallet) or []) for wallet in holder_set}
+        repeat_groups = ancestry_clusters(previous_launches, set())
+        repeat_cohort_pct, repeat_members = cluster_supply_pct(repeat_groups, wallet_amounts, supply_ui)
+        creator_ancestry = set([creator] if creator else [])
+        if creator:
+            try:
+                creator_funder = self.cached_origin_funder(creator, graduated_ts)
+                if creator_funder and creator_funder not in CEX_FUNDERS:
+                    creator_ancestry.add(creator_funder)
+                    creator_parent = self.cached_origin_funder(creator_funder, graduated_ts)
+                    if creator_parent and creator_parent not in CEX_FUNDERS:
+                        creator_ancestry.add(creator_parent)
+            except Exception:
+                pass  # optional creator ancestry must not invalidate otherwise complete evidence
+        dev_members = [
+            wallet for wallet, path in ancestry.items()
+            if set([wallet, *path]) & creator_ancestry
+        ]
+        if not dev_members:
+            dev_members = related_holder_wallets(funders, creator)
+        for wallet in holder_set:
+            history = [seen for seen in appearances.get(wallet, []) if seen != mint]
+            appearances[wallet] = [*history[-24:], mint]
+        self.save_wallet_graph_cache()
         same_slot_pct, bundle_slot, bundle_wallets = bundle_slot_pct(buys, supply_ui)
+        coordinated_pct, coordinated_slot, coordinated_wallets = coordinated_buy_pct(
+            buys, supply_ui, self.cfg.coordinated_window_slots, self.cfg.coordinated_min_wallets
+        )
+        confidence = "high" if coverage_pct >= self.cfg.high_confidence_funder_coverage_pct else "partial"
         return {
             "complete": coverage_pct >= self.cfg.min_funder_coverage_pct,
             "error": None if coverage_pct >= self.cfg.min_funder_coverage_pct else f"funder coverage {coverage_pct:.1f}%",
@@ -646,10 +817,21 @@ class Rpc:
             "bundle_wallets": bundle_wallets,
             "cluster_pct": largest_cluster_pct,
             "cluster_wallets": cluster_members,
+            "ancestry_cluster_pct": ancestry_cluster_pct,
+            "ancestry_cluster_wallets": ancestry_members,
+            "transfer_cluster_pct": transfer_cluster_pct,
+            "transfer_cluster_wallets": transfer_members,
+            "coordinated_buy_pct": coordinated_pct,
+            "coordinated_slot": coordinated_slot,
+            "coordinated_wallets": coordinated_wallets,
+            "repeat_cohort_pct": repeat_cohort_pct,
+            "repeat_cohort_wallets": repeat_members,
             "dev_cluster_pct": wallets_supply_pct(dev_members, wallet_amounts, supply_ui),
             "top10_wallet_pct": top_wallets_supply_pct(wallet_amounts, supply_ui),
             "early_buy_pct": early_buy_pct(buys, supply_ui, create_slot),
             "funder_coverage_pct": coverage_pct,
+            "holder_sample_count": len(holders),
+            "bundle_confidence": confidence,
             "creator": creator,
         }
 
@@ -941,6 +1123,10 @@ class Executor:
             for key in (
                 "bundle_slot_pct",
                 "cluster_pct",
+                "ancestry_cluster_pct",
+                "transfer_cluster_pct",
+                "coordinated_buy_pct",
+                "repeat_cohort_pct",
                 "dev_cluster_pct",
                 "top10_wallet_pct",
                 "early_buy_pct",
@@ -948,6 +1134,8 @@ class Executor:
             )
             if bundle.get(key) is not None
         )
+        if bundle.get("holder_sample_count") is not None:
+            summary += f" holders={bundle['holder_sample_count']} confidence={bundle.get('bundle_confidence', 'unknown')}"
         log(f"BUNDLE {mint}: {summary or bundle.get('error', 'no metrics')}")
         if bundle_guard:
             if self.cfg.bundle_log_only:
@@ -955,11 +1143,21 @@ class Executor:
             else:
                 self.skip(mint, bundle_guard)
                 return
-        # Honeypot guard: a token you can buy but not sell has no reverse route.
+        # Honeypot/liquidity guard: a token must not only have a sell route, but that route
+        # must return most of the proposed input immediately. This catches routes whose visible
+        # price is not backed by executable two-way liquidity.
         try:
-            self.jup.quote(mint, WSOL, tokens)
+            reverse_quote = self.jup.quote(mint, WSOL, tokens)
         except Exception as exc:
             self.skip(mint, f"no sell route (possible honeypot): {exc}")
+            return
+        round_trip_pct = int(reverse_quote["outAmount"]) / lamports * 100 if lamports > 0 else 0.0
+        if self.cfg.min_entry_round_trip_pct > 0 and round_trip_pct < self.cfg.min_entry_round_trip_pct:
+            self.skip(
+                mint,
+                f"round-trip liquidity returns {round_trip_pct:.1f}% < "
+                f"{self.cfg.min_entry_round_trip_pct:.1f}% of proposed buy",
+            )
             return
         buy_sig = ""
         if self.cfg.mode == "live":
@@ -988,15 +1186,22 @@ class Executor:
                 "graduated_at": utc_iso(item["graduated_ts"]),
                 "buy_signature": buy_sig,
                 "entry_price_impact_pct": impact,
+                "entry_round_trip_pct": round(round_trip_pct, 1),
                 "entry_market_cap_usd": round(market_cap) if market_cap else None,
                 "entry_curve_age_seconds": round(curve_age) if curve_age is not None else None,
                 "entry_top_holder_pct": round(top_holder_pct, 1) if top_holder_pct is not None else None,
                 "entry_bundle_slot_pct": round(bundle["bundle_slot_pct"], 1) if bundle.get("bundle_slot_pct") is not None else None,
                 "entry_cluster_pct": round(bundle["cluster_pct"], 1) if bundle.get("cluster_pct") is not None else None,
+                "entry_ancestry_cluster_pct": round(bundle["ancestry_cluster_pct"], 1) if bundle.get("ancestry_cluster_pct") is not None else None,
+                "entry_transfer_cluster_pct": round(bundle["transfer_cluster_pct"], 1) if bundle.get("transfer_cluster_pct") is not None else None,
+                "entry_coordinated_buy_pct": round(bundle["coordinated_buy_pct"], 1) if bundle.get("coordinated_buy_pct") is not None else None,
+                "entry_repeat_cohort_pct": round(bundle["repeat_cohort_pct"], 1) if bundle.get("repeat_cohort_pct") is not None else None,
                 "entry_dev_cluster_pct": round(bundle["dev_cluster_pct"], 1) if bundle.get("dev_cluster_pct") is not None else None,
                 "entry_top10_wallet_pct": round(bundle["top10_wallet_pct"], 1) if bundle.get("top10_wallet_pct") is not None else None,
                 "entry_early_buy_pct": round(bundle["early_buy_pct"], 1) if bundle.get("early_buy_pct") is not None else None,
                 "entry_funder_coverage_pct": round(bundle["funder_coverage_pct"], 1) if bundle.get("funder_coverage_pct") is not None else None,
+                "entry_holder_sample_count": bundle.get("holder_sample_count"),
+                "entry_bundle_confidence": bundle.get("bundle_confidence"),
                 "peak_usd": size_usd,
             }
         )
@@ -1178,15 +1383,22 @@ class Executor:
                 "buy_signature": pos.get("buy_signature", ""),
                 "sell_signature": sell_sig,
                 "entry_price_impact_pct": pos.get("entry_price_impact_pct"),
+                "entry_round_trip_pct": pos.get("entry_round_trip_pct"),
                 "entry_market_cap_usd": pos.get("entry_market_cap_usd"),
                 "entry_curve_age_seconds": pos.get("entry_curve_age_seconds"),
                 "entry_top_holder_pct": pos.get("entry_top_holder_pct"),
                 "entry_bundle_slot_pct": pos.get("entry_bundle_slot_pct"),
                 "entry_cluster_pct": pos.get("entry_cluster_pct"),
+                "entry_ancestry_cluster_pct": pos.get("entry_ancestry_cluster_pct"),
+                "entry_transfer_cluster_pct": pos.get("entry_transfer_cluster_pct"),
+                "entry_coordinated_buy_pct": pos.get("entry_coordinated_buy_pct"),
+                "entry_repeat_cohort_pct": pos.get("entry_repeat_cohort_pct"),
                 "entry_dev_cluster_pct": pos.get("entry_dev_cluster_pct"),
                 "entry_top10_wallet_pct": pos.get("entry_top10_wallet_pct"),
                 "entry_early_buy_pct": pos.get("entry_early_buy_pct"),
                 "entry_funder_coverage_pct": pos.get("entry_funder_coverage_pct"),
+                "entry_holder_sample_count": pos.get("entry_holder_sample_count"),
+                "entry_bundle_confidence": pos.get("entry_bundle_confidence"),
                 "peak_gain_pct": round(peak_gain * 100, 1) if peak_gain is not None else None,
             }
         )
@@ -1264,15 +1476,22 @@ class Executor:
                 "buy_signature": pos.get("buy_signature", ""),
                 "sell_signature": sig,
                 "entry_price_impact_pct": pos.get("entry_price_impact_pct"),
+                "entry_round_trip_pct": pos.get("entry_round_trip_pct"),
                 "entry_market_cap_usd": pos.get("entry_market_cap_usd"),
                 "entry_curve_age_seconds": pos.get("entry_curve_age_seconds"),
                 "entry_top_holder_pct": pos.get("entry_top_holder_pct"),
                 "entry_bundle_slot_pct": pos.get("entry_bundle_slot_pct"),
                 "entry_cluster_pct": pos.get("entry_cluster_pct"),
+                "entry_ancestry_cluster_pct": pos.get("entry_ancestry_cluster_pct"),
+                "entry_transfer_cluster_pct": pos.get("entry_transfer_cluster_pct"),
+                "entry_coordinated_buy_pct": pos.get("entry_coordinated_buy_pct"),
+                "entry_repeat_cohort_pct": pos.get("entry_repeat_cohort_pct"),
                 "entry_dev_cluster_pct": pos.get("entry_dev_cluster_pct"),
                 "entry_top10_wallet_pct": pos.get("entry_top10_wallet_pct"),
                 "entry_early_buy_pct": pos.get("entry_early_buy_pct"),
                 "entry_funder_coverage_pct": pos.get("entry_funder_coverage_pct"),
+                "entry_holder_sample_count": pos.get("entry_holder_sample_count"),
+                "entry_bundle_confidence": pos.get("entry_bundle_confidence"),
                 "peak_gain_pct": round(peak_gain * 100, 1) if peak_gain is not None else None,
             }
         )
@@ -1432,18 +1651,23 @@ class Executor:
 
     def run(self) -> None:
         log(f"executor starting: mode={self.cfg.mode} fraction={self.cfg.account_fraction} "
-            f"max_pos=${self.cfg.max_position_usd} slots={self.cfg.max_concurrent} tp=+{self.cfg.take_profit:.0%} sl=-{self.cfg.stop_loss:.0%} "
+            f"max_pos=${self.cfg.max_position_usd} slots={self.cfg.max_concurrent} "
+            f"tp=+{self.cfg.take_profit:.0%} sl=-{self.cfg.stop_loss:.0%} "
             f"time_stop={self.cfg.time_stop_minutes:.0f}m trail={self.cfg.trailing_stop:.0%} "
             f"scale_out={self.cfg.scale_out_at:.0%}x{self.cfg.scale_out_fraction:.0%} moon_bag={self.cfg.moon_bag:.0%}"
             f"{'(winners only)' if self.cfg.moon_bag_winners_only else ''}"
             f"{f'@{self.cfg.moon_bag_target_x:.0f}x' if self.cfg.moon_bag_target_x > 0 else '@hold'}"
             f"(min${self.cfg.min_moon_bag_usd:.2f},dead<{self.cfg.moon_bag_dead_pct:.0f}%) "
             f"slippage={self.cfg.slippage_bps}/{self.cfg.sell_slippage_bps}bps(buy/sell) "
+            f"round_trip>={self.cfg.min_entry_round_trip_pct:.0f}% "
             f"mcap=${self.cfg.min_entry_market_cap_usd:,.0f}-${self.cfg.max_entry_market_cap_usd:,.0f} "
             f"curve_age>={self.cfg.min_curve_age_seconds:.0f}s top_holder<={self.cfg.max_top_holder_pct:.0f}% "
             f"bundle_slot<={self.cfg.max_bundle_slot_pct:.0f}% cluster<={self.cfg.max_cluster_pct:.0f}% "
+            f"ancestry<={self.cfg.max_ancestry_cluster_pct:.0f}% transfer<={self.cfg.max_transfer_cluster_pct:.0f}% "
+            f"coordinated<={self.cfg.max_coordinated_buy_pct:.0f}% repeat<={self.cfg.max_repeat_cohort_pct:.0f}% "
             f"dev_cluster<={self.cfg.max_dev_cluster_pct:.0f}% top10<={self.cfg.max_top10_wallet_pct:.0f}% "
             f"early_buy<={self.cfg.max_early_buy_pct:.0f}% funder_coverage>={self.cfg.min_funder_coverage_pct:.0f}% "
+            f"high_confidence>={self.cfg.high_confidence_funder_coverage_pct:.0f}% holders={self.cfg.bundle_max_wallets} "
             f"bundle_mode={'log' if self.cfg.bundle_log_only else 'block'} "
             f"adopt>=${self.cfg.min_adopt_usd} "
             f"stuck_after={self.cfg.stuck_after_minutes:.0f}m "
