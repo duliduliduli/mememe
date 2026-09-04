@@ -5,9 +5,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY grad_backtest.py position_sizing.py server.py executor.py bundle_analysis.py optimize.py \
-     test_grad_backtest.py test_position_sizing.py test_server.py \
-     test_executor.py test_executor_guards.py test_optimize.py test_scale_out.py test_slippage_retry.py test_market_cap.py test_reconcile.py test_bundle_guards.py test_rate_limits.py test_moon_bag_target.py ./
+# Copy every Python module so newly added executor dependencies cannot be
+# omitted from the container by an outdated hand-maintained file list.
+COPY *.py ./
 COPY static static
 COPY data/graduations.example.csv data/
 
