@@ -184,7 +184,20 @@ against TP/SL/time-stop using executable Jupiter sell quotes. Two modes:
 Safety rails enforced in both modes: `ACCOUNT_FRACTION` (default 10%) capped by
 `MAX_POSITION_USD` (default $20), `MAX_CONCURRENT_POSITIONS` (2),
 `DAILY_LOSS_LIMIT_USD` (default $30 — halts new entries until next UTC day),
-`MIN_SOL_RESERVE` kept for fees, and `SLIPPAGE_BPS` (300) on every swap.
+`MIN_SOL_RESERVE` kept for fees, and slippage caps on every swap (see below).
+
+Slippage and retries (learned live): a pool that is seconds old moves several
+percent in the ~1s between quoting and executing, and a 3% tolerance rejected
+most swaps with Jupiter error 6001. Defaults are now `SLIPPAGE_BPS=1000` for
+buys and `SELL_SLIPPAGE_BPS=1500` for sells — sells get more room because a
+rejected sell in a falling market is the worst available outcome. A tolerance
+is a ceiling, not a cost: fills still happen at market, the setting only
+decides how far the price may move before the swap is refused. Entries that
+fail are re-quoted and retried `ENTRY_RETRIES` times (default 2, `ENTRY_RETRY_SECONDS`
+apart); every guard re-runs on each attempt, so the staleness window still
+bounds how late an entry can land. Swap failures are logged as one readable
+line (e.g. `Jupiter 6001: slippage tolerance exceeded`) instead of the raw
+simulation dump.
 
 Entry guards, applied before every buy:
 

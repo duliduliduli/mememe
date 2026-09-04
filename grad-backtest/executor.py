@@ -98,7 +98,13 @@ class Config:
         self.time_stop_minutes = float(os.getenv("TIME_STOP_MINUTES", "30"))
         self.entry_delay_seconds = float(os.getenv("ENTRY_DELAY_SECONDS", "30"))
         self.max_entry_age_seconds = float(os.getenv("MAX_ENTRY_AGE_SECONDS", "120"))
-        self.slippage_bps = int(os.getenv("SLIPPAGE_BPS", "300"))
+        # Fresh pools move several percent in the ~1s between quote and execution; 3% failed
+        # most live swaps with Jupiter error 6001. Sells get more room than buys because a
+        # rejected sell in a falling market is the worst outcome available.
+        self.slippage_bps = int(os.getenv("SLIPPAGE_BPS", "1000"))
+        self.sell_slippage_bps = int(os.getenv("SELL_SLIPPAGE_BPS", "1500"))
+        self.entry_retries = int(os.getenv("ENTRY_RETRIES", "2"))
+        self.entry_retry_seconds = float(os.getenv("ENTRY_RETRY_SECONDS", "3"))
         self.poll_seconds = float(os.getenv("POLL_SECONDS", "5"))
         self.max_price_impact_pct = float(os.getenv("MAX_PRICE_IMPACT_PCT", "5"))
         self.max_entry_lateness_seconds = float(os.getenv("MAX_ENTRY_LATENESS_SECONDS", "60"))
@@ -178,6 +184,17 @@ def quote_price_impact_pct(quote: dict[str, Any]) -> float | None:
         return abs(float(raw)) * 100 if raw is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def describe_error(exc: BaseException) -> str:
+    """Compact, human-readable form of swap/RPC failures for the log. The raw RPC error
+    carries the whole simulation log (thousands of characters); the code is what matters."""
+    text = str(exc)
+    if "0x1771" in text or "'Custom': 6001" in text or '"Custom": 6001' in text or '"Custom":6001' in text:
+        return "Jupiter 6001: slippage tolerance exceeded (price moved past tolerance between quote and execution)"
+    if "0x1770" in text or "'Custom': 6000" in text or '"Custom": 6000' in text:
+        return "Jupiter 6000: route no longer valid"
+    return text[:240] + "…" if len(text) > 240 else text
 
 
 def entry_guard_reason(cfg: Config, graduated_ts: float, now: float, price_impact_pct: float | None) -> str | None:
@@ -278,14 +295,16 @@ class Jupiter:
         self.cfg = cfg
         self.session = requests.Session()
 
-    def quote(self, input_mint: str, output_mint: str, amount: int) -> dict[str, Any]:
+    def quote(
+        self, input_mint: str, output_mint: str, amount: int, slippage_bps: int | None = None
+    ) -> dict[str, Any]:
         resp = self.session.get(
             f"{self.cfg.jupiter_base}/quote",
             params={
                 "inputMint": input_mint,
                 "outputMint": output_mint,
                 "amount": str(amount),
-                "slippageBps": self.cfg.slippage_bps,
+                "slippageBps": self.cfg.slippage_bps if slippage_bps is None else slippage_bps,
             },
             timeout=20,
         )
@@ -472,7 +491,7 @@ class Executor:
             amount = int(pos["tokens"])
         keep = int(amount * mb)
         sell_amount = amount - keep
-        quote = self.jup.quote(mint, WSOL, sell_amount)
+        quote = self.jup.quote(mint, WSOL, sell_amount, slippage_bps=self.cfg.sell_slippage_bps)
         if self.cfg.mode == "live":
             sell_sig = self.execute_swap(quote)
         exit_usd = int(quote["outAmount"]) / LAMPORTS * sol_price
@@ -539,7 +558,7 @@ class Executor:
                 if reason:
                     self.close_position(pos, reason, sol_price)
             except Exception as exc:
-                log(f"WARN managing {pos['mint']}: {exc}")
+                log(f"WARN managing {pos['mint']}: {describe_error(exc)}")
 
     def scale_out(self, pos: dict[str, Any], sol_price: float) -> None:
         """Bank part of a winner at the first target. The remainder keeps the same TP/SL/trailing
@@ -550,7 +569,7 @@ class Executor:
         sell_amount = int(amount * frac)
         if sell_amount <= 0:
             return
-        quote = self.jup.quote(mint, WSOL, sell_amount)
+        quote = self.jup.quote(mint, WSOL, sell_amount, slippage_bps=self.cfg.sell_slippage_bps)
         sig = self.execute_swap(quote) if self.cfg.mode == "live" else ""
         proceeds = int(quote["outAmount"]) / LAMPORTS * sol_price
         if self.cfg.mode == "paper":
@@ -588,7 +607,7 @@ class Executor:
                 amount = bag["tokens"]
                 if self.cfg.mode == "live":
                     amount = self.rpc.token_balance(self.wallet.pubkey, bag["mint"]) or amount
-                quote = self.jup.quote(bag["mint"], WSOL, int(amount))
+                quote = self.jup.quote(bag["mint"], WSOL, int(amount), slippage_bps=self.cfg.sell_slippage_bps)
                 sig = self.execute_swap(quote) if self.cfg.mode == "live" else ""
                 proceeds = int(quote["outAmount"]) / LAMPORTS * sol_price
                 if self.cfg.mode == "paper":
@@ -609,13 +628,33 @@ class Executor:
                 )
                 log(f"EXIT moon bag {bag['mint']} ${proceeds:.2f}")
             except Exception as exc:
-                log(f"WARN liquidating moon bag {bag['mint']}: {exc}")
+                log(f"WARN liquidating moon bag {bag['mint']}: {describe_error(exc)}")
+
+    def enter_with_retry(self, item: dict[str, Any], sol_price: float) -> None:
+        """Slippage rejections are transient (the price moved during the ~1s between quote and
+        send), so re-quote and try again a couple of times. try_enter re-runs every guard on
+        each attempt, so the staleness window still bounds how late an entry can land."""
+        attempts = 1 + max(0, self.cfg.entry_retries)
+        for attempt in range(1, attempts + 1):
+            try:
+                self.try_enter(item, sol_price)
+                return
+            except Exception as exc:
+                reason = describe_error(exc)
+                if attempt < attempts:
+                    log(f"WARN entry {item['mint']} attempt {attempt}/{attempts} failed: {reason}; retrying")
+                    time.sleep(self.cfg.entry_retry_seconds)
+                else:
+                    log(f"WARN entry {item['mint']} failed after {attempts} attempts: {reason}")
 
     # ---- main loop -------------------------------------------------------
     def run(self) -> None:
         log(f"executor starting: mode={self.cfg.mode} fraction={self.cfg.account_fraction} "
             f"max_pos=${self.cfg.max_position_usd} tp=+{self.cfg.take_profit:.0%} sl=-{self.cfg.stop_loss:.0%} "
-            f"time_stop={self.cfg.time_stop_minutes:.0f}m daily_loss_limit=${self.cfg.daily_loss_limit_usd}")
+            f"time_stop={self.cfg.time_stop_minutes:.0f}m trail={self.cfg.trailing_stop:.0%} "
+            f"scale_out={self.cfg.scale_out_at:.0%}x{self.cfg.scale_out_fraction:.0%} moon_bag={self.cfg.moon_bag:.0%} "
+            f"slippage={self.cfg.slippage_bps}/{self.cfg.sell_slippage_bps}bps(buy/sell) "
+            f"retries={self.cfg.entry_retries} daily_loss_limit=${self.cfg.daily_loss_limit_usd}")
         if self.cfg.mode == "live":
             log(f"live wallet: {self.wallet.pubkey} (burner only!)")
             try:
@@ -643,10 +682,7 @@ class Executor:
                     self.pending.remove(item)
                     if draining:
                         continue
-                    try:
-                        self.try_enter(item, sol_price)
-                    except Exception as exc:
-                        log(f"WARN entry {item['mint']} failed: {exc}")
+                    self.enter_with_retry(item, sol_price)
                 if self.state["positions"]:
                     self.manage_positions(sol_price, panic)
                 if panic and self.state.get("moon_bags"):
