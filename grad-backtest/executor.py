@@ -191,7 +191,7 @@ class Config:
         self.max_dev_cluster_pct = percent_env("MAX_DEV_CLUSTER_PCT", 15)
         self.max_top10_wallet_pct = percent_env("MAX_TOP10_WALLET_PCT", 50)
         self.max_early_buy_pct = percent_env("MAX_EARLY_BUY_PCT", 30)
-        self.min_funder_coverage_pct = percent_env("MIN_FUNDER_COVERAGE_PCT", 60)
+        self.min_funder_coverage_pct = percent_env("MIN_FUNDER_COVERAGE_PCT", 30)
         self.bundle_log_only = os.getenv("BUNDLE_LOG_ONLY", "0") == "1"
         self.bundle_fail_closed = os.getenv("BUNDLE_FAIL_CLOSED", "1") == "1"
         self.bundle_lookup_timeout_ms = max(250, int(os.getenv("BUNDLE_LOOKUP_TIMEOUT_MS", "1500")))
