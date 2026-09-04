@@ -241,6 +241,11 @@ Entry guards, applied before every buy:
 - **Staleness** — an entry more than `MAX_ENTRY_LATENESS_SECONDS` (60s) past
   its target time is skipped; a late entry is not the trade the backtest models.
 
+Adopted holdings (see restart safety below) do not occupy an entry slot:
+they are money already in the market, not a decision being made now, so three
+leftover $2 bags cannot block every new graduation the way they did on the
+first restart after adoption shipped.
+
 Every one of the metadata guards fails open: if its lookup errors or times
 out, a `WARN` is logged and that check is skipped for the entry, so an RPC
 hiccup can neither block trading nor be mistaken for a clean token. Each
@@ -269,7 +274,17 @@ Then, if the numbers beat the plain TP/SL/time-stop run, set `TRAILING_STOP`
 backtest sample, not from one chart — a single example proves the mechanism,
 not the parameter.
 
-### Restart safety, rent reclaim, and stuck positions (live mode)
+### Rate limits and transaction retries
+
+Helius and Jupiter both answer bursts with HTTP 429. Every RPC and Jupiter
+call retries on 429 with a short backoff (0.5s, 1s, 2s, 4s) before giving up;
+anything other than 429 is raised immediately. The SOL/USD price is cached for
+30 seconds instead of re-quoted every loop, and startup account closes are
+paced at one per second. If a swap is rejected with `BlockhashNotFound` (the
+RPC node had not seen the blockhash Jupiter built on), the executor builds a
+fresh transaction on the same quote once before treating it as a failure.
+
+## Restart safety, rent reclaim, and stuck positions (live mode)
 
 Learned from a night where restarts stranded six positions and 59 empty token
 accounts held ~0.12 SOL of rent:
