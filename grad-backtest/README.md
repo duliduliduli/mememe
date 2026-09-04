@@ -119,7 +119,7 @@ mememe/
     ├── Dockerfile, railway.json   same as root, for builds rooted here
     ├── .env.example            every variable with a comment
     ├── data/graduations.example.csv
-    └── test_*.py               115 unit tests (section 10)
+    └── test_*.py               111 unit tests (section 10)
 ```
 
 ---
