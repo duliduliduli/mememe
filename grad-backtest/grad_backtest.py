@@ -199,6 +199,8 @@ class TradeResult:
     gross_return: float
     net_return: float
     both_barriers_same_candle: bool
+    moon_bag_fraction: float = 0.0
+    moon_bag_price: float = 0.0  # price the kept fraction is valued/sold at (last candle, ~24h)
 
 
 class GeckoTerminal:
@@ -315,6 +317,7 @@ def simulate_trade(
     time_stop_minutes: int,
     side_cost: float,
     trailing_stop: float = 0.0,
+    moon_bag: float = 0.0,
 ) -> TradeResult:
     tp_price = entry_price * (1.0 + take_profit)
     sl_price = entry_price * (1.0 - stop_loss)
@@ -351,7 +354,15 @@ def simulate_trade(
             break
         peak = max(peak, candle.high)
 
-    gross, net = apply_costs(entry_price, exit_price, side_cost)
+    # Moon bag: sell only (1-mb) at the primary exit, hold mb until the end of
+    # the collected path (~24h) and sell there. Both sell legs pay side_cost, so
+    # the blended effective exit price folds into the same cost formula.
+    moon_bag_price = 0.0
+    effective_exit = exit_price
+    if moon_bag > 0:
+        moon_bag_price = sorted(minute_candles, key=lambda c: c.timestamp)[-1].close
+        effective_exit = exit_price * (1.0 - moon_bag) + moon_bag_price * moon_bag
+    gross, net = apply_costs(entry_price, effective_exit, side_cost)
     return TradeResult(
         mint_address=mint,
         graduation_timestamp=utc_iso(graduation_ts),
@@ -365,6 +376,8 @@ def simulate_trade(
         gross_return=gross,
         net_return=net,
         both_barriers_same_candle=ambiguous,
+        moon_bag_fraction=moon_bag,
+        moon_bag_price=moon_bag_price,
     )
 
 
@@ -505,6 +518,7 @@ def run_backtest(args: argparse.Namespace) -> None:
                 args.time_stop_minutes,
                 args.side_cost,
                 args.trailing_stop,
+                args.moon_bag,
             )
             trades.append(asdict(trade))
             snapshots.extend(snapshot_rows(mint, graduation_ts, pool, minute_path))
@@ -538,6 +552,7 @@ def run_backtest(args: argparse.Namespace) -> None:
             "take_profit": args.take_profit,
             "stop_loss": args.stop_loss,
             "trailing_stop": args.trailing_stop,
+            "moon_bag": args.moon_bag,
             "time_stop_minutes": args.time_stop_minutes,
             "cost_each_side": args.side_cost,
             "round_trip_cost_at_flat_price": 1 - (1 - args.side_cost) / (1 + args.side_cost),
@@ -575,6 +590,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--trailing-stop", type=float, default=0.0,
         help="Exit when price falls this fraction from its post-entry peak (0 disables)",
+    )
+    run.add_argument(
+        "--moon-bag", type=float, default=0.0,
+        help="Keep this fraction of the position at the primary exit and sell it at ~24h (0 disables)",
     )
     run.add_argument("--time-stop-minutes", type=int, default=30)
     run.add_argument("--side-cost", type=float, default=0.03, help="Fraction charged on entry and exit")

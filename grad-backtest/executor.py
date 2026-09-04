@@ -89,6 +89,7 @@ class Config:
         self.take_profit = float(os.getenv("TAKE_PROFIT", "0.75"))
         self.stop_loss = float(os.getenv("STOP_LOSS", "0.30"))
         self.trailing_stop = float(os.getenv("TRAILING_STOP", "0"))  # fraction off peak; 0 disables
+        self.moon_bag = min(0.5, max(0.0, float(os.getenv("MOON_BAG", "0"))))  # fraction kept at exit; 0 disables
         self.time_stop_minutes = float(os.getenv("TIME_STOP_MINUTES", "30"))
         self.entry_delay_seconds = float(os.getenv("ENTRY_DELAY_SECONDS", "30"))
         self.max_entry_age_seconds = float(os.getenv("MAX_ENTRY_AGE_SECONDS", "120"))
@@ -434,6 +435,8 @@ class Executor:
     def close_position(self, pos: dict[str, Any], reason: str, sol_price: float) -> None:
         mint = pos["mint"]
         sell_sig = ""
+        # Panic dumps everything; otherwise keep the configured moon-bag fraction.
+        mb = 0.0 if reason == "panic" else self.cfg.moon_bag
         if self.cfg.mode == "live":
             amount = self.rpc.token_balance(self.wallet.pubkey, mint)
             if amount <= 0:
@@ -441,15 +444,30 @@ class Executor:
                 self.state["positions"].remove(pos)
                 save_state(self.state)
                 return
-            quote = self.jup.quote(mint, WSOL, amount)
-            sell_sig = self.execute_swap(quote)
-            exit_usd = int(quote["outAmount"]) / LAMPORTS * sol_price
         else:
-            quote = self.jup.quote(mint, WSOL, int(pos["tokens"]))
-            exit_usd = int(quote["outAmount"]) / LAMPORTS * sol_price
+            amount = int(pos["tokens"])
+        keep = int(amount * mb)
+        sell_amount = amount - keep
+        quote = self.jup.quote(mint, WSOL, sell_amount)
+        if self.cfg.mode == "live":
+            sell_sig = self.execute_swap(quote)
+        exit_usd = int(quote["outAmount"]) / LAMPORTS * sol_price
+        if self.cfg.mode == "paper":
             self.state["paper_balance_usd"] = float(self.state["paper_balance_usd"]) + exit_usd
-        net = exit_usd / pos["position_usd"] - 1.0
-        self.state["daily"]["realized_pnl_usd"] = float(self.state["daily"]["realized_pnl_usd"]) + (exit_usd - pos["position_usd"])
+        sold_cost = pos["position_usd"] * (1.0 - mb)
+        net = exit_usd / sold_cost - 1.0 if sold_cost > 0 else 0.0
+        if keep > 0:
+            self.state.setdefault("moon_bags", []).append(
+                {
+                    "mint": mint,
+                    "tokens": keep,
+                    "cost_usd": round(pos["position_usd"] * mb, 2),
+                    "created_at": utc_iso(),
+                    "from_exit": reason,
+                }
+            )
+            log(f"MOONBAG {mint}: keeping {mb:.0%} ({keep} tokens, ${pos['position_usd'] * mb:.2f} basis)")
+        self.state["daily"]["realized_pnl_usd"] = float(self.state["daily"]["realized_pnl_usd"]) + (exit_usd - sold_cost)
         self.state["positions"].remove(pos)
         save_state(self.state)
         record_trade(
@@ -458,7 +476,7 @@ class Executor:
                 "closed_at": utc_iso(),
                 "mint": mint,
                 "mode": self.cfg.mode,
-                "position_usd": round(pos["position_usd"], 2),
+                "position_usd": round(sold_cost, 2),
                 "exit_usd": round(exit_usd, 2),
                 "net_return": round(net, 4),
                 "exit_reason": reason,
@@ -482,6 +500,35 @@ class Executor:
                     self.close_position(pos, reason, sol_price)
             except Exception as exc:
                 log(f"WARN managing {pos['mint']}: {exc}")
+
+    def liquidate_moon_bags(self, sol_price: float) -> None:
+        for bag in list(self.state.get("moon_bags", [])):
+            try:
+                amount = bag["tokens"]
+                if self.cfg.mode == "live":
+                    amount = self.rpc.token_balance(self.wallet.pubkey, bag["mint"]) or amount
+                quote = self.jup.quote(bag["mint"], WSOL, int(amount))
+                sig = self.execute_swap(quote) if self.cfg.mode == "live" else ""
+                proceeds = int(quote["outAmount"]) / LAMPORTS * sol_price
+                if self.cfg.mode == "paper":
+                    self.state["paper_balance_usd"] = float(self.state["paper_balance_usd"]) + proceeds
+                self.state["moon_bags"].remove(bag)
+                record_trade(
+                    {
+                        "opened_at": bag["created_at"],
+                        "closed_at": utc_iso(),
+                        "mint": bag["mint"],
+                        "mode": self.cfg.mode,
+                        "position_usd": bag["cost_usd"],
+                        "exit_usd": round(proceeds, 2),
+                        "net_return": round(proceeds / bag["cost_usd"] - 1.0, 4) if bag["cost_usd"] else 0.0,
+                        "exit_reason": "panic_moon_bag",
+                        "sell_signature": sig,
+                    }
+                )
+                log(f"EXIT moon bag {bag['mint']} ${proceeds:.2f}")
+            except Exception as exc:
+                log(f"WARN liquidating moon bag {bag['mint']}: {exc}")
 
     # ---- main loop -------------------------------------------------------
     def run(self) -> None:
@@ -514,10 +561,12 @@ class Executor:
                         log(f"WARN entry {item['mint']} failed: {exc}")
                 if self.state["positions"]:
                     self.manage_positions(sol_price, panic)
-                if panic and not self.state["positions"]:
+                if panic and self.state.get("moon_bags"):
+                    self.liquidate_moon_bags(sol_price or self.sol_price_usd())
+                if panic and not self.state["positions"] and not self.state.get("moon_bags"):
                     PANIC_FLAG.unlink(missing_ok=True)
                     STOP_FLAG.touch()
-                    log("panic complete: all positions closed, executor draining")
+                    log("panic complete: all positions and moon bags closed, executor draining")
                 save_state(self.state)
             except Exception as exc:
                 log(f"ERROR loop: {exc}")

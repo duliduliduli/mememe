@@ -195,6 +195,25 @@ Then, if the numbers beat the plain TP/SL/time-stop run, set `TRAILING_STOP`
 backtest sample, not from one chart — a single example proves the mechanism,
 not the parameter.
 
+### Moon bag (off by default — backtest it first)
+
+Some tokens dump past our exit and then rerun hours or days later. A moon bag
+keeps a fraction of each position at the primary exit instead of selling all
+of it. Backtest it — the simulation sells the kept fraction at the ~24h mark:
+
+```bash
+python grad_backtest.py run --output-dir data/mb15 --moon-bag 0.15
+python grad_backtest.py run --output-dir data/mb15_trail --moon-bag 0.15 --trailing-stop 0.25
+```
+
+If it wins across the sample, set `MOON_BAG` (e.g. `0.15`, capped at `0.5`) on
+the executor: each exit sells the rest and parks the kept tokens in the state
+file's `moon_bags` list (shown on the dashboard's Live panel). Moon bags are
+not actively managed; `panic` liquidates them along with everything else. Note
+the cost: on stop-loss exits the kept fraction usually rides to ~zero, so the
+24h-sale backtest number is the honest measure of whether the occasional
+rerun pays for all the bags that die.
+
 Control it through the dashboard API (all require the `x-admin-token` header):
 
 ```bash

@@ -98,3 +98,37 @@ class TrailingStopTests(unittest.TestCase):
         candles = [Candle(100, 100, 180, 99, 170, 1)]
         result = simulate_trade("m", 0, "p", "pump", 100, 100, candles, 0.75, 0.30, 30, 0.03)
         self.assertEqual(result.exit_reason, "take_profit")
+
+
+class MoonBagTests(unittest.TestCase):
+    def test_backtest_moon_bag_blends_late_price(self):
+        from grad_backtest import Candle, apply_costs, simulate_trade
+        candles = [
+            Candle(100, 100, 180, 99, 170, 1),      # TP +75% hits at 175
+            Candle(160, 170, 320, 160, 300, 1),     # later path
+            Candle(86000, 300, 310, 290, 300, 1),   # ~24h close at 300
+        ]
+        result = simulate_trade("m", 0, "p", "pump", 100, 100, candles, 0.75, 0.30, 30, 0.03, moon_bag=0.15)
+        self.assertEqual(result.exit_reason, "take_profit")
+        self.assertEqual(result.moon_bag_price, 300)
+        expected = apply_costs(100, 175 * 0.85 + 300 * 0.15, 0.03)[1]
+        self.assertAlmostEqual(result.net_return, expected)
+
+    def test_backtest_moon_bag_disabled_by_default(self):
+        from grad_backtest import Candle, simulate_trade
+        candles = [Candle(100, 100, 180, 99, 170, 1)]
+        result = simulate_trade("m", 0, "p", "pump", 100, 100, candles, 0.75, 0.30, 30, 0.03)
+        self.assertEqual(result.moon_bag_fraction, 0.0)
+        self.assertEqual(result.exit_price, 175)
+
+    def test_executor_moon_bag_config_clamped(self):
+        with mock.patch.dict(os.environ, {"MOON_BAG": "0.9"}):
+            import importlib
+            import executor
+            importlib.reload(executor)
+            self.assertEqual(executor.Config().moon_bag, 0.5)
+        with mock.patch.dict(os.environ, {"MOON_BAG": "-1"}):
+            import importlib
+            import executor
+            importlib.reload(executor)
+            self.assertEqual(executor.Config().moon_bag, 0.0)
