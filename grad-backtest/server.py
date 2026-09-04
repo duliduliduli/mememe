@@ -35,7 +35,7 @@ ACCOUNT_FRACTION = float(os.getenv("ACCOUNT_FRACTION", "0.10"))
 FIXED_FEE_PER_SIDE = float(os.getenv("FIXED_FEE_PER_SIDE", "0.10"))
 LOG_FILE = DATA_DIR / "run.log"
 
-ALLOWED_STAGES = {"collect", "run", "sizing"}
+ALLOWED_STAGES = {"collect", "run", "sizing", "optimize"}
 EXECUTOR_STATE = DATA_DIR / "executor_state.json"
 EXECUTOR_STOP = DATA_DIR / "executor.stop"
 EXECUTOR_PANIC = DATA_DIR / "executor.panic"
@@ -212,6 +212,8 @@ async def run_job(request: Request) -> JSONResponse:
         argv = [sys.executable, "position_sizing.py", "--input", str(DATA_DIR / "trade_results.csv"),
                 "--output", str(DATA_DIR / "sizing_summary.json"), "--balance", str(START_BALANCE),
                 "--fixed-fee-per-side", str(FIXED_FEE_PER_SIDE), *extra]
+    elif stage == "optimize":
+        argv = [sys.executable, "optimize.py", *extra]
     else:
         argv = [sys.executable, "grad_backtest.py", stage, *extra]
 
