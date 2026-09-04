@@ -76,7 +76,7 @@ class ExecutorScaleOutTests(unittest.TestCase):
         self._seed(ex)
         start_balance = ex.state["paper_balance_usd"]
         # sol_price=100: 1000 tokens quote to 0.07 SOL = $7.00 (+40%) -> scale-out fires
-        ex.jup.quote = lambda mint, out, amount: {"outAmount": str(amount * 70_000)}
+        ex.jup.quote = lambda mint, out, amount, **kw: {"outAmount": str(amount * 70_000)}
         ex.manage_positions(100.0, panic=False)
         pos = ex.state["positions"][0]
         self.assertTrue(pos["scaled_out"])
@@ -94,7 +94,7 @@ class ExecutorScaleOutTests(unittest.TestCase):
         self.assertEqual(len(self._trades()), 1)
 
         # Remainder reaches $4.40 (>= 2.5 * 1.75) -> take_profit on the reduced basis
-        ex.jup.quote = lambda mint, out, amount: {"outAmount": str(amount * 88_000)}
+        ex.jup.quote = lambda mint, out, amount, **kw: {"outAmount": str(amount * 88_000)}
         ex.manage_positions(100.0, panic=False)
         self.assertEqual(ex.state["positions"], [])
         rows = self._trades()
@@ -106,7 +106,7 @@ class ExecutorScaleOutTests(unittest.TestCase):
     def test_scale_out_off_by_default(self):
         ex = self._executor({})
         self._seed(ex)
-        ex.jup.quote = lambda mint, out, amount: {"outAmount": str(amount * 70_000)}  # +40%
+        ex.jup.quote = lambda mint, out, amount, **kw: {"outAmount": str(amount * 70_000)}  # +40%
         ex.manage_positions(100.0, panic=False)
         self.assertNotIn("scaled_out", ex.state["positions"][0])
         self.assertFalse((Path(self.tmp) / "live_trades.csv").exists())
