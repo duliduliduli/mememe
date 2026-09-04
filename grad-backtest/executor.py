@@ -31,12 +31,23 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import requests
 
+from bundle_analysis import (
+    CEX_FUNDERS,
+    bundle_slot_pct,
+    cluster_supply_pct,
+    cluster_wallets,
+    early_buy_pct,
+    related_holder_wallets,
+    top_wallets_supply_pct,
+    wallets_supply_pct,
+)
 from grad_backtest import KNOWN_QUOTES, WSOL, candidate_mints
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
@@ -59,11 +70,19 @@ TRADE_COLUMNS = [
     "opened_at", "closed_at", "mint", "mode", "position_usd", "exit_usd",
     "net_return", "exit_reason", "buy_signature", "sell_signature", "entry_price_impact_pct",
     "peak_gain_pct", "entry_market_cap_usd", "entry_curve_age_seconds", "entry_top_holder_pct",
+    "entry_bundle_slot_pct", "entry_cluster_pct", "entry_dev_cluster_pct",
+    "entry_top10_wallet_pct", "entry_early_buy_pct", "entry_funder_coverage_pct",
 ]
 
 
 def now_ts() -> float:
     return time.time()
+
+
+def percent_env(name: str, default: float) -> float:
+    """Read a percentage while accepting either 30 or the legacy 0.30 spelling."""
+    value = float(os.getenv(name, str(default)))
+    return value * 100 if 0 < value <= 1 else value
 
 
 RATE_LIMIT_BACKOFF = (0.5, 1.0, 2.0, 4.0)
@@ -160,6 +179,18 @@ class Config:
         # the one that dumps on us (SOLL's creator held 59% at graduation). 0 disables either.
         self.min_curve_age_seconds = float(os.getenv("MIN_CURVE_AGE_SECONDS", "120"))
         self.max_top_holder_pct = float(os.getenv("MAX_TOP_HOLDER_PCT", "20"))
+        # Multi-wallet bundle checks. The old .env example expressed percentages as fractions
+        # (0.30 == 30%), so percent_env accepts both forms during rollout.
+        self.max_bundle_slot_pct = percent_env("MAX_BUNDLE_SLOT_PCT", 30)
+        self.max_cluster_pct = percent_env("MAX_CLUSTER_PCT", 30)
+        self.max_dev_cluster_pct = percent_env("MAX_DEV_CLUSTER_PCT", 15)
+        self.max_top10_wallet_pct = percent_env("MAX_TOP10_WALLET_PCT", 50)
+        self.max_early_buy_pct = percent_env("MAX_EARLY_BUY_PCT", 30)
+        self.min_funder_coverage_pct = percent_env("MIN_FUNDER_COVERAGE_PCT", 60)
+        self.bundle_log_only = os.getenv("BUNDLE_LOG_ONLY", "0") == "1"
+        self.bundle_fail_closed = os.getenv("BUNDLE_FAIL_CLOSED", "1") == "1"
+        self.bundle_lookup_timeout_ms = max(250, int(os.getenv("BUNDLE_LOOKUP_TIMEOUT_MS", "1500")))
+        self.bundle_max_wallets = min(20, max(2, int(os.getenv("BUNDLE_MAX_WALLETS", "20"))))
         self.max_entry_lateness_seconds = float(os.getenv("MAX_ENTRY_LATENESS_SECONDS", "60"))
         # Startup wallet reconciliation (live only): adopt untracked holdings worth at least
         # MIN_ADOPT_USD as managed positions so a restart never strands a bag, and close empty
@@ -276,6 +307,7 @@ def entry_guard_reason(
     market_cap_usd: float | None = None,
     curve_age_seconds: float | None = None,
     top_holder_pct: float | None = None,
+    bundle: dict[str, Any] | None = None,
 ) -> str | None:
     """Reject entries that are no longer the trade the backtest models.
 
@@ -321,6 +353,21 @@ def entry_guard_reason(
             f"top wallet holds {top_holder_pct:.1f}% of supply > {cfg.max_top_holder_pct:.0f}% "
             "(one holder can dump the pool)"
         )
+    if bundle is not None:
+        if not bundle.get("complete", False) and cfg.bundle_fail_closed:
+            detail = bundle.get("error") or "required holder/funding history was incomplete"
+            return f"bundle data unavailable ({detail})"
+        checks = (
+            ("bundle_slot_pct", cfg.max_bundle_slot_pct, "same-slot wallets"),
+            ("cluster_pct", cfg.max_cluster_pct, "connected funding cluster"),
+            ("dev_cluster_pct", cfg.max_dev_cluster_pct, "creator-linked wallet cluster"),
+            ("top10_wallet_pct", cfg.max_top10_wallet_pct, "top ten wallets"),
+            ("early_buy_pct", cfg.max_early_buy_pct, "first three slots"),
+        )
+        for key, limit, label in checks:
+            value = bundle.get(key)
+            if value is not None and limit > 0 and value > limit:
+                return f"{label} hold {value:.1f}% of supply > {limit:.1f}%"
     return None
 
 
@@ -438,14 +485,14 @@ class Rpc:
             before = sigs[-1]["signature"]
         return None
 
-    def top_wallet_holder(self, mint: str, exclude: set[str] | None = None) -> tuple[str, int] | None:
-        """(owner, raw amount) of the largest plain-wallet holder among the mint's 20 largest
-        token accounts. Accounts owned by programs (AMM pools, bonding curves, Mayhem vaults)
-        cannot dump on us and are skipped, as are owners in `exclude` (our own wallet)."""
+    def plain_wallet_holders(
+        self, mint: str, exclude: set[str] | None = None, limit: int = 20
+    ) -> list[tuple[str, int]]:
+        """Largest plain-wallet holders, combining multiple token accounts per owner."""
         exclude = exclude or set()
         largest = self.call("getTokenLargestAccounts", [mint]).get("value") or []
         if not largest:
-            return None
+            return []
         addresses = [entry["address"] for entry in largest]
         accounts = self.call("getMultipleAccounts", [addresses, {"encoding": "jsonParsed"}]).get("value") or []
         owners: list[tuple[str, int]] = []
@@ -458,18 +505,138 @@ class Rpc:
                 continue
             owners.append((owner, int(entry["amount"])))
         if not owners:
-            return None
+            return []
         owner_accounts = self.call(
             "getMultipleAccounts", [[owner for owner, _ in owners], {"encoding": "base64"}]
         ).get("value") or []
-        best: tuple[str, int] | None = None
+        totals: dict[str, int] = {}
         for (owner, amount), acct in zip(owners, owner_accounts):
             program = acct["owner"] if acct else SYSTEM_PROGRAM  # unfunded wallet: still a wallet
             if program != SYSTEM_PROGRAM or owner in exclude:
                 continue
-            if best is None or amount > best[1]:
-                best = (owner, amount)
-        return best
+            totals[owner] = totals.get(owner, 0) + amount
+        return sorted(totals.items(), key=lambda row: row[1], reverse=True)[:limit]
+
+    def top_wallet_holder(self, mint: str, exclude: set[str] | None = None) -> tuple[str, int] | None:
+        """(owner, raw amount) of the largest plain-wallet holder."""
+        holders = self.plain_wallet_holders(mint, exclude, 1)
+        return holders[0] if holders else None
+
+    def enhanced_transactions(self, address: str, **params: Any) -> list[dict[str, Any]]:
+        """Low-latency parsed Helius history used only by the entry bundle gate."""
+        url = f"https://api-mainnet.helius-rpc.com/v0/addresses/{address}/transactions"
+        query = {"api-key": self.cfg.helius_api_key, "commitment": "confirmed", **params}
+        timeout = self.cfg.bundle_lookup_timeout_ms / 1000
+        response = requests.get(url, params=query, timeout=timeout)
+        response.raise_for_status()
+        body = response.json()
+        if not isinstance(body, list):
+            raise RuntimeError(f"Helius history returned {str(body)[:160]}")
+        return body
+
+    def origin_funder(self, wallet: str, before_ts: float) -> str | None:
+        """Earliest meaningful inbound SOL sender visible before graduation."""
+        transactions = self.enhanced_transactions(
+            wallet,
+            **{"sort-order": "asc", "lte-time": int(before_ts), "limit": 25},
+        )
+        for tx in transactions:
+            for transfer in tx.get("nativeTransfers") or []:
+                sender = transfer.get("fromUserAccount")
+                recipient = transfer.get("toUserAccount")
+                amount = int(transfer.get("amount") or 0)
+                if recipient == wallet and sender and sender != wallet and amount >= 100_000:
+                    return sender
+        return None
+
+    def bundle_snapshot(
+        self,
+        mint: str,
+        supply_ui: float,
+        decimals: int,
+        created_ts: float,
+        graduated_ts: float,
+        exclude: set[str] | None = None,
+    ) -> dict[str, Any]:
+        """Build the live equivalent of a Bubblemap from the largest plain-wallet holders."""
+        holders = self.plain_wallet_holders(mint, exclude, self.cfg.bundle_max_wallets)
+        if len(holders) < 2:
+            return {"complete": False, "error": "fewer than two plain-wallet holders returned"}
+        wallet_amounts = {wallet: raw / (10 ** decimals) for wallet, raw in holders}
+        holder_set = set(wallet_amounts)
+        transactions = self.enhanced_transactions(
+            mint,
+            **{
+                "sort-order": "asc",
+                "gte-time": int(created_ts) - 2,
+                "lte-time": int(graduated_ts) + 2,
+                "limit": 100,
+            },
+        )
+        buys: list[dict[str, Any]] = []
+        creator = None
+        create_slot = None
+        for tx in transactions:
+            slot = tx.get("slot")
+            if slot is None:
+                continue
+            if create_slot is None or int(slot) < create_slot:
+                create_slot = int(slot)
+                creator = tx.get("feePayer") or creator
+            amounts: dict[str, float] = {}
+            for transfer in tx.get("tokenTransfers") or []:
+                wallet = transfer.get("toUserAccount")
+                if transfer.get("mint") != mint or wallet not in holder_set:
+                    continue
+                raw = float(transfer.get("tokenAmount") or transfer.get("rawTokenAmount") or 0)
+                transfer_decimals = int(transfer.get("decimals", decimals))
+                # Legacy Enhanced Transactions reports tokenAmount in UI units; Parsed Events uses
+                # rawTokenAmount. Prefer the raw field when it is present.
+                amount = raw / (10 ** transfer_decimals) if "rawTokenAmount" in transfer else raw
+                amounts[wallet] = amounts.get(wallet, 0.0) + amount
+            buys.extend({"wallet": wallet, "slot": int(slot), "amount": amount} for wallet, amount in amounts.items())
+        if not buys or create_slot is None:
+            return {"complete": False, "error": "mint purchase history was empty or not yet indexed"}
+
+        funders: dict[str, str | None] = {wallet: None for wallet in holder_set}
+        timeout = self.cfg.bundle_lookup_timeout_ms / 1000
+        workers = min(8, len(holder_set))
+        total_timeout = timeout * ((len(holder_set) + workers - 1) // workers) + 0.25
+        pool = ThreadPoolExecutor(max_workers=workers)
+        futures = {pool.submit(self.origin_funder, wallet, graduated_ts): wallet for wallet in holder_set}
+        try:
+            for future in as_completed(futures, timeout=total_timeout):
+                wallet = futures[future]
+                try:
+                    funders[wallet] = future.result()
+                except Exception:
+                    funders[wallet] = None
+        except TimeoutError:
+            pass
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+        covered_amount = sum(wallet_amounts[w] for w, funder in funders.items() if funder)
+        tracked_amount = sum(wallet_amounts.values())
+        coverage_pct = covered_amount / tracked_amount * 100 if tracked_amount else 0.0
+        clusters = cluster_wallets(funders)
+        largest_cluster_pct, cluster_members = cluster_supply_pct(clusters, wallet_amounts, supply_ui)
+        dev_members = related_holder_wallets(funders, creator)
+        same_slot_pct, bundle_slot, bundle_wallets = bundle_slot_pct(buys, supply_ui)
+        return {
+            "complete": coverage_pct >= self.cfg.min_funder_coverage_pct,
+            "error": None if coverage_pct >= self.cfg.min_funder_coverage_pct else f"funder coverage {coverage_pct:.1f}%",
+            "bundle_slot_pct": same_slot_pct,
+            "bundle_slot": bundle_slot,
+            "bundle_wallets": bundle_wallets,
+            "cluster_pct": largest_cluster_pct,
+            "cluster_wallets": cluster_members,
+            "dev_cluster_pct": wallets_supply_pct(dev_members, wallet_amounts, supply_ui),
+            "top10_wallet_pct": top_wallets_supply_pct(wallet_amounts, supply_ui),
+            "early_buy_pct": early_buy_pct(buys, supply_ui, create_slot),
+            "funder_coverage_pct": coverage_pct,
+            "creator": creator,
+        }
 
     def send_raw(self, raw: bytes) -> str:
         return self.call(
@@ -650,10 +817,8 @@ class Executor:
 
     def entry_metadata(
         self, mint: str, graduated_ts: float, size_usd: float, tokens: int
-    ) -> tuple[float | None, float | None, float | None, str | None]:
-        """(market cap, seconds from creation to graduation, top wallet holder %, that wallet).
-        Every lookup is optional: a failure is logged and leaves that value None, because an
-        entry must never be blocked, or forced, by a metadata call that timed out."""
+    ) -> tuple[float | None, float | None, float | None, str | None, dict[str, Any]]:
+        """Entry metadata plus a mandatory multi-wallet bundle snapshot."""
         cfg = self.cfg
         market_cap = curve_age = top_holder_pct = None
         top_holder = None
@@ -680,7 +845,26 @@ class Executor:
                     top_holder_pct = amount / (10 ** decimals) / supply_ui * 100
             except Exception as exc:
                 log(f"WARN {mint}: holder concentration check unavailable ({describe_error(exc)})")
-        return market_cap, curve_age, top_holder_pct, top_holder
+        bundle: dict[str, Any]
+        if not supply_ui or decimals is None:
+            bundle = {"complete": False, "error": "token supply unavailable"}
+        elif curve_age is None:
+            bundle = {"complete": False, "error": "creation time unavailable"}
+        else:
+            try:
+                exclude = {self.wallet.pubkey} if self.wallet else set()
+                bundle = self.rpc.bundle_snapshot(
+                    mint,
+                    supply_ui,
+                    decimals,
+                    graduated_ts - curve_age,
+                    graduated_ts,
+                    exclude,
+                )
+            except Exception as exc:
+                bundle = {"complete": False, "error": describe_error(exc)}
+                log(f"WARN {mint}: bundle snapshot unavailable ({describe_error(exc)})")
+        return market_cap, curve_age, top_holder_pct, top_holder, bundle
 
     def try_enter(self, item: dict[str, Any], sol_price: float) -> None:
         mint = item["mint"]
@@ -698,7 +882,9 @@ class Executor:
         if tokens <= 0:
             raise RuntimeError("zero-token quote")
         impact = quote_price_impact_pct(quote)
-        market_cap, curve_age, top_holder_pct, top_holder = self.entry_metadata(mint, item["graduated_ts"], size_usd, tokens)
+        market_cap, curve_age, top_holder_pct, top_holder, bundle = self.entry_metadata(
+            mint, item["graduated_ts"], size_usd, tokens
+        )
         guard = entry_guard_reason(
             self.cfg, item["graduated_ts"], now_ts(), impact, market_cap, curve_age, top_holder_pct
         )
@@ -707,6 +893,35 @@ class Executor:
                 guard += f" [{top_holder}]"
             self.skip(mint, guard)
             return
+        bundle_guard = entry_guard_reason(
+            self.cfg,
+            item["graduated_ts"],
+            now_ts(),
+            impact,
+            market_cap,
+            curve_age,
+            top_holder_pct,
+            bundle,
+        )
+        summary = " ".join(
+            f"{key.removesuffix('_pct')}={bundle[key]:.1f}%"
+            for key in (
+                "bundle_slot_pct",
+                "cluster_pct",
+                "dev_cluster_pct",
+                "top10_wallet_pct",
+                "early_buy_pct",
+                "funder_coverage_pct",
+            )
+            if bundle.get(key) is not None
+        )
+        log(f"BUNDLE {mint}: {summary or bundle.get('error', 'no metrics')}")
+        if bundle_guard:
+            if self.cfg.bundle_log_only:
+                log(f"WARN {mint}: bundle log-only would skip: {bundle_guard}")
+            else:
+                self.skip(mint, bundle_guard)
+                return
         # Honeypot guard: a token you can buy but not sell has no reverse route.
         try:
             self.jup.quote(mint, WSOL, tokens)
@@ -743,6 +958,12 @@ class Executor:
                 "entry_market_cap_usd": round(market_cap) if market_cap else None,
                 "entry_curve_age_seconds": round(curve_age) if curve_age is not None else None,
                 "entry_top_holder_pct": round(top_holder_pct, 1) if top_holder_pct is not None else None,
+                "entry_bundle_slot_pct": round(bundle["bundle_slot_pct"], 1) if bundle.get("bundle_slot_pct") is not None else None,
+                "entry_cluster_pct": round(bundle["cluster_pct"], 1) if bundle.get("cluster_pct") is not None else None,
+                "entry_dev_cluster_pct": round(bundle["dev_cluster_pct"], 1) if bundle.get("dev_cluster_pct") is not None else None,
+                "entry_top10_wallet_pct": round(bundle["top10_wallet_pct"], 1) if bundle.get("top10_wallet_pct") is not None else None,
+                "entry_early_buy_pct": round(bundle["early_buy_pct"], 1) if bundle.get("early_buy_pct") is not None else None,
+                "entry_funder_coverage_pct": round(bundle["funder_coverage_pct"], 1) if bundle.get("funder_coverage_pct") is not None else None,
                 "peak_usd": size_usd,
             }
         )
@@ -921,6 +1142,12 @@ class Executor:
                 "entry_market_cap_usd": pos.get("entry_market_cap_usd"),
                 "entry_curve_age_seconds": pos.get("entry_curve_age_seconds"),
                 "entry_top_holder_pct": pos.get("entry_top_holder_pct"),
+                "entry_bundle_slot_pct": pos.get("entry_bundle_slot_pct"),
+                "entry_cluster_pct": pos.get("entry_cluster_pct"),
+                "entry_dev_cluster_pct": pos.get("entry_dev_cluster_pct"),
+                "entry_top10_wallet_pct": pos.get("entry_top10_wallet_pct"),
+                "entry_early_buy_pct": pos.get("entry_early_buy_pct"),
+                "entry_funder_coverage_pct": pos.get("entry_funder_coverage_pct"),
                 "peak_gain_pct": round(peak_gain * 100, 1) if peak_gain is not None else None,
             }
         )
@@ -1001,6 +1228,12 @@ class Executor:
                 "entry_market_cap_usd": pos.get("entry_market_cap_usd"),
                 "entry_curve_age_seconds": pos.get("entry_curve_age_seconds"),
                 "entry_top_holder_pct": pos.get("entry_top_holder_pct"),
+                "entry_bundle_slot_pct": pos.get("entry_bundle_slot_pct"),
+                "entry_cluster_pct": pos.get("entry_cluster_pct"),
+                "entry_dev_cluster_pct": pos.get("entry_dev_cluster_pct"),
+                "entry_top10_wallet_pct": pos.get("entry_top10_wallet_pct"),
+                "entry_early_buy_pct": pos.get("entry_early_buy_pct"),
+                "entry_funder_coverage_pct": pos.get("entry_funder_coverage_pct"),
                 "peak_gain_pct": round(peak_gain * 100, 1) if peak_gain is not None else None,
             }
         )
@@ -1135,6 +1368,10 @@ class Executor:
             f"slippage={self.cfg.slippage_bps}/{self.cfg.sell_slippage_bps}bps(buy/sell) "
             f"mcap=${self.cfg.min_entry_market_cap_usd:,.0f}-${self.cfg.max_entry_market_cap_usd:,.0f} "
             f"curve_age>={self.cfg.min_curve_age_seconds:.0f}s top_holder<={self.cfg.max_top_holder_pct:.0f}% "
+            f"bundle_slot<={self.cfg.max_bundle_slot_pct:.0f}% cluster<={self.cfg.max_cluster_pct:.0f}% "
+            f"dev_cluster<={self.cfg.max_dev_cluster_pct:.0f}% top10<={self.cfg.max_top10_wallet_pct:.0f}% "
+            f"early_buy<={self.cfg.max_early_buy_pct:.0f}% funder_coverage>={self.cfg.min_funder_coverage_pct:.0f}% "
+            f"bundle_mode={'log' if self.cfg.bundle_log_only else 'block'} "
             f"adopt>=${self.cfg.min_adopt_usd} "
             f"stuck_after={self.cfg.stuck_after_minutes:.0f}m "
             f"retries={self.cfg.entry_retries} daily_loss_limit=${self.cfg.daily_loss_limit_usd}")
