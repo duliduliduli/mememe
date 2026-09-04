@@ -213,6 +213,8 @@ prints the important ones.
 | `MAX_ENTRY_AGE_SECONDS` | `120` | A graduation older than this when first seen is skipped. |
 | `MAX_ENTRY_LATENESS_SECONDS` | `60` | An entry attempt more than this past its target time is skipped. |
 | `POLL_SECONDS` | `5` | Main loop period. |
+| `HELIUS_POLL_TIMEOUT_SECONDS` | `5` | Maximum time an entry-discovery poll may delay the next exit check. |
+| `MAX_ENTRIES_PER_CYCLE` | `1` | Maximum due graduations analyzed per loop, preventing entry bursts from starving exits. |
 
 ### 4.4 Entry guards
 
@@ -327,17 +329,14 @@ continues after `POLL_SECONDS`:
 
 1. Roll the daily P&L counter if the UTC date changed.
 2. Read the flag files: `executor.panic` means panic; `executor.stop` or panic means draining.
-3. If not draining, poll Helius for new graduations (6.3).
-4. Collect pending graduations whose entry time has arrived. If there are any, or there are open positions, fetch the SOL price (cached 30 s).
-5. Enter each due graduation via `enter_with_retry` (6.4). Draining drops them.
-6. Manage open positions (6.5).
-7. If moon bags exist and not panicking, run the moon-bag check (6.7), which internally rate-limits itself to `MOON_BAG_CHECK_SECONDS`.
-8. If panicking, liquidate moon bags and stuck positions.
-9. If panicking and nothing is left, delete the panic flag, touch the stop flag, log `panic complete …`.
-10. Save state.
+3. Fetch the SOL price when needed and manage every open position first (6.5).
+4. Manage moon bags, stuck positions, and panic liquidation before doing any entry work.
+5. If not draining, poll Helius for new graduations (6.3), bounded by `HELIUS_POLL_TIMEOUT_SECONDS`.
+6. Collect due graduations and analyze at most `MAX_ENTRIES_PER_CYCLE`; later items remain queued.
+7. Save state.
 
-Pending graduations live only in memory. A restart forgets them, and they are
-re-detected only if still within `MAX_ENTRY_AGE_SECONDS`.
+Pending graduations are persisted in `executor_state.json`. On restart, entries
+later than `MAX_ENTRY_LATENESS_SECONDS` are discarded rather than replayed.
 
 ### 6.3 Detection
 
@@ -468,9 +467,10 @@ Adopted positions are managed normally but do not consume an entry slot. Note
 that adoption loses the original entry price and peak, which is why the `/data`
 volume matters.
 
-After every full live sell, `reclaim_rent` burns any dust and closes the token
-account (`RENT reclaimed ~0.0020 SOL …`). Burns only ever happen on tokens the
-bot itself bought or on dead moon bags.
+After every full live sell, `reclaim_rent` re-reads the exact token account at
+confirmed commitment, burns any real remaining dust, and closes the account
+(`RENT reclaimed ~0.0020 SOL …`). The confirmed re-read prevents a stale
+pre-sell balance from generating a failed burn transaction.
 
 ### 6.10 Rate limits and transaction retries
 
