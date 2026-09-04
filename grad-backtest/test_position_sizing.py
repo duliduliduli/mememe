@@ -39,3 +39,30 @@ class SizingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CliSmokeTests(unittest.TestCase):
+    def test_cli_runs_end_to_end(self):
+        """Regression: main() used os.getenv without importing os and crashed on launch."""
+        import csv
+        import json
+        import os
+        import subprocess
+        import sys
+        import tempfile
+
+        tmp = tempfile.mkdtemp(prefix="grad-sizing-cli-")
+        rows = [0.5, -0.3, 0.2, -0.3, 0.75, -0.3, 0.1, -0.2, 0.6, -0.3] * 3
+        with open(os.path.join(tmp, "trade_results.csv"), "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["mint_address", "net_return"])
+            for i, r in enumerate(rows):
+                w.writerow([f"m{i}", r])
+        out = os.path.join(tmp, "sizing.json")
+        proc = subprocess.run(
+            [sys.executable, "position_sizing.py", "--input", os.path.join(tmp, "trade_results.csv"),
+             "--output", out, "--paths", "50"],
+            capture_output=True, text=True, env={**os.environ, "DATA_DIR": tmp},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("grid", json.load(open(out)))
