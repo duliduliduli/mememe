@@ -363,7 +363,7 @@ function renderLive(l) {
   $("liveNote").textContent = (open.length
     ? open.length + " open position(s): " + open.map(p => shortMint(p.mint) + " ($" + p.position_usd + ")").join(", ")
     : "No open positions.")
-    + (bags.length ? " · " + bags.length + " moon bag(s) held: " + bags.map(b => shortMint(b.mint)).join(", ") : "")
+    + (bags.length ? " · " + bags.length + " moon bag(s) held: " + bags.map(b => shortMint(b.mint) + (b.last_x != null ? " " + b.last_x + "x" : "")).join(", ") : "")
     + (stuck.length ? " · " + stuck.length + " STUCK (unsellable, slot freed): " + stuck.map(b => shortMint(b.mint)).join(", ") : "");
   const k = $("liveKpis"); k.replaceChildren();
   const balance = l.mode === "live" ? null : l.state?.paper_balance_usd;
