@@ -550,7 +550,9 @@ class Rpc:
         """
         exclude = exclude or set()
         try:
-            das = self.call("getTokenAccounts", {"mint": mint, "page": 1, "limit": limit}) or {}
+            # DAS does not promise balance ordering, so inspect the full first page and sort
+            # locally rather than asking it for only N arbitrary accounts.
+            das = self.call("getTokenAccounts", {"mint": mint, "page": 1, "limit": 1000}) or {}
             rows = das.get("token_accounts") or das.get("tokenAccounts") or []
             totals: dict[str, int] = {}
             for row in rows:
