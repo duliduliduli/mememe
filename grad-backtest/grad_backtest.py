@@ -26,6 +26,7 @@ import pandas as pd
 import requests
 
 
+DATA_DIR = os.getenv("DATA_DIR", "data")
 WSOL = "So11111111111111111111111111111111111111112"
 USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 USDT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
@@ -545,12 +546,12 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument("--start-time", help="ISO-8601 or Unix timestamp")
     collect.add_argument("--end-time", help="ISO-8601 or Unix timestamp")
     collect.add_argument("--requests-per-minute", type=float, default=30)
-    collect.add_argument("--output", default="data/graduations.csv")
+    collect.add_argument("--output", default=os.path.join(DATA_DIR, "graduations.csv"))
     collect.set_defaults(func=collect_graduations)
 
     run = sub.add_parser("run", help="Fetch OHLCV, simulate trades, and summarize")
-    run.add_argument("--input", default="data/graduations.csv")
-    run.add_argument("--output-dir", default="data")
+    run.add_argument("--input", default=os.path.join(DATA_DIR, "graduations.csv"))
+    run.add_argument("--output-dir", default=DATA_DIR)
     run.add_argument("--limit", type=int)
     run.add_argument("--include-needs-review", action="store_true")
     run.add_argument("--refresh", action="store_true")

@@ -10,6 +10,10 @@ COPY static static
 COPY data/graduations.example.csv data/
 
 ENV PYTHONUNBUFFERED=1
+# All scripts read/write here; mount a Railway volume at /data to persist
+# graduations, the OHLCV cache, results, and the dashboard's job log.
+ENV DATA_DIR=/data
+RUN mkdir -p /data
 
 # Default: serve the public dashboard (which can launch jobs itself when
 # ADMIN_TOKEN is set). Setting BACKTEST_COMMAND instead runs one batch job

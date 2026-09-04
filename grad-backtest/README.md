@@ -199,8 +199,9 @@ service does everything.
    - `HELIUS_API_KEY` and `MIGRATION_ADDRESS` (needed for `collect` jobs)
    - `ADMIN_TOKEN` — a long random string; required to launch jobs via the API
    - optionally `START_BALANCE`, `FIXED_FEE_PER_SIDE`, `GECKO_REQUESTS_PER_MINUTE`
-4. Attach a **Volume** mounted at `/app/data` so collected CSVs, the OHLCV
-   cache, and results survive restarts and redeploys.
+4. Attach a **Volume** mounted at `/data` (the container's `DATA_DIR` default)
+   so collected CSVs, the OHLCV cache, and results survive restarts and
+   redeploys — without it, every redeploy starts from an empty filesystem.
 5. Under **Settings → Networking**, click **Generate Domain** — that's your
    public dashboard URL.
 6. Kick off jobs from anywhere:
@@ -214,8 +215,28 @@ curl -X POST ... -d '{"stage": "sizing"}'
 ```
 
 The dashboard refreshes itself every 15 seconds and shows job progress live.
-Batch mode still exists: set `BACKTEST_COMMAND` (e.g. `run --limit 5`) and the
-container runs that once and exits instead of serving the dashboard.
+
+Before the first full batch, do a dress rehearsal: launch
+`{"stage": "run", "extra_args": "--limit 5"}` and confirm trades appear on the
+dashboard. That proves env vars, both APIs, and volume writes end to end —
+much cheaper than discovering a bad API key three hours into a 500-token run.
+The cache is resumable, so those five tokens aren't wasted work.
+
+### Railway batch mode (no dashboard)
+
+Set `BACKTEST_COMMAND` (e.g. `run --limit 5`, then `run` for the real batch)
+and the container executes that once and exits instead of serving the
+dashboard. Two extra settings matter in this mode:
+
+- **Restart Policy → Never** (service settings). Railway treats a clean exit
+  as a crash by default and would re-run the backtest forever, burning your
+  Helius/GeckoTerminal quota. (`railway.json` ships ON_FAILURE for the
+  dashboard mode, so override it in the UI for batch.)
+- Remove or ignore the healthcheck — there is no HTTP server to probe.
+
+Results land on the volume; read them with `railway ssh` and
+`cat /data/summary.json`, or flip back to dashboard mode (unset
+`BACKTEST_COMMAND`, redeploy) and view the same volume through the web UI.
 
 The same image works on any container host (Fly.io, Cloud Run jobs, a plain VPS):
 

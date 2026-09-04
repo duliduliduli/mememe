@@ -132,7 +132,8 @@ def fee_reality(args: argparse.Namespace, side_cost: float) -> dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", default="data/trade_results.csv")
+    data_dir = os.getenv("DATA_DIR", "data")
+    parser.add_argument("--input", default=os.path.join(data_dir, "trade_results.csv"))
     parser.add_argument("--balance", type=float, default=100.0, help="Starting bankroll in USD")
     parser.add_argument(
         "--fixed-fee-per-side",
@@ -154,7 +155,7 @@ def main() -> None:
     parser.add_argument("--trades-per-path", type=int, default=200)
     parser.add_argument("--paths", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--output", default="data/sizing_summary.json")
+    parser.add_argument("--output", default=os.path.join(data_dir, "sizing_summary.json"))
     args = parser.parse_args()
 
     frame = pd.read_csv(args.input)
