@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
-"""Assemble the executor from local part files so imports never hit the network."""
+"""Load the real executor from a local gzip+base64 payload so tests and Railway
+never hit the network on import."""
+from __future__ import annotations
+
+import base64
+import gzip
 from pathlib import Path
 
-_dir = Path(__file__).resolve().parent
-_src = (_dir / "executor_part1.py").read_text() + (_dir / "executor_part2.py").read_text()
-exec(compile(_src, str(_dir / "executor_assembled.py"), "exec"), globals())
+_payload = Path(__file__).with_name("executor_payload.b64")
+_src = gzip.decompress(base64.b64decode(_payload.read_text().encode("ascii")))
+exec(compile(_src, str(Path(__file__).with_name("executor_restored.py")), "exec"), globals())
