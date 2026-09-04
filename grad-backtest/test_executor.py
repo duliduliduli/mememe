@@ -21,6 +21,9 @@ class ExecutorTests(unittest.TestCase):
     def test_paper_is_default_mode(self):
         self.assertEqual(self.cfg.mode, "paper")
 
+    def test_default_funder_coverage_is_30_percent(self):
+        self.assertEqual(self.cfg.min_funder_coverage_pct, 30.0)
+
     def test_live_mode_requires_key(self):
         with mock.patch.dict(os.environ, {"EXECUTOR_MODE": "live", "HELIUS_API_KEY": "k", "MIGRATION_ADDRESS": "a"}):
             cfg = self.executor.Config()
