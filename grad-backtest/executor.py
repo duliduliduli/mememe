@@ -164,6 +164,11 @@ class Config:
         self.entry_retries = int(os.getenv("ENTRY_RETRIES", "2"))
         self.entry_retry_seconds = float(os.getenv("ENTRY_RETRY_SECONDS", "3"))
         self.poll_seconds = float(os.getenv("POLL_SECONDS", "5"))
+        # Entry discovery and bundle analysis are best-effort; protecting money already in the
+        # market is not.  Bound both sources of entry work so an active position is never starved
+        # behind a burst of graduations.
+        self.helius_poll_timeout_seconds = max(1.0, float(os.getenv("HELIUS_POLL_TIMEOUT_SECONDS", "5")))
+        self.max_entries_per_cycle = max(1, int(os.getenv("MAX_ENTRIES_PER_CYCLE", "1")))
         self.max_price_impact_pct = float(os.getenv("MAX_PRICE_IMPACT_PCT", "5"))
         # Pump.fun tokens graduate around $69k and genuine ones sit near $30k-200k at entry. A
         # market cap far above that 30s after migration means a bundled buy already pumped it
@@ -224,6 +229,7 @@ def load_state(cfg: Config) -> dict[str, Any]:
         "positions": [],
         "daily": {"date": utc_iso()[:10], "realized_pnl_usd": 0.0},
         "seen_signatures": [],
+        "pending": [],
         "updated_at": utc_iso(),
         "draining": False,
     }
@@ -436,6 +442,15 @@ class Rpc:
             info = acct["account"]["data"]["parsed"]["info"]
             total += int(info["tokenAmount"]["amount"])
         return total
+
+    def token_account_balance(self, account: str) -> int:
+        """Confirmed raw balance for one token account.
+
+        A freshly confirmed swap can be newer than a default/finalized account listing.  Rent
+        reclaim must use this targeted confirmed read or it can try to burn the pre-sell balance.
+        """
+        value = self.call("getTokenAccountBalance", [account, {"commitment": "confirmed"}])["value"]
+        return int(value["amount"])
 
     def token_accounts(self, owner: str, mint: str | None = None) -> list[dict[str, Any]]:
         """Token accounts the wallet owns: every one across both token programs, or those for a mint."""
@@ -740,7 +755,10 @@ class Executor:
         self.wallet = Wallet(cfg) if cfg.mode == "live" else None
         self.state = load_state(cfg)
         self.state["mode"] = cfg.mode
-        self.pending: list[dict[str, Any]] = []  # graduations waiting for entry delay
+        # Keep pending entries in the persisted state.  A deploy should not silently forget the
+        # queue and then rediscover/process an unbounded burst before checking open positions.
+        self.pending: list[dict[str, Any]] = self.state.setdefault("pending", [])
+        self._prune_stale_pending()
 
     # ---- pricing helpers -------------------------------------------------
     def sol_price_usd(self) -> float:
@@ -764,7 +782,11 @@ class Executor:
     def poll_graduations(self) -> None:
         url = f"https://api-mainnet.helius-rpc.com/v0/addresses/{self.cfg.migration_address}/transactions"
         try:
-            batch = requests.get(url, params={"api-key": self.cfg.helius_api_key, "limit": 10}, timeout=20).json()
+            batch = requests.get(
+                url,
+                params={"api-key": self.cfg.helius_api_key, "limit": 10},
+                timeout=self.cfg.helius_poll_timeout_seconds,
+            ).json()
         except Exception as exc:
             log(f"WARN helius poll failed: {exc}")
             return
@@ -789,6 +811,17 @@ class Executor:
             enter_at = int(timestamp) + self.cfg.entry_delay_seconds
             self.pending.append({"mint": mints[0], "graduated_ts": int(timestamp), "enter_at": enter_at})
             log(f"DETECTED graduation {mints[0]} (age {age:.0f}s, entering at +{self.cfg.entry_delay_seconds:.0f}s)")
+
+    def _prune_stale_pending(self) -> None:
+        """Drop entry work that became unsafe while the process was stopped."""
+        cutoff = now_ts()
+        keep = []
+        for item in self.pending:
+            if cutoff > float(item.get("enter_at", 0)) + self.cfg.max_entry_lateness_seconds:
+                self.skip(item.get("mint", "unknown"), "stale after restart")
+            else:
+                keep.append(item)
+        self.pending[:] = keep
 
     # ---- trading ---------------------------------------------------------
     def execute_swap(self, quote: dict[str, Any]) -> str:
@@ -1062,7 +1095,13 @@ class Executor:
     def reclaim_rent(self, mint: str) -> None:
         try:
             for acct in self.rpc.token_accounts(self.wallet.pubkey, mint=mint):
-                sig = self.close_token_account(acct["pubkey"], acct["program"], mint, burn_amount=acct["amount"])
+                # token_accounts() may be served at finalized commitment and briefly report the
+                # pre-sell amount.  Re-read the exact account at confirmed commitment before
+                # deciding whether a burn instruction belongs in the close transaction.
+                burn_amount = self.rpc.token_account_balance(acct["pubkey"])
+                sig = self.close_token_account(
+                    acct["pubkey"], acct["program"], mint, burn_amount=burn_amount
+                )
                 log(f"RENT reclaimed ~{TOKEN_ACCOUNT_RENT_SOL:.4f} SOL from {mint}'s token account ({sig[:16]}…)")
         except Exception as exc:
             log(f"WARN {mint}: could not close token account: {describe_error(exc)}")
@@ -1357,6 +1396,40 @@ class Executor:
                     log(f"WARN entry {item['mint']} failed after {attempts} attempts: {reason}")
 
     # ---- main loop -------------------------------------------------------
+    def run_cycle(self) -> None:
+        """Run one executor iteration with exits strictly ahead of new-entry work."""
+        roll_daily(self.state)
+        panic = PANIC_FLAG.exists()
+        draining = STOP_FLAG.exists() or panic
+        self.state["draining"] = draining
+        sol_price = None
+
+        # Capital already at risk always goes first.  The old loop analyzed every due entry before
+        # reaching this block, which could miss an entire pump-and-dump during a launch burst.
+        if self.state["positions"]:
+            sol_price = self.sol_price_usd()
+            self.manage_positions(sol_price, panic)
+        if self.state.get("moon_bags") and not panic:
+            self.manage_moon_bags(sol_price or self.sol_price_usd())
+        if panic and (self.state.get("moon_bags") or self.state.get("stuck")):
+            price = sol_price or self.sol_price_usd()
+            self.liquidate_bags(price, "moon_bags", "panic_moon_bag")
+            self.liquidate_bags(price, "stuck", "panic_stuck")
+        if panic and not self.state["positions"] and not self.state.get("moon_bags") and not self.state.get("stuck"):
+            PANIC_FLAG.unlink(missing_ok=True)
+            STOP_FLAG.touch()
+            log("panic complete: all positions and moon bags closed, executor draining")
+
+        if not draining:
+            self.poll_graduations()
+            due = [p for p in self.pending if now_ts() >= p["enter_at"]]
+            if due:
+                sol_price = sol_price or self.sol_price_usd()
+                for item in due[: self.cfg.max_entries_per_cycle]:
+                    self.pending.remove(item)
+                    self.enter_with_retry(item, sol_price)
+        save_state(self.state)
+
     def run(self) -> None:
         log(f"executor starting: mode={self.cfg.mode} fraction={self.cfg.account_fraction} "
             f"max_pos=${self.cfg.max_position_usd} tp=+{self.cfg.take_profit:.0%} sl=-{self.cfg.stop_loss:.0%} "
@@ -1393,34 +1466,7 @@ class Executor:
                 log(f"WARN wallet reconciliation failed: {describe_error(exc)}")
         while True:
             try:
-                roll_daily(self.state)
-                panic = PANIC_FLAG.exists()
-                draining = STOP_FLAG.exists() or panic
-                self.state["draining"] = draining
-                if not draining:
-                    self.poll_graduations()
-                sol_price = None
-                due = [p for p in self.pending if now_ts() >= p["enter_at"]]
-                if (due and not draining) or self.state["positions"]:
-                    sol_price = self.sol_price_usd()
-                for item in due:
-                    self.pending.remove(item)
-                    if draining:
-                        continue
-                    self.enter_with_retry(item, sol_price)
-                if self.state["positions"]:
-                    self.manage_positions(sol_price, panic)
-                if self.state.get("moon_bags") and not panic:
-                    self.manage_moon_bags(sol_price or self.sol_price_usd())
-                if panic and (self.state.get("moon_bags") or self.state.get("stuck")):
-                    price = sol_price or self.sol_price_usd()
-                    self.liquidate_bags(price, "moon_bags", "panic_moon_bag")
-                    self.liquidate_bags(price, "stuck", "panic_stuck")
-                if panic and not self.state["positions"] and not self.state.get("moon_bags") and not self.state.get("stuck"):
-                    PANIC_FLAG.unlink(missing_ok=True)
-                    STOP_FLAG.touch()
-                    log("panic complete: all positions and moon bags closed, executor draining")
-                save_state(self.state)
+                self.run_cycle()
             except Exception as exc:
                 log(f"ERROR loop: {exc}")
             time.sleep(self.cfg.poll_seconds)
