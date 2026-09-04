@@ -100,6 +100,51 @@ python grad_backtest.py run --output-dir data/cost_4pct --side-cost 0.04
 python -m unittest -v
 ```
 
+## Position sizing for a small account
+
+`position_sizing.py` answers "what fraction of my balance should each trade use?"
+from your actual backtest results instead of guesswork:
+
+```bash
+python position_sizing.py --balance 100 --fixed-fee-per-side 0.10
+```
+
+It bootstraps thousands of simulated trading sequences from
+`data/trade_results.csv` for a grid of account fractions and reports the median
+outcome, the 5th-percentile outcome, drawdown, and risk of ruin per fraction,
+then recommends the fraction with the best median growth that keeps ruin risk
+under 5% (writes `data/sizing_summary.json`).
+
+Why fraction depends on account size at $100:
+
+- Proportional costs (DEX fee + slippage, the `--side-cost` in the backtest)
+  are the same at any size: at 3%/side you lose ~5.8% round trip on a flat price.
+- Fixed costs (Solana base fee + priority fee/tip) do not shrink with position
+  size. At ~$0.10/side, a $10 position pays an extra 2% round trip; a $50
+  position pays 0.4%. That puts a hard floor under viable trade size, which is
+  why `--min-position` exists and the report shows how often the floor binds.
+- Bigger fractions grow faster when the edge is real, but variance and ruin risk
+  explode past the Kelly point. The grid makes that trade-off visible.
+
+To tune profit-taking together with sizing, run TP/SL sensitivity passes and size
+each one — pick the combination whose sizing report has the best risk-adjusted
+growth, not just the best median:
+
+```bash
+python grad_backtest.py run --output-dir data/tp50 --take-profit 0.50
+python grad_backtest.py run --output-dir data/tp100 --take-profit 1.00
+python position_sizing.py --input data/tp50/trade_results.csv --output data/tp50/sizing.json
+python position_sizing.py --input data/tp100/trade_results.csv --output data/tp100/sizing.json
+```
+
+Caveats: if the mean net return per trade is not positive, the tool says so and
+refuses to recommend — no sizing or TP level fixes a negative edge. Backtest
+results overstate live performance (latency, slippage on real order sizes,
+survivorship), so trade half the recommended fraction at first. And this repo
+contains no live executor: never commit or paste wallet private keys anywhere;
+if you later automate execution, use a dedicated burner wallet holding only what
+you can lose, with the key supplied as a runtime environment variable.
+
 ## Running in the cloud
 
 ### GitHub Actions (no infrastructure needed)
