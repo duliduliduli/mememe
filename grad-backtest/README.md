@@ -1,487 +1,891 @@
-# Graduation Backtest Starter
+# Pump.fun Graduation Bot — complete reference
 
-Research pipeline for Pump.fun tokens after migration to PumpSwap or Raydium:
+A research-and-execution system for one trade: buy a Pump.fun token shortly
+after it graduates (migrates from the bonding curve to a PumpSwap or Raydium
+pool), then exit on take-profit, stop-loss, trailing stop, or time stop.
 
-1. Collect graduation candidates from a verified migration address with Helius.
-2. Discover each token's migration pool and fetch historical OHLCV from GeckoTerminal.
-3. Estimate entry at migration +30 seconds, then simulate +75% TP / -30% SL / 30-minute time stop.
-4. Charge configurable costs on **both** entry and exit and write an audit-friendly summary.
+It has three parts that share one data directory:
 
-This is research software, not investment advice or a production trading executor.
+| Part | Files | What it does |
+|---|---|---|
+| Research pipeline | `grad_backtest.py`, `optimize.py`, `position_sizing.py` | Collects historical graduations, fetches price paths, simulates the strategy, sweeps parameters honestly, sizes positions from the results. |
+| Executor | `executor.py` | Detects graduations live, applies entry guards, buys via Jupiter, manages exits, moon bags, stuck positions, wallet reconciliation, rent reclaim. Paper or live. |
+| Dashboard + API | `server.py`, `static/index.html` | Public read-only web page over the result files; token-gated endpoints to launch jobs and start/stop/panic the executor. |
 
-## Install
+This is research software. The executor moves real money when told to; nothing
+here is investment advice, and the backtest exists to tell you whether the
+strategy has an edge before you find out with a wallet.
+
+---
+
+## Table of contents
+
+1. [Architecture and data flow](#1-architecture-and-data-flow)
+2. [Repository layout](#2-repository-layout)
+3. [Quick start](#3-quick-start)
+4. [Configuration reference (every environment variable)](#4-configuration-reference)
+5. [The strategy](#5-the-strategy)
+6. [Executor in depth](#6-executor-in-depth)
+   - 6.1 Startup sequence
+   - 6.2 Main loop
+   - 6.3 Detection
+   - 6.4 Entry pipeline and guard order
+   - 6.5 Position management and exit order
+   - 6.6 Scale-out
+   - 6.7 Moon bags
+   - 6.8 Stuck positions
+   - 6.9 Wallet reconciliation and rent reclaim
+   - 6.10 Rate limits and transaction retries
+   - 6.11 Control: start, stop, panic
+   - 6.12 State file schema
+   - 6.13 Files written and the trade CSV
+   - 6.14 Log line reference
+7. [Dashboard and HTTP API](#7-dashboard-and-http-api)
+8. [Research pipeline](#8-research-pipeline)
+   - 8.1 `collect`
+   - 8.2 `run` and the simulation rules
+   - 8.3 Outputs
+   - 8.4 `optimize.py`
+   - 8.5 `position_sizing.py`
+9. [Deployment](#9-deployment)
+10. [Tests](#10-tests)
+11. [Function-by-function reference](#11-function-by-function-reference)
+12. [Behavioural notes, limitations, and lessons from live trading](#12-behavioural-notes-limitations-and-lessons-from-live-trading)
+13. [Security](#13-security)
+
+---
+
+## 1. Architecture and data flow
+
+```
+                 Helius enhanced-transactions API
+                 (history of MIGRATION_ADDRESS)
+                          │
+          ┌───────────────┴────────────────┐
+          │                                │
+   grad_backtest.py collect         executor.py poll_graduations
+          │                                │
+   graduations.csv                  pending graduations (in memory)
+          │                                │  +ENTRY_DELAY_SECONDS
+   grad_backtest.py run             entry guards → Jupiter buy → position
+   (GeckoTerminal pools + OHLCV)           │
+          │                         manage_positions every POLL_SECONDS
+   cache/*.json, trade_results.csv,        │  (Jupiter sell quotes)
+   summary.json, errors.csv …       exits → live_trades.csv, executor_state.json
+          │                                │
+   optimize.py / position_sizing.py        │
+          │                                │
+          └──────────── DATA_DIR ──────────┘
+                          │
+                   server.py (FastAPI)
+                          │
+                 static/index.html (dashboard)
+```
+
+Everything reads and writes under `DATA_DIR` (default `data`, `/data` in the
+container). On Railway that directory must be a mounted volume or every deploy
+starts empty; see [Deployment](#9-deployment).
+
+External services:
+
+| Service | Used by | For |
+|---|---|---|
+| Helius enhanced transactions (`api-mainnet.helius-rpc.com/v0/addresses/{addr}/transactions`) | collector, executor | Finding graduation transactions on the migration address |
+| Helius (or any) Solana JSON-RPC (`RPC_URL`) | executor | Balances, token accounts, supply, signatures, largest holders, sending and confirming transactions |
+| Jupiter swap API (`JUPITER_BASE_URL`, default lite-api v1) | executor | Quotes (buy, sell, valuation, SOL price) and swap transactions |
+| GeckoTerminal (`api.geckoterminal.com/api/v2`) | backtester | Pool discovery and OHLCV candles |
+
+---
+
+## 2. Repository layout
+
+```
+mememe/
+├── Dockerfile                  root-level image so Railway builds with no Root Directory setting
+├── railway.json                Dockerfile builder, ON_FAILURE restart (5 retries), /healthz healthcheck
+├── .dockerignore
+├── README.md                   short pointer to this file
+├── .github/workflows/
+│   ├── tests.yml               unit tests on push/PR touching grad-backtest/
+│   └── backtest.yml            manual "Run backtest in the cloud" workflow with cached OHLCV
+└── grad-backtest/
+    ├── executor.py             live/paper executor (section 6)
+    ├── server.py               FastAPI dashboard + control API (section 7)
+    ├── static/index.html       dashboard page
+    ├── grad_backtest.py        collector + backtester (section 8)
+    ├── optimize.py             parameter sweep with train/validation split
+    ├── position_sizing.py      bootstrap Monte Carlo sizing
+    ├── requirements.txt        requests, pandas, fastapi, uvicorn, httpx, solders
+    ├── Dockerfile, railway.json   same as root, for builds rooted here
+    ├── .env.example            every variable with a comment
+    ├── data/graduations.example.csv
+    └── test_*.py               115 unit tests (section 10)
+```
+
+---
+
+## 3. Quick start
+
+### Local, research only
 
 ```bash
 cd grad-backtest
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 python -m pip install -r requirements.txt
+export HELIUS_API_KEY='…' MIGRATION_ADDRESS='…'
+python grad_backtest.py collect --count 200
+python grad_backtest.py run --limit 5      # dress rehearsal
+python grad_backtest.py run                # full sample
+python optimize.py                         # parameter sweep from the cache
+python position_sizing.py --balance 100    # sizing from trade_results.csv
+python server.py                           # dashboard on :8000
 ```
 
-Set the credentials without putting secrets in the code:
+### Paper trading
 
 ```bash
-export HELIUS_API_KEY='your_key'
-export MIGRATION_ADDRESS='current_verified_migration_authority'
+export EXECUTOR_MODE=paper
+python executor.py
 ```
 
-The migration address is deliberately not hard-coded because Pump.fun has changed its migration path over time. Verify the address for the exact venue and week you are testing.
+Real detection, real Jupiter quotes, simulated fills against a
+`START_BALANCE` paper balance. No wallet involved.
 
-## Step 2: collect graduations
+### Live trading
 
 ```bash
-python grad_backtest.py collect \
-  --count 500 \
-  --start-time 2026-08-01T00:00:00Z \
-  --end-time 2026-08-08T00:00:00Z
+export EXECUTOR_MODE=live WALLET_PRIVATE_KEY='base58 key of a burner wallet'
+python executor.py
 ```
 
-This writes `data/graduations.csv`. Transactions containing exactly one unknown non-quote mint are marked `confirmed`; transactions with multiple candidate mints are marked `needs_review`. Review those signatures by hand. The pricing command skips them unless `--include-needs-review` is supplied.
+Or set the same variables on Railway with `EXECUTOR_AUTOSTART=1` and the
+dashboard container launches the executor on boot. Read
+[Security](#13-security) before doing this.
 
-If you obtain a cleaner graduation list from Bitquery or another source, skip collection and provide a CSV containing:
+---
 
-```csv
-mint_address,graduation_timestamp
-TOKEN_MINT,2026-08-01T12:00:00Z
+## 4. Configuration reference
+
+Every variable, its default, and what reads it. A variable that is not set
+uses its default; you only add one to change it. `executor.py --print-config`
+prints the values in effect (minus the key). The executor's first log line also
+prints the important ones.
+
+### 4.1 Credentials and endpoints
+
+| Variable | Default | Read by | Meaning |
+|---|---|---|---|
+| `HELIUS_API_KEY` | (none, required) | collector, executor | Helius key for graduation polling and the default RPC URL. |
+| `MIGRATION_ADDRESS` | (none, required) | collector, executor | Pump.fun's migration authority. Public, not a secret; deliberately not hard-coded because it has changed over time. |
+| `RPC_URL` | `https://mainnet.helius-rpc.com/?api-key=$HELIUS_API_KEY` | executor | Solana JSON-RPC endpoint. |
+| `JUPITER_BASE_URL` | `https://lite-api.jup.ag/swap/v1` | executor | Jupiter quote/swap base. |
+| `WALLET_PRIVATE_KEY` | (none; required in live mode) | executor | Base58 private key of a burner wallet. Never a seed phrase, never a main wallet. |
+| `ADMIN_TOKEN` | (none) | server | Password for `POST /api/run` and `POST /api/executor/*`, sent as header `x-admin-token`. Unset means those endpoints return 503. |
+| `DATA_DIR` | `data` (`/data` in the container) | everything | Where all files live. |
+| `PORT` | `8000` | server | Listen port. |
+| `GECKO_REQUESTS_PER_MINUTE` | `9` | backtester | GeckoTerminal pacing for the keyless API. |
+
+### 4.2 Executor mode and sizing
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `EXECUTOR_MODE` | `paper` | `paper` or `live`. |
+| `EXECUTOR_AUTOSTART` | `0` | `1` makes the dashboard container launch the executor at boot. |
+| `START_BALANCE` | `100` | Initial paper balance for a fresh state file; also the dashboard equity-curve start. |
+| `ACCOUNT_FRACTION` | `0.10` | Fraction of equity per position. Equity in live mode is spendable SOL (balance minus `MIN_SOL_RESERVE`) times the SOL price. |
+| `MAX_POSITION_USD` | `20` | Hard cap on position size. |
+| `MIN_POSITION_USD` | `5` | If the computed size is below this, no entry. Lower it if you want small fractional sizing on a small account. |
+| `MAX_CONCURRENT_POSITIONS` | `2` | Maximum bot-opened positions at once. Adopted holdings do not count. |
+| `DAILY_LOSS_LIMIT_USD` | `30` | Once realized P&L for the UTC day is at or below minus this, no new entries until the next UTC day. Measured from quoted closes and reset by a restart. Use a huge number to effectively disable; `0` would block after any loss. |
+| `MIN_SOL_RESERVE` | `0.05` | SOL kept back for fees when computing live equity. |
+
+### 4.3 Strategy parameters
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `TAKE_PROFIT` | `0.75` | Exit when the sell-quote value reaches basis × (1 + TP). |
+| `STOP_LOSS` | `0.30` | Exit when the value falls to basis × (1 − SL). |
+| `TRAILING_STOP` | `0` | Exit when the value falls this fraction from its post-entry peak. `0` disables. |
+| `TIME_STOP_MINUTES` | `30` | Exit at this age regardless of P&L. |
+| `SCALE_OUT_AT` | `0` | Gain at which a partial sell happens. `0` disables. |
+| `SCALE_OUT_FRACTION` | `0.5` | Fraction sold at the scale-out (clamped to 0.9). |
+| `ENTRY_DELAY_SECONDS` | `30` | Wait after the migration transaction before buying. |
+| `MAX_ENTRY_AGE_SECONDS` | `120` | A graduation older than this when first seen is skipped. |
+| `MAX_ENTRY_LATENESS_SECONDS` | `60` | An entry attempt more than this past its target time is skipped. |
+| `POLL_SECONDS` | `5` | Main loop period. |
+
+### 4.4 Entry guards
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MAX_PRICE_IMPACT_PCT` | `5` | Skip if the buy quote's price impact exceeds this. |
+| `MAX_ENTRY_MARKET_CAP_USD` | `300000` | Skip if the implied entry market cap is above this. `0` disables. |
+| `MIN_ENTRY_MARKET_CAP_USD` | `25000` | Skip if the implied entry market cap is below this. `0` disables. |
+| `MIN_CURVE_AGE_SECONDS` | `120` | Skip if the token graduated less than this many seconds after it was created. `0` disables. |
+| `MAX_TOP_HOLDER_PCT` | `20` | Skip if the largest plain-wallet holder owns more than this share of supply. `0` disables. |
+
+### 4.5 Swaps, slippage, retries
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SLIPPAGE_BPS` | `1000` | Buy slippage tolerance (10%). Also used for position valuation quotes. |
+| `SELL_SLIPPAGE_BPS` | `1500` | Sell slippage tolerance (15%) for every real sell. |
+| `ENTRY_RETRIES` | `2` | Extra entry attempts after the first one fails. |
+| `ENTRY_RETRY_SECONDS` | `3` | Sleep between entry attempts. |
+
+### 4.6 Moon bags
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MOON_BAG` | `0` | Fraction of tokens kept at a normal exit (clamped to 0.5). `0` disables. |
+| `MOON_BAG_WINNERS_ONLY` | `1` | Keep a bag only when the exit was profitable. |
+| `MOON_BAG_TARGET_X` | `100` | Sell a bag once worth this multiple of the value it was kept at. `0` holds forever. |
+| `MOON_BAG_CHECK_SECONDS` | `60` | How often bags are re-quoted. |
+| `MIN_MOON_BAG_USD` | `0.5` | A would-be bag worth less than this is sold with the rest. |
+| `MOON_BAG_DEAD_PCT` | `5` | A bag worth less than this percent of its kept value is burned and its account closed. `0` disables. |
+
+### 4.7 Restart safety and housekeeping (live mode)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MIN_ADOPT_USD` | `1.0` | Untracked holdings worth at least this are adopted as managed positions at startup. |
+| `CLOSE_EMPTY_ACCOUNTS` | `1` | Close empty token accounts at startup and after full sells to reclaim rent. |
+| `STUCK_AFTER_MINUTES` | `15` | Minutes past the time stop after which three consecutive sell failures move a position to the stuck list. |
+
+### 4.8 Dashboard equity simulation
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `FIXED_FEE_PER_SIDE` | `0.10` | Flat USD fee per swap in the dashboard's simulated equity curve and the sizing job. |
+| `ACCOUNT_FRACTION` | `0.10` | Fraction per trade in that curve, overridden by `sizing_summary.json`'s recommendation when present. |
+
+### 4.9 Batch mode
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `BACKTEST_COMMAND` | (none) | If set (e.g. `run --limit 5`) the container runs that `grad_backtest.py` command once and exits instead of serving the dashboard. |
+
+---
+
+## 5. The strategy
+
+**Signal.** A transaction on the Pump.fun migration address that moves exactly
+one non-quote token. That token just graduated.
+
+**Entry.** `ENTRY_DELAY_SECONDS` (30 s) after the migration, buy with
+`min(equity × ACCOUNT_FRACTION, MAX_POSITION_USD)` of SOL via Jupiter, if
+every guard in section 6.4 passes.
+
+**Exit.** Every `POLL_SECONDS`, get a Jupiter sell quote for the whole
+position. That executable value, not a chart price, is compared against the
+basis: take profit at +`TAKE_PROFIT`, stop loss at −`STOP_LOSS`, trailing stop
+at `TRAILING_STOP` below the peak, time stop at `TIME_STOP_MINUTES`. Optional
+scale-out banks part of a winner early; optional moon bag keeps a slice of a
+winner riding.
+
+**Sizing.** Fractional by default, with a floor and a cap. The floor exists
+because a Solana round trip has real fixed costs: about a cent of network fees
+plus 0.002 SOL of token-account rent, which the executor now reclaims after
+every full sell.
+
+**What the numbers said so far.** One overnight live session (52 closed round
+trips, $5 positions) had a 37% win rate, average winner +33%, average loser
+−32%. Break-even at that win rate needs winners to average about +56%. The
+losers were dominated by bundled launches that dumped within a minute of
+migrating; the guards in 6.4 target exactly that profile. Nothing else in this
+document should be read as a claim that the strategy is profitable.
+
+---
+
+## 6. Executor in depth
+
+`executor.py` is a single process with one loop. It keeps its state in
+`executor_state.json`, appends every closed trade to `live_trades.csv`, every
+skipped opportunity to `skips.csv`, and every log line to `executor.log` (and
+stdout, which is what Railway shows).
+
+### 6.1 Startup sequence
+
+1. `Config()` reads every variable; `validate()` requires the Helius key and
+   migration address, and the wallet key in live mode.
+2. `load_state()` reads `executor_state.json` or creates a fresh state.
+3. The first log line prints the parameters in effect:
+   ```
+   executor starting: mode=live fraction=0.05 max_pos=$100.0 tp=+75% sl=-30% time_stop=60m trail=20%
+   scale_out=40%x50% moon_bag=5%(winners only)@100x(min$0.50,dead<5%) slippage=1000/1500bps(buy/sell)
+   mcap=$25,000-$2,000,000 curve_age>=120s top_holder<=20% adopt>=$1.0 stuck_after=15m retries=2 daily_loss_limit=$25.0
+   ```
+4. Live mode: logs the wallet address and SOL balance, and warns if the
+   balance is at or below the fee reserve.
+5. If the state file has open positions: `resuming N open position(s) from state file`.
+6. Live mode: `reconcile_wallet()` (section 6.9).
+
+### 6.2 Main loop
+
+Each iteration, wrapped so one exception logs `ERROR loop: …` and the loop
+continues after `POLL_SECONDS`:
+
+1. Roll the daily P&L counter if the UTC date changed.
+2. Read the flag files: `executor.panic` means panic; `executor.stop` or panic means draining.
+3. If not draining, poll Helius for new graduations (6.3).
+4. Collect pending graduations whose entry time has arrived. If there are any, or there are open positions, fetch the SOL price (cached 30 s).
+5. Enter each due graduation via `enter_with_retry` (6.4). Draining drops them.
+6. Manage open positions (6.5).
+7. If moon bags exist and not panicking, run the moon-bag check (6.7), which internally rate-limits itself to `MOON_BAG_CHECK_SECONDS`.
+8. If panicking, liquidate moon bags and stuck positions.
+9. If panicking and nothing is left, delete the panic flag, touch the stop flag, log `panic complete …`.
+10. Save state.
+
+Pending graduations live only in memory. A restart forgets them, and they are
+re-detected only if still within `MAX_ENTRY_AGE_SECONDS`.
+
+### 6.3 Detection
+
+`poll_graduations()` fetches the 10 most recent enhanced transactions for
+`MIGRATION_ADDRESS`. For each transaction not yet in `seen_signatures`:
+
+- Extract candidate mints from `tokenTransfers` and `accountData[].tokenBalanceChanges`, excluding WSOL, USDC, and USDT.
+- Exactly one candidate is a graduation. Two or more logs `SKIP …: ambiguous graduation tx …`. Zero is ignored.
+- If the transaction is older than `MAX_ENTRY_AGE_SECONDS`, `SKIP …: graduation too old at detection (Ns)`.
+- Otherwise queue it with `enter_at = timestamp + ENTRY_DELAY_SECONDS` and log `DETECTED graduation <mint> (age Ns, entering at +30s)`.
+
+The "too old" skips that appear right after a restart are the backlog from the
+downtime; they are expected.
+
+### 6.4 Entry pipeline and guard order
+
+`enter_with_retry` calls `try_enter` up to `1 + ENTRY_RETRIES` times. An
+exception (a rejected swap, a bad quote) triggers a retry after
+`ENTRY_RETRY_SECONDS`; a `SKIP` is a decision and is not retried. Every guard
+runs again on every attempt, so the lateness window still bounds how late an
+entry can land.
+
+`try_enter`, in order:
+
+1. **Sizing guards** (`position_size_usd`): open bot-opened positions must be below `MAX_CONCURRENT_POSITIONS` (adopted holdings don't count); daily realized P&L must be above −`DAILY_LOSS_LIMIT_USD`; size = `min(equity × ACCOUNT_FRACTION, MAX_POSITION_USD)` must be at least `MIN_POSITION_USD` and at most equity. Failure: `SKIP …: sizing guards (open=N, daily_pnl=X)`.
+2. **Buy quote** WSOL → token for the sized amount at `SLIPPAGE_BPS`. A zero-token quote raises and is retried.
+3. **Metadata lookups** (`entry_metadata`), each optional and failing open with a `WARN … unavailable` line:
+   - token supply → implied market cap = supply × (USD in ÷ tokens out), i.e. the price we would actually pay;
+   - mint creation time via `getSignaturesForAddress` with early stop → curve age = graduation − creation;
+   - largest plain-wallet holder via `getTokenLargestAccounts` plus two `getMultipleAccounts` calls, ignoring program-owned accounts (the pool, the bonding curve, the Mayhem vault) and our own wallet.
+4. **`entry_guard_reason`**, first hit wins:
+   1. lateness > `MAX_ENTRY_LATENESS_SECONDS` → `stale entry: Ns past target`
+   2. price impact > `MAX_PRICE_IMPACT_PCT` → `price impact X% > 5.0% (pool too thin for our size)`
+   3. market cap > `MAX_ENTRY_MARKET_CAP_USD` → `market cap $X > $Y (already pumped far past graduation)`
+   4. market cap < `MIN_ENTRY_MARKET_CAP_USD` → `market cap $X < $Y (already dumped since graduation)`
+   5. curve age < `MIN_CURVE_AGE_SECONDS` → `graduated Ns after creation < 120s (curve filled by one buyer: bundle)`
+   6. top holder > `MAX_TOP_HOLDER_PCT` → `top wallet holds X% of supply > 20% (one holder can dump the pool) [wallet]`
+5. **Honeypot guard**: a reverse quote token → WSOL must succeed, else `SKIP …: no sell route (possible honeypot)`.
+6. **Execute.** Live: build, sign, send, confirm (6.10). If the swap reports failure, wait 15 s and check the wallet; if tokens landed anyway the position is adopted with `buy_signature = "unconfirmed"`. Paper: debit the paper balance.
+7. Record the position (6.12) and log `ENTER <mint> $X (live <sig>… | paper fill)`.
+
+Why those guards exist:
+
+- **Price impact**: a thin pool makes the round trip cost more than the trade can earn.
+- **Ceiling**: a token at $1M+ thirty seconds after a $69K graduation was pumped by a bundle before we arrived, and that buyer dumps into whoever follows. Note that on the overnight sample the over-$300K band was actually the best-performing bucket on closed trades, so this threshold is under review; $2M is the current live setting.
+- **Floor**: a token far below the graduation cap a minute later was already dumped into its own pool. The motivating case (SOLL) had its creator sell 78% of supply 24 s after migration; the bot bought at a $450 cap. Sub-$30K entries went 1 for 7 overnight.
+- **Curve age**: filling a whole bonding curve in seconds takes one buyer. SOLL graduated 29 s after creation with six buyers.
+- **Holder concentration**: the wallet that holds a big slice at entry is the one that dumps. SOLL's creator held 59% at graduation.
+
+### 6.5 Position management and exit order
+
+`manage_positions` runs every loop for every open position:
+
+1. Sell-quote the whole position (at `SLIPPAGE_BPS`; the real sell uses `SELL_SLIPPAGE_BPS`). Update `peak_usd` and `last_value_usd`.
+2. **Scale-out check** (before any exit): if enabled, not yet done, and value ≥ basis × (1 + `SCALE_OUT_AT`) → `scale_out` and re-evaluate next loop.
+3. **Exit decision** (`decide_exit`), first hit wins:
+   1. panic flag → `panic`
+   2. value ≥ basis × (1 + `TAKE_PROFIT`) → `take_profit`
+   3. value ≤ basis × (1 − `STOP_LOSS`) → `stop_loss`
+   4. `TRAILING_STOP` > 0 and value ≤ peak × (1 − trail) → `trailing_stop`
+   5. age ≥ `TIME_STOP_MINUTES` → `time_stop`
+4. On an exit reason, `close_position` (6.7 decides the moon bag, then sells, records, reclaims rent). On success the failure counter resets.
+5. On any exception: `WARN managing <mint>: …`, increment `sell_failures`, and possibly move to stuck (6.8).
+
+Live-mode edge case: if the wallet holds zero tokens when a close is
+attempted (a previous sell landed after its confirmation timeout, or you sold
+manually), the position is closed at its last quoted value with reason
+`<reason>_unconfirmed` and a warning to verify on an explorer.
+
+### 6.6 Scale-out
+
+At `SCALE_OUT_AT`, sell `SCALE_OUT_FRACTION` of the tokens. The remainder keeps
+its cost basis reduced proportionally and its peak scaled down, so every
+threshold stays at the same token price. Recorded as its own `scale_out` row.
+The cost is a second sell leg per winner and a smaller share riding to the
+full target.
+
+### 6.7 Moon bags
+
+At a non-panic exit, `close_position` may keep `MOON_BAG` of the tokens:
+
+- not if `MOON_BAG_WINNERS_ONLY` is on and the last quoted value was not above basis;
+- not if the kept slice would be worth less than `MIN_MOON_BAG_USD` (its rent would exceed it).
+
+The bag is recorded with `cost_usd` (its share of the basis), `kept_usd` (what
+selling it would have returned at the exit), and the parent exit reason. Log:
+`MOONBAG <mint>: keeping 5% (N tokens, worth $X now, sells at 100x ($Y))`.
+
+`manage_moon_bags` runs every `MOON_BAG_CHECK_SECONDS`: each bag is sell-quoted
+(silently skipped if unquotable), `last_value_usd`, `peak_usd`, and `last_x`
+are updated, and then:
+
+- value ≥ kept × `MOON_BAG_TARGET_X` → sold, `MOONBAG TARGET …`, trade row `moon_bag_target`;
+- value < kept × `MOON_BAG_DEAD_PCT`% → burned and the account closed, `MOONBAG DEAD …`, trade row `moon_bag_dead` at −100% of `cost_usd`.
+
+Panic liquidates every bag. Bags live in the state file, so without a
+persistent volume a redeploy forgets them and the restart adopts the tokens as
+an ordinary position that time-stops out within the hour.
+
+### 6.8 Stuck positions
+
+If a position's sells keep failing (three or more consecutive exceptions) and
+it is more than `TIME_STOP_MINUTES + STUCK_AFTER_MINUTES` old, it is moved
+from `positions` to `stuck` so it stops occupying a slot. The dashboard lists
+it, panic still tries to sell it, and the log says to sell it manually.
+
+### 6.9 Wallet reconciliation and rent reclaim
+
+Every token account on Solana holds 0.00203928 SOL of rent until it is closed.
+A night of trading without cleanup left 59 empty accounts holding ~0.12 SOL.
+
+`reconcile_wallet` runs once at live startup, over every token account the
+wallet owns (both Token and Token-2022):
+
+- quote tokens (WSOL, USDC, USDT) are ignored;
+- empty accounts are closed (one per second to respect rate limits);
+- untracked holdings are sell-quoted; if unquotable they are left alone with a `WARN … held but not quotable`; if worth less than `MIN_ADOPT_USD` they are left alone; otherwise they are adopted as a managed position with basis = current value and the clock starting now (`ADOPTED untracked holding …`).
+
+Adopted positions are managed normally but do not consume an entry slot. Note
+that adoption loses the original entry price and peak, which is why the `/data`
+volume matters.
+
+After every full live sell, `reclaim_rent` burns any dust and closes the token
+account (`RENT reclaimed ~0.0020 SOL …`). Burns only ever happen on tokens the
+bot itself bought or on dead moon bags.
+
+### 6.10 Rate limits and transaction retries
+
+- Every RPC and Jupiter call goes through `with_backoff`: on HTTP 429 it sleeps 0.5, 1, 2, 4 s and retries, then tries once more; any other error is raised immediately.
+- The SOL price is cached 30 s.
+- `execute_swap` builds the transaction from the quote, signs, sends with preflight and up to 3 RPC retries, then polls `getSignatureStatuses` every 2 s for up to 60 s. If the send is rejected with `BlockhashNotFound` it rebuilds once on the same quote.
+- Jupiter error 6001 (`0x1771`) is slippage exceeded: the price moved more than the tolerance between quote and execution. Error 6000 is a route that no longer exists. Both are logged as one readable line.
+
+### 6.11 Control: start, stop, panic
+
+The server (section 7) starts the executor as a child process and controls it
+through flag files in `DATA_DIR`:
+
+| Action | Mechanism | Effect |
+|---|---|---|
+| Start | `POST /api/executor/start` or `EXECUTOR_AUTOSTART=1` | Removes `executor.stop`, launches `executor.py`. |
+| Stop (drain) | `POST /api/executor/stop` → `executor.stop` | No new detections or entries; open positions are still managed to their exits. |
+| Panic | `POST /api/executor/panic` → `executor.panic` | Every position, moon bag, and stuck position is market-sold; then the executor drains. |
+
+There is no kill endpoint. To stop the process, stop the container.
+
+### 6.12 State file schema
+
+`DATA_DIR/executor_state.json`, written atomically after every loop:
+
+```
+{
+  "mode": "paper" | "live",
+  "paper_balance_usd": float,
+  "positions": [ position … ],
+  "moon_bags": [ moon_bag … ],
+  "stuck": [ position + "stuck_at" … ],
+  "daily": { "date": "YYYY-MM-DD", "realized_pnl_usd": float },
+  "seen_signatures": [ last 500 Helius signatures ],
+  "moon_bags_checked_ts": float,
+  "draining": bool,
+  "updated_at": "ISO Z"
+}
+
+position = {
+  "mint", "tokens" (raw), "position_usd" (basis), "opened_ts", "opened_at",
+  "graduated_at" (null when adopted), "buy_signature" ("" paper | sig | "unconfirmed" | "adopted"),
+  "entry_price_impact_pct", "entry_market_cap_usd", "entry_curve_age_seconds", "entry_top_holder_pct",
+  "peak_usd", "last_value_usd", "sell_failures", "last_sell_error", "scaled_out", "adopted"
+}
+
+moon_bag = {
+  "mint", "tokens", "cost_usd", "kept_usd", "peak_usd", "created_at", "from_exit",
+  "last_value_usd", "last_x"
+}
 ```
 
-## Steps 3-4: prices and trade simulation
+### 6.13 Files written and the trade CSV
 
-Start with five rows to validate the setup:
+| File | Written by | Contents |
+|---|---|---|
+| `executor.log` | every `log()` | `<ISO Z> <message>` per line |
+| `executor_state.json` | `save_state` | schema above |
+| `live_trades.csv` | closes, scale-outs, bag sells, dead-bag burns | one row per exit leg |
+| `skips.csv` | `skip()` | `timestamp,mint,reason` |
+| `executor.stop`, `executor.panic` | server / executor | empty flag files |
+
+`live_trades.csv` columns:
+
+```
+opened_at, closed_at, mint, mode, position_usd, exit_usd, net_return, exit_reason,
+buy_signature, sell_signature, entry_price_impact_pct, peak_gain_pct,
+entry_market_cap_usd, entry_curve_age_seconds, entry_top_holder_pct
+```
+
+An existing file keeps its original header; new columns are only written to
+new files. `exit_reason` values: `take_profit`, `stop_loss`, `trailing_stop`,
+`time_stop`, `panic`, any of those with `_unconfirmed`, `scale_out`,
+`moon_bag_target`, `moon_bag_dead`, `panic_moon_bag`, `panic_stuck`.
+
+### 6.14 Log line reference
+
+| Line | Meaning |
+|---|---|
+| `DETECTED graduation <mint> (age Ns, entering at +30s)` | Queued for entry. |
+| `SKIP <mint>: <reason>` | Passed on, with the reason; also in `skips.csv`. |
+| `ENTER <mint> $X (live <sig>…)` | Bought. |
+| `SCALE-OUT <mint>: sold 50% for $X (+Y%); remainder basis $Z` | Partial take-profit. |
+| `EXIT <mint> <reason> $X (+Y%, peaked +Z%)` | Closed. |
+| `MOONBAG <mint>: keeping 5% (…)` | A bag was kept. |
+| `MOONBAG TARGET <mint>: worth $V = Nx the $K kept; sold for $P` | A bag hit its multiple. |
+| `MOONBAG DEAD <mint>: worth $V vs $K kept; burned, rent reclaimed` | A bag died; rent back. |
+| `RENT reclaimed ~0.0020 SOL from <mint>'s token account` | Account closed after a sell. |
+| `ADOPTED untracked holding <mint> worth $X; managing it from here` | Startup found tokens it didn't know about. |
+| `wallet reconciled: adopted N position(s), closed M empty token account(s) (~X SOL rent)` | Startup summary. |
+| `STUCK <mint>: N consecutive sell failures past its time stop … Slot freed` | Moved to the stuck list. |
+| `WARN entry <mint> attempt a/n failed: …; retrying` | Swap rejected; retrying. |
+| `WARN managing <mint>: …` | A sell or quote failed this loop. |
+| `WARN <mint>: market cap / curve age / holder concentration check unavailable` | A guard's lookup failed; that guard was skipped for this entry. |
+| `WARN <mint>: held but not quotable (…); leaving it alone` | Startup found a token with no Jupiter route. |
+| `ERROR loop: …` | The whole iteration failed; the loop continues. |
+| `panic complete: all positions and moon bags closed, executor draining` | Panic finished. |
+
+---
+
+## 7. Dashboard and HTTP API
+
+`server.py` is a FastAPI app. `GET /` serves `static/index.html`, which polls
+five endpoints every 15 seconds. The page has no admin controls; the POST
+endpoints are for `curl` and the like.
+
+### Endpoints
+
+| Method and path | Auth | Returns |
+|---|---|---|
+| `GET /healthz` | none | `{"status":"ok"}` (Railway healthcheck) |
+| `GET /` | none | the dashboard |
+| `GET /api/overview` | none | backtest stats, exit-reason counts, every net return, simulated equity curve, `summary.json`, `sizing_summary.json`, job status |
+| `GET /api/trades?limit=200` | none | rows of `trade_results.csv`, newest first |
+| `GET /api/errors?limit=200` | none | last rows of `errors.csv` |
+| `GET /api/activity?lines=100` | none | last lines of `run.log` plus job status |
+| `GET /api/live?limit=100` | none | executor running/draining flags, mode, full state JSON, `live_trades.csv` rows, closed count, win rate, realized P&L, last 60 lines of `executor.log` |
+| `POST /api/run` | admin | body `{"stage": "collect"\|"run"\|"sizing"\|"optimize", "extra_args": "…"}`; launches one background job (409 if one is running); output appended to `run.log` |
+| `POST /api/executor/start` | admin | launches the executor (409 if running) |
+| `POST /api/executor/stop` | admin | touches `executor.stop` |
+| `POST /api/executor/panic` | admin | touches `executor.panic` |
+
+Admin auth: header `x-admin-token` compared to `ADMIN_TOKEN` with a
+constant-time comparison; 503 if the token is unset, 401 on mismatch. Job
+arguments that try to pass `--helius-api-key` are rejected; credentials go
+through the environment.
 
 ```bash
-python grad_backtest.py run --limit 5
+TOK=…; URL=https://your-app.up.railway.app
+curl -X POST $URL/api/run -H "x-admin-token: $TOK" -H "content-type: application/json" -d '{"stage":"run","extra_args":"--limit 5"}'
+curl -X POST $URL/api/executor/start -H "x-admin-token: $TOK"
+curl -X POST $URL/api/executor/stop  -H "x-admin-token: $TOK"
+curl -X POST $URL/api/executor/panic -H "x-admin-token: $TOK"
 ```
 
-Then run the full file:
+### Dashboard panels
+
+- **Header**: job pill (running stage or idle) and the modification time of `trade_results.csv`.
+- **KPI tiles**: simulated balance, trade count (with skipped-token count), win rate, median and mean net return per trade, position size in use (from the sizing recommendation when one exists).
+- **Simulated equity**: the backtest's trades replayed at the account fraction with `FIXED_FEE_PER_SIDE` charged twice per trade; hover for the trade.
+- **Net return distribution**: histogram of net returns after costs.
+- **Live executor**: shown when the executor is running or has state. Pill (running / draining / stopped), mode badge (`LIVE MONEY` in red, or paper), open positions with sizes, moon bags with their current multiple, stuck positions, realized P&L or paper balance, closed trades, win rate, today's P&L, and the 15 most recent closed trades.
+- **Recent trades**: the backtest's newest 25 rows.
+- **Activity log**: tail of `run.log`, then a tail of `executor.log`.
+- **Skipped tokens**: the backtest's `errors.csv`.
+
+The page follows the viewer's light/dark preference and an explicit
+`data-theme` override. Everyone who can reach the URL sees the numbers; the
+dashboard exposes no credentials.
+
+---
+
+## 8. Research pipeline
+
+### 8.1 `collect`
 
 ```bash
-python grad_backtest.py run
+python grad_backtest.py collect --count 500 --start-time 2026-08-01T00:00:00Z --end-time 2026-08-08T00:00:00Z
 ```
 
-Defaults:
+Pages backwards through the migration address's enhanced transactions (100
+per page, finalized). Every transaction is a candidate; the graduated token is
+the one non-quote mint it moved. One row per (mint, signature).
+`extraction_status` is `confirmed` when exactly one candidate mint was present,
+otherwise `needs_review` (the pricing step skips those unless
+`--include-needs-review`). Output `graduations.csv` with columns
+`mint_address, graduation_timestamp, tx_signature, extraction_status,
+candidate_count_in_tx, helius_source, helius_type`.
 
-- entry delay: 30 seconds
-- take profit: +75%
-- stop loss: -30%
-- time stop: 30 minutes
-- friction: 3% on entry and 3% on exit (5.83% loss if price is flat)
-- API pace: 9 requests/minute for GeckoTerminal's keyless endpoint
+Any CSV with `mint_address` and `graduation_timestamp` works as input to `run`.
 
-Example sensitivity runs:
+### 8.2 `run` and the simulation rules
 
 ```bash
-python grad_backtest.py run --output-dir data/cost_2pct --side-cost 0.02
-python grad_backtest.py run --output-dir data/cost_4pct --side-cost 0.04
+python grad_backtest.py run --limit 5     # then without --limit
 ```
 
-## Outputs
+Per token:
 
-- `trade_results.csv`: strategy result per token
-- `hold_30m_results.csv`: simple 30-minute hold comparison
-- `price_snapshots.csv`: migration, +1m, +5m, +30m, +2h, +24h
-- `summary.json`: median, mean, win rate, top-five concentration, top-five removal, and TP/SL vs hold
-- `errors.csv`: skipped tokens and reasons
-- `cache/`: resumable raw normalized candles per mint
+1. **Pool discovery** on GeckoTerminal: pools for the mint whose dex id contains `pump` or `raydium` and that were created within 6 hours of the graduation; closest creation time wins, PumpSwap over Raydium, then higher liquidity.
+2. **Price data**: up to 4,000 one-minute candles from graduation to +24 h, plus eight 30-second candles around the entry target. Cached in `cache/<mint>.json` so a rerun with different parameters makes no API calls (`--refresh` refetches).
+3. **Entry**: open of the first 30-second candle at or after graduation + `--entry-delay-seconds`, tolerance 90 s. The entry candle timestamp is recorded so latency can be audited.
+4. **Run-up filter** (`--max-entry-runup`): skip tokens whose entry price is more than that fraction above the graduation price.
+5. **`simulate_trade`** over the one-minute candles from entry to the time stop. Within each candle, in this order, first hit wins:
+   1. take-profit and stop-loss both touched → exit at the stop price, reason `sl_ambiguous` (intraminute order is unknowable, so the adverse order is assumed and flagged);
+   2. stop-loss touched → `stop_loss`;
+   3. trailing stop touched (only if its price is above the stop price; the peak is updated only after a candle, so a candle's own high never arms the stop its own low triggers) → `trailing_stop`, flagged ambiguous if take-profit was also touched;
+   4. scale-out level touched → recorded as filled, simulation continues;
+   5. take-profit touched → `take_profit`;
+   6. otherwise update the peak.
+   If nothing hits, exit at the close of the last candle before the deadline, reason `time_stop`.
+6. **Blending**: a moon bag is valued at the close of the last candle in the 24-hour path for every exit reason; a scale-out leg is blended in at its fill price. Costs (`--side-cost`, default 3% per side, 5.83% round trip at a flat price) are applied to the blended exit.
+7. **Benchmarks**: a plain 30-minute hold, and price snapshots at migration, +1 m, +5 m, +30 m, +2 h, +24 h.
 
-## Methodology caveats
+Flags: `--take-profit 0.75`, `--stop-loss 0.30`, `--trailing-stop 0`,
+`--moon-bag 0`, `--scale-out-at 0`, `--scale-out-fraction 0.5`,
+`--max-entry-runup 0`, `--time-stop-minutes 30`, `--side-cost 0.03`,
+`--entry-delay-seconds 30`, `--requests-per-minute 9`, `--limit`, `--refresh`,
+`--include-needs-review`, `--input`, `--output-dir`.
 
-- GeckoTerminal OHLCV is aggregated market data, not executable quotes for your order size. The cost setting is only a coarse slippage/fee model.
-- Entry uses the open of the first available 30-second candle at or after the +30-second target. It records that candle timestamp so latency can be audited.
-- A one-minute candle does not reveal whether its high or low occurred first. When both TP and SL are crossed in the same candle, the backtest assumes the stop loss happened first and flags the row.
-- Empty intervals are filled from the previous close by the API. Tokens with missing early candles fail instead of silently using a distant price.
-- Pool discovery only accepts Pump/Raydium pools created within six hours of the migration timestamp.
-- Survivorship and data-availability bias remain possible. Check failed/missing tokens, not just successful rows.
-- At the public keyless limit, 500 tokens can take hours. The cache lets you stop and resume safely.
+### 8.3 Outputs
 
-## Test
+| File | Contents |
+|---|---|
+| `trade_results.csv` | one row per token: mint, graduation and entry timestamps and prices, exit timestamp/price/reason, gross and net return, same-candle ambiguity flag, moon bag fraction and price, scale-out price |
+| `hold_30m_results.csv` | the hold benchmark |
+| `price_snapshots.csv` | the six snapshots per token |
+| `errors.csv` | tokens that failed pool discovery, pricing, or the run-up filter, with the reason |
+| `summary.json` | median, mean, win rate, sum; top-five concentration of profit and the stats with the top five removed; strategy vs hold; the three yes/no questions (median positive after costs, beats hold, positive without the top five); ambiguous-bar count; all parameters |
+| `cache/<mint>.json` | pool address, dex id, minute path, entry candles |
+
+All four CSVs are rewritten after every token, so a long run can be stopped
+and resumed.
+
+Caveats: GeckoTerminal candles are aggregated market data, not executable
+quotes for your size. Empty intervals are filled from the previous close by
+the API. A token with missing early candles fails rather than silently using a
+distant price. Survivorship and data-availability bias remain possible.
+
+### 8.4 `optimize.py`
 
 ```bash
-python -m unittest -v
+python optimize.py
+python optimize.py --take-profits 0.5,0.75 --moon-bags 0,0.1 --max-entry-runup 2.0
 ```
 
-## Parameter optimizer ("training" done honestly)
+Sweeps the grid (defaults: take-profit 0.4/0.5/0.75/1.0/1.5, stop-loss
+0.2/0.3/0.4, time stop 15/30/60, trailing 0/0.2/0.3, moon bag 0/0.15, scale-out
+0/0.4; 486 valid combinations) against every cached token with zero API calls.
+The sample is split chronologically, 70% train / 30% validation. Combos are
+ranked on train by median net return (mean as tiebreak); the top five are then
+scored on the validation tokens the sweep never saw, next to the baseline
+(TP 0.75 / SL 0.30 / 30 m). The verdict flags overfitting when the train
+median exceeds validation by more than 5 points. It refuses to run on fewer
+than 30 cached tokens and warns under 50 in train. Output
+`optimize_summary.json`.
 
-After one full `run` has populated the cache, `optimize.py` sweeps the whole
-parameter grid — take-profit, stop-loss, time stop, trailing stop, moon bag —
-against every cached token, with zero API calls:
+Judge combos by the validation column. Parameters are never tuned on a handful
+of charts: the tokens you noticed are the ones that moved.
+
+### 8.5 `position_sizing.py`
 
 ```bash
-python optimize.py                      # defaults: 270 combos
-python optimize.py --take-profits 0.5,0.75 --moon-bags 0,0.1,0.2
+python position_sizing.py --balance 100 --fixed-fee-per-side 0.10 --min-position 5
 ```
 
-It splits the sample chronologically (default 70% train / 30% validation),
-ranks combos by train median net return, then reports how the winners perform
-on the validation tokens the sweep never saw. **Judge combos by the validation
-column.** A big train-vs-validation gap is the overfitting alarm — it means
-the "winning" parameters memorized the past instead of finding an edge. This
-is also why parameters are never tuned on a handful of hand-picked charts:
-the tokens you noticed are the ones that moved.
+Bootstraps 2,000 paths of 200 trades each (with replacement) from
+`trade_results.csv` for fractions 2% to 50% of balance, charging a fixed USD
+fee per side on top of the proportional costs already inside `net_return`.
+Per fraction: median, 5th and 95th percentile final balance, median max
+drawdown, ruin rate (balance below `--ruin-threshold`, default $5), median log
+growth, and how often the `--min-position` floor bound. Recommends the
+fraction with the best median log growth among those with ruin rate at or
+below `--max-ruin-rate` (5%). Refuses on fewer than 20 trades and warns when
+the mean net return is not positive, because no sizing fixes a negative edge.
+Output `sizing_summary.json`, which the dashboard picks up as its position
+size. Trade half the recommendation live at first.
 
-Runs in the cloud via the dashboard: `{"stage": "optimize"}` (results land in
-`optimize_summary.json` on the volume).
+---
 
-## Position sizing for a small account
+## 9. Deployment
 
-`position_sizing.py` answers "what fraction of my balance should each trade use?"
-from your actual backtest results instead of guesswork:
+### Railway (dashboard + executor, recommended)
+
+1. New project → Deploy from GitHub repo → this repo. The root `Dockerfile` builds `grad-backtest/` with no Root Directory setting.
+2. **Variables**: `HELIUS_API_KEY`, `MIGRATION_ADDRESS`, `ADMIN_TOKEN`, then the executor variables you want to change from their defaults (section 4). For live trading: `EXECUTOR_MODE=live`, `EXECUTOR_AUTOSTART=1`, `WALLET_PRIVATE_KEY` (mark it sealed).
+3. **Volume** mounted at `/data`. Without it every deploy starts with an empty filesystem: the OHLCV cache, results, trade history, and the executor's state (open positions' entry prices and peaks, moon bags) are lost, and the restart has to adopt whatever is in the wallet at current value.
+4. **Networking → Generate Domain** for the public dashboard.
+5. Every push to `main` redeploys, which restarts the executor. Each restart costs several minutes of not trading plus the state loss above. Set **Settings → Watch Paths** to something like `/grad-backtest/**/*.py`, `/grad-backtest/static/**`, `/Dockerfile` so documentation-only commits do not redeploy.
+
+`railway.json`: Dockerfile builder, restart on failure up to 5 times,
+healthcheck at `/healthz`.
+
+### Railway batch mode
+
+Set `BACKTEST_COMMAND` (e.g. `run --limit 5`) and the container runs that once
+and exits. Set the restart policy to Never or Railway will re-run it forever,
+and ignore the healthcheck. Results land on the volume.
+
+### GitHub Actions
+
+`.github/workflows/backtest.yml` (Actions → "Run backtest in the cloud") runs
+`collect`, `run`, or both with `HELIUS_API_KEY` and `MIGRATION_ADDRESS` from
+repository secrets, caches `data/cache` and `graduations.csv` between runs,
+and uploads the results as an artifact. Jobs are capped at 6 hours.
+`.github/workflows/tests.yml` runs the unit tests on every push and pull
+request that touches `grad-backtest/`.
+
+### Any container host
 
 ```bash
-python position_sizing.py --balance 100 --fixed-fee-per-side 0.10
+docker build -t grad-backtest .
+docker run --rm -p 8000:8000 -e HELIUS_API_KEY=… -e MIGRATION_ADDRESS=… -v "$PWD/data:/data" grad-backtest
 ```
 
-It bootstraps thousands of simulated trading sequences from
-`data/trade_results.csv` for a grid of account fractions and reports the median
-outcome, the 5th-percentile outcome, drawdown, and risk of ruin per fraction,
-then recommends the fraction with the best median growth that keeps ruin risk
-under 5% (writes `data/sizing_summary.json`).
+---
 
-Why fraction depends on account size at $100:
-
-- Proportional costs (DEX fee + slippage, the `--side-cost` in the backtest)
-  are the same at any size: at 3%/side you lose ~5.8% round trip on a flat price.
-- Fixed costs (Solana base fee + priority fee/tip) do not shrink with position
-  size. At ~$0.10/side, a $10 position pays an extra 2% round trip; a $50
-  position pays 0.4%. That puts a hard floor under viable trade size, which is
-  why `--min-position` exists and the report shows how often the floor binds.
-- Bigger fractions grow faster when the edge is real, but variance and ruin risk
-  explode past the Kelly point. The grid makes that trade-off visible.
-
-To tune profit-taking together with sizing, run TP/SL sensitivity passes and size
-each one — pick the combination whose sizing report has the best risk-adjusted
-growth, not just the best median:
+## 10. Tests
 
 ```bash
-python grad_backtest.py run --output-dir data/tp50 --take-profit 0.50
-python grad_backtest.py run --output-dir data/tp100 --take-profit 1.00
-python position_sizing.py --input data/tp50/trade_results.csv --output data/tp50/sizing.json
-python position_sizing.py --input data/tp100/trade_results.csv --output data/tp100/sizing.json
+cd grad-backtest && python -m unittest -v
 ```
 
-Caveats: if the mean net return per trade is not positive, the tool says so and
-refuses to recommend — no sizing or TP level fixes a negative edge. Backtest
-results overstate live performance (latency, slippage on real order sizes,
-survivorship), so trade half the recommended fraction at first. And this repo
-contains no live executor: never commit or paste wallet private keys anywhere;
-if you later automate execution, use a dedicated burner wallet holding only what
-you can lose, with the key supplied as a runtime environment variable.
+| File | Covers |
+|---|---|
+| `test_grad_backtest.py` | candle selection, cost math, simulate_trade barrier ordering |
+| `test_scale_out.py` | scale-out in the simulator and the executor |
+| `test_optimize.py` | dataset loading, split, grid, run-up filter |
+| `test_position_sizing.py` | fee math, ruin detection, min-position floor, CLI end to end |
+| `test_server.py` | endpoints, admin gating, job launching |
+| `test_executor.py` | decide_exit, sizing, trailing stop |
+| `test_executor_guards.py` | lateness, price impact, skip and trade CSV writing |
+| `test_slippage_retry.py` | entry retry, error classification |
+| `test_market_cap.py` | implied market cap math and ceiling |
+| `test_bundle_guards.py` | floor, curve age, holder concentration, RPC helpers, try_enter integration |
+| `test_reconcile.py` | account close/burn transactions, adoption, stuck handling, panic |
+| `test_rate_limits.py` | 429 backoff, price cache, adopted slots, blockhash retry |
+| `test_moon_bag_target.py` | winners-only, target multiple, dead-bag burn, minimum size, redaction |
 
-## Live executor (paper by default)
+---
 
-`executor.py` trades the strategy in real time: it polls Helius for new
-graduations, enters 30s after migration via Jupiter, and manages each position
-against TP/SL/time-stop using executable Jupiter sell quotes. Two modes:
+## 11. Function-by-function reference
 
-- **`EXECUTOR_MODE=paper`** (default): real detection, real quotes, simulated
-  fills. No wallet, no key, no risk. Run this first — for days, not minutes —
-  and judge the results on the dashboard's Live panel.
-- **`EXECUTOR_MODE=live`**: signs and sends real swaps. Requires
-  `WALLET_PRIVATE_KEY` — a **burner wallet's** exported private key (Phantom:
-  account settings → Show private key for that one account). NEVER your seed
-  phrase, never your main wallet, never more money than you can lose entirely.
+### 11.1 `executor.py`
 
-Safety rails enforced in both modes: `ACCOUNT_FRACTION` (default 10%) capped by
-`MAX_POSITION_USD` (default $20), `MAX_CONCURRENT_POSITIONS` (2),
-`DAILY_LOSS_LIMIT_USD` (default $30 — halts new entries until next UTC day),
-`MIN_SOL_RESERVE` kept for fees, and slippage caps on every swap (see below).
+Module constants: `DATA_DIR`, `STATE_FILE`, `TRADES_FILE`, `LOG_FILE`,
+`STOP_FLAG`, `PANIC_FLAG`, `USDC`, `LAMPORTS`, `TOKEN_PROGRAM`,
+`TOKEN_2022_PROGRAM`, `TOKEN_ACCOUNT_RENT_SOL`, `SYSTEM_PROGRAM`, `SKIPS_FILE`,
+`TRADE_COLUMNS`, `RATE_LIMIT_BACKOFF`.
 
-Slippage and retries (learned live): a pool that is seconds old moves several
-percent in the ~1s between quoting and executing, and a 3% tolerance rejected
-most swaps with Jupiter error 6001. Defaults are now `SLIPPAGE_BPS=1000` for
-buys and `SELL_SLIPPAGE_BPS=1500` for sells — sells get more room because a
-rejected sell in a falling market is the worst available outcome. A tolerance
-is a ceiling, not a cost: fills still happen at market, the setting only
-decides how far the price may move before the swap is refused. Entries that
-fail are re-quoted and retried `ENTRY_RETRIES` times (default 2, `ENTRY_RETRY_SECONDS`
-apart); every guard re-runs on each attempt, so the staleness window still
-bounds how late an entry can land. Swap failures are logged as one readable
-line (e.g. `Jupiter 6001: slippage tolerance exceeded`) instead of the raw
-simulation dump.
+Module functions:
 
-Entry guards, applied before every buy:
+- `now_ts()` — single source of "now".
+- `is_rate_limited(exc)` — true for HTTP 429.
+- `with_backoff(fn, what)` — retry `fn` on 429 with the backoff schedule; re-raise anything else.
+- `utc_iso(epoch=None)` — ISO-8601 UTC with `Z`.
+- `log(message)` — timestamp, print, append to `executor.log`.
+- `load_state(cfg)` / `save_state(state)` — read the state file or build a fresh one; write atomically, trimming `seen_signatures` to 500.
+- `roll_daily(state)` — reset the daily P&L on a new UTC date.
+- `record_trade(row)` — append to `live_trades.csv`, honouring an existing header.
+- `record_skip(mint, reason)` — append to `skips.csv`.
+- `quote_price_impact_pct(quote)` — Jupiter's fraction as a percent.
+- `describe_error(exc)` — redact API keys, name Jupiter 6001/6000, truncate.
+- `entry_market_cap_usd(size_usd, out_amount_raw, supply_ui, decimals)` — implied cap from the executable quote.
+- `entry_guard_reason(cfg, graduated_ts, now, impact, market_cap, curve_age, top_holder_pct)` — the six ordered guards; `None` inputs never block.
+- `position_size_usd(cfg, equity_usd, open_positions, daily_pnl)` — sizing with concurrency, daily-loss, min, max, and equity checks.
+- `decide_exit(entry_usd, current_usd, opened_ts, now, cfg, peak_usd)` — take-profit, stop-loss, trailing, time stop.
+- `main()` — `--print-config` or run.
 
-- **Sellability** — a reverse (sell) route must exist for the token, or the
-  entry is skipped as a possible honeypot.
-- **Price impact** — entries with quoted impact above `MAX_PRICE_IMPACT_PCT`
-  (default 5%) are skipped: the pool is too thin for our size and the real
-  round-trip cost would eat the trade.
-- **Market cap ceiling** — entries with an implied market cap above
-  `MAX_ENTRY_MARKET_CAP_USD` (default $300,000) are skipped. Pump.fun tokens
-  graduate near $69k and genuine ones sit around $30k–200k at entry; a token at
-  $900k–$150M thirty seconds after migration was pumped by a bundled buy before
-  we arrived, and that buyer dumps into whoever follows. The cap is computed
-  from the actual buy quote (USD in ÷ tokens out × circulating supply, one
-  `getTokenSupply` RPC call), so it reflects the price we would really pay. If
-  the supply lookup fails the entry proceeds rather than blocking on metadata.
-  The backtest equivalent is `--max-entry-runup` (skip tokens whose entry price
-  is more than that fraction above the graduation price); `optimize.py` accepts
-  the same flag as a dataset filter.
-- **Market cap floor** — entries with an implied market cap below
-  `MIN_ENTRY_MARKET_CAP_USD` (default $25,000) are skipped. Graduation is
-  about $69k, so a token far below that a minute later was already dumped into
-  its own pool. The case that motivated it: SOLL's creator sold 78% of supply
-  24 seconds after migration and the bot then bought at a $450 cap; overnight,
-  entries under $30k went 1 for 7. Uses the same supply lookup as the ceiling.
-- **Curve age** — a token that graduated less than `MIN_CURVE_AGE_SECONDS`
-  (default 120) after it was created is skipped. Filling a whole bonding curve
-  in seconds takes one buyer, which is the definition of a bundle (SOLL:
-  created to graduated in 29 seconds, six buyers). Creation time comes from the
-  mint's signature history (`getSignaturesForAddress`, usually one call; the
-  scan stops as soon as it sees a transaction older than the threshold, and a
-  token too busy to conclude within three pages is treated as unknown, never
-  rejected).
-- **Holder concentration** — if the largest plain-wallet holder owns more than
-  `MAX_TOP_HOLDER_PCT` (default 20%) of supply, the entry is skipped and the
-  wallet is named in the skip reason. Program-owned accounts (the AMM pool,
-  bonding curve, Mayhem vault) are not counted because they cannot dump on us;
-  our own wallet is excluded. Three RPC calls (`getTokenLargestAccounts`, then
-  the token accounts' owners, then whether each owner is a wallet or a
-  program). SOLL's creator held 59% at graduation.
-- **Staleness** — an entry more than `MAX_ENTRY_LATENESS_SECONDS` (60s) past
-  its target time is skipped; a late entry is not the trade the backtest models.
+`class Config` — reads every variable (section 4); `validate()` enforces the required ones.
 
-Adopted holdings (see restart safety below) do not occupy an entry slot:
-they are money already in the market, not a decision being made now, so three
-leftover $2 bags cannot block every new graduation the way they did on the
-first restart after adoption shipped.
+`class Rpc` — JSON-RPC client with backoff: `call`, `sol_balance`, `token_balance`, `token_accounts(owner, mint=None)`, `token_supply`, `mint_first_seen(mint, stop_before_ts, max_pages=3)`, `top_wallet_holder(mint, exclude)`, `send_raw`, `confirmed(signature, timeout_s=60)`.
 
-Every one of the metadata guards fails open: if its lookup errors or times
-out, a `WARN` is logged and that check is skipped for the entry, so an RPC
-hiccup can neither block trading nor be mistaken for a clean token. Each
-position and trade row records `entry_market_cap_usd`,
-`entry_curve_age_seconds`, and `entry_top_holder_pct` so the guards can be
-tuned from real outcomes later. Set any threshold to `0` to disable it.
+`class Jupiter` — `quote(input, output, amount, slippage_bps=None)` and `swap_transaction(quote, pubkey)`, both with backoff; the swap is built with wrap/unwrap SOL, dynamic compute limit, and automatic priority fee.
 
-Every skipped opportunity is recorded to `skips.csv` with its reason, and each
-trade records its quoted entry price impact, so filters can be tuned from data.
+`class Wallet` — live-only signer: `sign(raw_tx)` for Jupiter's versioned transactions; `sign_instructions(instructions, blockhash)` for burn/close transactions.
 
-### Trailing stop (off by default — backtest it first)
+`class Executor` — `sol_price_usd` (30 s cache), `equity_usd`, `poll_graduations`, `execute_swap`, `skip`, `entry_metadata`, `try_enter`, `enter_with_retry`, `close_position`, `_record_close`, `manage_positions`, `scale_out`, `close_token_account(account, program, mint, burn_amount=0)`, `reclaim_rent(mint)`, `reconcile_wallet(sol_price)`, `sell_bag(bag, key, reason, sol_price, quote=None)`, `manage_moon_bags(sol_price)`, `burn_dead_bag(bag, value)`, `liquidate_bags(sol_price, key, reason)`, `run`.
 
-Many rugs bleed downward for minutes before the liquidity pull. A trailing stop
-("exit when price falls X% from its post-entry peak") sells that fade instead of
-riding it to the time stop. Both layers support it:
+### 11.2 `server.py`
 
-```bash
-# Measure it against your collected sample before using it live:
-python grad_backtest.py run --output-dir data/trail25 --trailing-stop 0.25
-python grad_backtest.py run --output-dir data/trail35 --trailing-stop 0.35
-python position_sizing.py --input data/trail25/trade_results.csv --output data/trail25/sizing.json
-```
+Helpers: `read_csv`, `read_json`, `file_mtime`, `frame_records`,
+`equity_curve(trades, fraction)` (balance += balance × fraction × net_return −
+2 × fixed fee, clamped at zero). Endpoints as in section 7. Internals:
+`_run_job(argv, stage)` runs the subprocess in a daemon thread appending to
+`run.log` with start/finish markers; `_require_admin(request)`;
+`_executor_running()`; `_start_executor()`; `maybe_autostart_executor()`
+startup hook.
 
-Then, if the numbers beat the plain TP/SL/time-stop run, set `TRAILING_STOP`
-(e.g. `0.25`) on the executor. `0` (default) disables it. Tune it from the
-backtest sample, not from one chart — a single example proves the mechanism,
-not the parameter.
+### 11.3 `grad_backtest.py`
 
-### Rate limits and transaction retries
+Constants: `DATA_DIR`, `WSOL`, `USDC`, `USDT`, `KNOWN_QUOTES`, `GECKO_BASE`,
+`HELIUS_BASE`, `SUPPORTED_DEX_HINTS`. Functions: `utc_iso`, `parse_timestamp`,
+`candidate_mints(tx)`, `collect_graduations(args)`, `price_at_or_after(candles,
+target, tolerance)`, `apply_costs(entry, exit, side_cost)`, `simulate_trade(…)`,
+`snapshot_rows`, `make_summary`, `run_backtest(args)`, `build_parser`, `main`.
+Classes: `ApiClient` (paced GET with retry on 429/5xx), `GeckoTerminal`
+(`select_pool`, `ohlcv`, `minute_path`, `entry_candles`), dataclasses `Candle`
+and `TradeResult`.
 
-Helius and Jupiter both answer bursts with HTTP 429. Every RPC and Jupiter
-call retries on 429 with a short backoff (0.5s, 1s, 2s, 4s) before giving up;
-anything other than 429 is raised immediately. The SOL/USD price is cached for
-30 seconds instead of re-quoted every loop, and startup account closes are
-paced at one per second. If a swap is rejected with `BlockhashNotFound` (the
-RPC node had not seen the blockhash Jupiter built on), the executor builds a
-fresh transaction on the same quote once before treating it as a failure.
+### 11.4 `optimize.py`
 
-## Restart safety, rent reclaim, and stuck positions (live mode)
+`parse_grid`, `load_dataset(input_csv, cache_dir, entry_delay,
+max_entry_runup=0)`, `evaluate(dataset, combo, side_cost)`, `main`.
 
-Learned from a night where restarts stranded six positions and 59 empty token
-accounts held ~0.12 SOL of rent:
+### 11.5 `position_sizing.py`
 
-- **Wallet reconciliation at startup.** The executor scans every token account
-  the wallet holds. Untracked holdings worth at least `MIN_ADOPT_USD` (default
-  $1) are adopted as managed positions with basis = current value and the clock
-  starting now, so a restart can never strand a bag again. Holdings under the
-  threshold are left untouched (nothing the wallet held before the bot is ever
-  burned), and quote tokens are ignored.
-- **Rent reclaim.** Empty token accounts are closed at startup, and each full
-  sell closes its account afterwards (burning any dust first — only on tokens
-  the bot bought). Each close returns ~0.002 SOL. `CLOSE_EMPTY_ACCOUNTS=0`
-  disables both.
-- **Stuck positions.** A position whose sells keep failing for
-  `STUCK_AFTER_MINUTES` (default 15) past its time stop, with at least three
-  consecutive failures, is moved to `state.stuck` so it stops blocking a slot.
-  It stays visible on the dashboard, `panic` still tries to liquidate it, and
-  the log says to sell it manually.
+`trade_pnl(position, net_return, fixed_fee_per_side)`, `simulate_path(…)`,
+`evaluate_fraction(returns, fraction, args, rng)`, `fee_reality(args,
+side_cost)`, `main`.
 
-### Scale-out / partial take-profit (off by default — backtest it first)
+---
 
-A position that reaches +40% and then rugs is worth nothing under a single
-+75% take-profit. A scale-out banks part of the winner at a first target and
-lets the rest ride to the full take-profit under the same rules:
+## 12. Behavioural notes, limitations, and lessons from live trading
 
-```bash
-python grad_backtest.py run --output-dir data/scale40 --scale-out-at 0.40 --scale-out-fraction 0.5
-python optimize.py            # the sweep now includes --scale-out-ats 0,0.4
-```
+Things that are true of the code and easy to get wrong:
 
-On the executor, `SCALE_OUT_AT=0.40` and `SCALE_OUT_FRACTION=0.5` sell half at
-+40%; the remainder keeps the same take-profit, stop-loss and trailing rules on
-its reduced cost basis, which leaves every threshold at the same token price.
-Each scale-out is recorded in `live_trades.csv` as its own `scale_out` row.
-The cost is a second sell leg per winner (extra fixed fees, which matter at
-$5 positions) and a smaller share riding to the full target when a winner
-keeps running. Whether that trade-off pays is exactly what the optimizer
-measures; the WTF-shaped reversal it protects against is common enough that
-it is worth measuring early.
+- Position valuation uses the buy slippage setting for its quote; real sells use the sell setting. The recorded exit value comes from the sell quote.
+- The daily loss limit measures quote-based closed P&L, resets at UTC midnight, and is reset by a restart. It never fired during the overnight session because of the restarts.
+- Detection reads the 10 most recent migration transactions per poll. A burst of more than 10 graduations in 5 seconds would miss some.
+- Pending graduations are not persisted. A redeploy in the 30-second entry window loses that entry.
+- Adopted positions have no entry price or peak history; they are managed from their adoption value.
+- `record_trade` keeps an old file's header, so columns added later are blank in an old `live_trades.csv`. Rotate the file to get the new columns.
+- The dashboard's paper-balance colour compares against a hard-coded 100, not `START_BALANCE`.
+- GeckoTerminal's 30-second candle endpoint may require a paid plan from some networks (a 401 was observed), in which case the backtest's entry step fails for every token.
 
-Every closed trade now also records `peak_gain_pct`, the highest value the
-position reached before exit, so a postmortem can see "peaked at +41%, exited
-at −88%" directly from the trade log.
+What the live sessions taught, in order:
 
-### Moon bag (off by default — backtest it first)
+1. Three percent slippage rejected most swaps on pools seconds old (Jupiter 6001). Buys now use 10%, sells 15%, with retries.
+2. A confirmation timeout does not mean the swap failed. Entries check the wallet before giving up.
+3. Restarts without a volume orphaned six positions and cost more than the strategy did. Reconciliation now adopts them, but the volume is still the real fix.
+4. Fifty-nine empty token accounts held 0.12 SOL of rent. Every full sell now closes its account.
+5. Bundled launches (creator buys the curve, graduates in seconds, dumps into the pool) were the dominant loser. The floor, curve-age, and holder guards target that profile; the market-cap ceiling turned out to block the best-performing bucket and is now set high.
+6. Adopted dust bags filled every entry slot after a restart. They no longer count.
+7. Helius and Jupiter rate-limit startup bursts. Everything retries on 429 and the price is cached.
+8. Moon bags kept on losers just lock rent. Bags are winners-only, have a minimum size, a target multiple, and a dead-bag burn.
 
-Some tokens dump past our exit and then rerun hours or days later. A moon bag
-keeps a fraction of each position at the primary exit instead of selling all
-of it. Backtest it — the simulation sells the kept fraction at the ~24h mark:
+---
 
-```bash
-python grad_backtest.py run --output-dir data/mb15 --moon-bag 0.15
-python grad_backtest.py run --output-dir data/mb15_trail --moon-bag 0.15 --trailing-stop 0.25
-```
+## 13. Security
 
-If it wins across the sample, set `MOON_BAG` (e.g. `0.15`, capped at `0.5`) on
-the executor: each exit sells the rest and parks the kept tokens in the state
-file's `moon_bags` list (shown on the dashboard's Live panel with their
-current multiple). Two settings decide what happens to a bag afterwards:
-
-- `MOON_BAG_WINNERS_ONLY` (default `1`) keeps a bag only when the exit was
-  profitable. A stop-loss remnant rides to zero and locks 0.002 SOL of rent,
-  so losers are sold in full and their rent reclaimed.
-- `MOON_BAG_TARGET_X` (default `100`) sells a bag once a sell quote is worth
-  that multiple of the value it was kept at (the `MOONBAG` log line states the
-  dollar target). Bags are re-quoted every `MOON_BAG_CHECK_SECONDS` (default
-  60), not every loop. `0` holds forever; `panic` is then the only exit.
-
-- `MIN_MOON_BAG_USD` (default `0.5`): a bag that would be worth less than
-  this is not kept at all; its rent (0.002 SOL) would exceed its value.
-- `MOON_BAG_DEAD_PCT` (default `5`): a bag that has fallen to this percent of
-  the value it was kept at is burned and its token account closed, taking the
-  rent back. Logged as `MOONBAG DEAD` and recorded as a `moon_bag_dead` trade.
-
-`panic` still liquidates every bag along with everything else. Bags live in
-the state file, so without a persistent `/data` volume a redeploy forgets
-them: the restart adopts the tokens as an ordinary position and sells them on
-the time stop.
-
-Control it through the dashboard API (all require the `x-admin-token` header):
-
-```bash
-curl -X POST .../api/executor/start -H "x-admin-token: $TOK"   # begin trading
-curl -X POST .../api/executor/stop  -H "x-admin-token: $TOK"   # drain: no new buys, manage open positions
-curl -X POST .../api/executor/panic -H "x-admin-token: $TOK"   # sell everything at market NOW
-```
-
-Set `EXECUTOR_AUTOSTART=1` on Railway so the executor restarts with the
-container and resumes managing any open positions from `executor_state.json`.
-Closed trades land in `live_trades.csv` and the dashboard shows a Live panel
-(balance/PnL, open positions, closed trades, executor log) whenever the
-executor has activity. Trades happen on the Solana blockchain via Jupiter
-(`JUPITER_BASE_URL`, default `https://lite-api.jup.ag/swap/v1`); tokens land
-at the wallet's address and are visible in any explorer.
-
-Honest expectations: the backtest exists to tell you whether this strategy has
-an edge. Running live before the backtest says yes means the safety rails are
-limiting how fast you can lose, not making you money.
-
-## Dashboard
-
-`server.py` serves a public, read-only web dashboard over the result files:
-simulated equity curve, win rate, net-return distribution, recent trades,
-skipped tokens, and a live activity log of the running job. Run it locally:
-
-```bash
-python server.py            # http://localhost:8000
-```
-
-Environment knobs:
-
-- `DATA_DIR` — where results live (default `data`)
-- `START_BALANCE`, `FIXED_FEE_PER_SIDE`, `ACCOUNT_FRACTION` — parameters of the
-  simulated equity curve shown on the dashboard; the fraction is overridden
-  automatically by the recommendation in `data/sizing_summary.json` when present
-- `ADMIN_TOKEN` — when set, `POST /api/run` (header `x-admin-token`) can launch
-  `collect`, `run`, or `sizing` jobs in the background; without it, job
-  launching is disabled and the dashboard is purely read-only
-
-Everyone who can reach the URL can see your numbers — the dashboard exposes no
-credentials, but treat the performance data itself as public once deployed.
-
-## Running in the cloud
-
-### GitHub Actions (no infrastructure needed)
-
-The repo ships a manual workflow at `.github/workflows/backtest.yml`.
-
-1. In the GitHub repo, go to **Settings → Secrets and variables → Actions** and add
-   `HELIUS_API_KEY` and `MIGRATION_ADDRESS` as repository secrets.
-2. Go to **Actions → "Run backtest in the cloud" → Run workflow**.
-3. Pick a stage (`collect`, `run`, or `collect-then-run`) and optionally pass extra
-   flags such as `--limit 5 --side-cost 0.02`.
-4. When the job finishes, download `backtest-results-*` from the run's **Artifacts**
-   section — it contains `trade_results.csv`, `summary.json`, and the rest.
-
-The OHLCV cache and the collected `graduations.csv` are persisted between workflow
-runs via the Actions cache, so you can `collect` once and then do several `run`
-sensitivity passes. GitHub-hosted jobs are capped at 6 hours; at the keyless
-GeckoTerminal rate a full 500-token run fits, but use `--limit` first to validate.
-
-### Railway (public dashboard + job runner)
-
-The folder includes a `Dockerfile` and `railway.json`. By default the container
-serves the dashboard; it can also launch backtest jobs itself, so one Railway
-service does everything.
-
-1. Create a new Railway project → **Deploy from GitHub repo** and pick this repo.
-2. In the service settings, set **Root Directory** to `grad-backtest`.
-3. Add environment variables:
-   - `HELIUS_API_KEY` and `MIGRATION_ADDRESS` (needed for `collect` jobs)
-   - `ADMIN_TOKEN` — a long random string; required to launch jobs via the API
-   - optionally `START_BALANCE`, `FIXED_FEE_PER_SIDE`, `GECKO_REQUESTS_PER_MINUTE`
-4. Attach a **Volume** mounted at `/data` (the container's `DATA_DIR` default)
-   so collected CSVs, the OHLCV cache, and results survive restarts and
-   redeploys — without it, every redeploy starts from an empty filesystem.
-5. Under **Settings → Networking**, click **Generate Domain** — that's your
-   public dashboard URL.
-6. Kick off jobs from anywhere:
-
-```bash
-curl -X POST https://YOUR-APP.up.railway.app/api/run \
-  -H "x-admin-token: $ADMIN_TOKEN" -H "content-type: application/json" \
-  -d '{"stage": "collect", "extra_args": "--count 500"}'
-curl -X POST ... -d '{"stage": "run", "extra_args": "--limit 5"}'
-curl -X POST ... -d '{"stage": "sizing"}'
-```
-
-The dashboard refreshes itself every 15 seconds and shows job progress live.
-
-Before the first full batch, do a dress rehearsal: launch
-`{"stage": "run", "extra_args": "--limit 5"}` and confirm trades appear on the
-dashboard. That proves env vars, both APIs, and volume writes end to end —
-much cheaper than discovering a bad API key three hours into a 500-token run.
-The cache is resumable, so those five tokens aren't wasted work.
-
-### Railway batch mode (no dashboard)
-
-Set `BACKTEST_COMMAND` (e.g. `run --limit 5`, then `run` for the real batch)
-and the container executes that once and exits instead of serving the
-dashboard. Two extra settings matter in this mode:
-
-- **Restart Policy → Never** (service settings). Railway treats a clean exit
-  as a crash by default and would re-run the backtest forever, burning your
-  Helius/GeckoTerminal quota. (`railway.json` ships ON_FAILURE for the
-  dashboard mode, so override it in the UI for batch.)
-- Remove or ignore the healthcheck — there is no HTTP server to probe.
-
-Results land on the volume; read them with `railway ssh` and
-`cat /data/summary.json`, or flip back to dashboard mode (unset
-`BACKTEST_COMMAND`, redeploy) and view the same volume through the web UI.
-
-The same image works on any container host (Fly.io, Cloud Run jobs, a plain VPS):
-
-```bash
-docker build -t grad-backtest grad-backtest/
-docker run --rm -e HELIUS_API_KEY=... -e MIGRATION_ADDRESS=... \
-  -e BACKTEST_COMMAND="run --limit 5" -v "$PWD/data:/app/data" grad-backtest
-```
+- **Never** paste a private key or seed phrase into chat, a commit, an issue, or this README. The key goes only in the `WALLET_PRIVATE_KEY` environment variable, ideally sealed.
+- Use a dedicated burner wallet holding only what you can lose. The executor signs anything Jupiter builds for the configured wallet.
+- `MIGRATION_ADDRESS` is public. `ADMIN_TOKEN` is a password you invent; anyone with it can start the executor or panic-sell your positions.
+- Error text redacts `api-key` query parameters, but logs still contain wallet addresses and trade details. Treat the dashboard's numbers as public once deployed.
+- `--print-config` omits the wallet key; nothing else in the codebase prints it.
