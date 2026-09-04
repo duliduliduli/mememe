@@ -221,10 +221,19 @@ prints the important ones.
 | Variable | Default | Meaning |
 |---|---|---|
 | `MAX_PRICE_IMPACT_PCT` | `5` | Skip if the buy quote's price impact exceeds this. |
+| `MIN_ENTRY_ROUND_TRIP_PCT` | `80` | Skip unless an immediate executable sell quote returns at least this percentage of the proposed input. |
 | `MAX_ENTRY_MARKET_CAP_USD` | `300000` | Skip if the implied entry market cap is above this. `0` disables. |
 | `MIN_ENTRY_MARKET_CAP_USD` | `25000` | Skip if the implied entry market cap is below this. `0` disables. |
 | `MIN_CURVE_AGE_SECONDS` | `120` | Skip if the token graduated less than this many seconds after it was created. `0` disables. |
 | `MAX_TOP_HOLDER_PCT` | `20` | Skip if the largest plain-wallet holder owns more than this share of supply. `0` disables. |
+
+Bundle graph defaults: inspect up to 50 holders; block same-slot (`30%`), direct-funder
+(`30%`), two-hop ancestry (`20%`), unpaid token-transfer (`12%`), coordinated
+12-slot acquisition (`20%`), repeat-launch cohort (`12%`), creator-linked (`15%`),
+top-ten (`50%`), and first-three-slot (`30%`) concentration. Funder coverage below
+`30%` fails closed. Coverage from `30%` through `60%` is classified as partial and
+multiplies every limit by `0.67`; higher coverage uses the normal limits. Wallet
+funders and launch appearances are cached in `DATA_DIR/wallet_graph_cache.json`.
 
 ### 4.5 Swaps, slippage, retries
 
@@ -367,7 +376,7 @@ entry can land.
    - token supply → implied market cap = supply × (USD in ÷ tokens out), i.e. the price we would actually pay;
    - mint creation time via `getSignaturesForAddress` with early stop → curve age = graduation − creation;
    - largest plain-wallet holder via `getTokenLargestAccounts` plus two `getMultipleAccounts` calls, ignoring program-owned accounts (the pool, the bonding curve, the Mayhem vault) and our own wallet.
-   - a mandatory bundle snapshot over the largest plain-wallet holders: same-slot purchases, first-three-slot purchases, top-ten concentration, common non-CEX funders, and the creator-linked cluster. Holder histories are fetched concurrently from Helius. With `BUNDLE_FAIL_CLOSED=1`, missing supply, creation history, purchase history, or funder coverage below `MIN_FUNDER_COVERAGE_PCT` (30% by default) skips the entry.
+   - a mandatory bundle graph over up to 50 plain-wallet holders. It combines same-slot and short-window purchases, first-three-slot purchases, top-ten concentration, direct and two-hop non-CEX funding ancestry, unpaid wallet-to-wallet token distributions, creator linkage, and wallet cohorts previously seen together. Holder histories are fetched concurrently and cached. With `BUNDLE_FAIL_CLOSED=1`, missing supply, creation history, purchase history, or less than 30% funder coverage skips the entry; 30–60% coverage applies stricter thresholds.
 4. **`entry_guard_reason`**, first hit wins:
    1. lateness > `MAX_ENTRY_LATENESS_SECONDS` → `stale entry: Ns past target`
    2. price impact > `MAX_PRICE_IMPACT_PCT` → `price impact X% > 5.0% (pool too thin for our size)`
@@ -378,10 +387,14 @@ entry can land.
    7. incomplete mandatory bundle data → `bundle data unavailable (…)`
    8. same-slot holdings > `MAX_BUNDLE_SLOT_PCT`
    9. largest connected funding cluster > `MAX_CLUSTER_PCT`
-   10. creator-linked cluster > `MAX_DEV_CLUSTER_PCT`
-   11. top-ten wallet concentration > `MAX_TOP10_WALLET_PCT`
-   12. first-three-slot purchases > `MAX_EARLY_BUY_PCT`
-5. **Honeypot guard**: a reverse quote token → WSOL must succeed, else `SKIP …: no sell route (possible honeypot)`.
+   10. two-hop ancestry cluster > `MAX_ANCESTRY_CLUSTER_PCT`
+   11. unpaid token-transfer cluster > `MAX_TRANSFER_CLUSTER_PCT`
+   12. coordinated rolling-slot burst > `MAX_COORDINATED_BUY_PCT`
+   13. repeat-launch cohort > `MAX_REPEAT_COHORT_PCT`
+   14. creator-linked cluster > `MAX_DEV_CLUSTER_PCT`
+   15. top-ten wallet concentration > `MAX_TOP10_WALLET_PCT`
+   16. first-three-slot purchases > `MAX_EARLY_BUY_PCT`
+5. **Executable liquidity guard**: a reverse quote token → WSOL must succeed and return at least `MIN_ENTRY_ROUND_TRIP_PCT` of the proposed input.
 6. **Execute.** Live: build, sign, send, confirm (6.10). If the swap reports failure, wait 15 s and check the wallet; if tokens landed anyway the position is adopted with `buy_signature = "unconfirmed"`. Paper: debit the paper balance.
 7. Record the position (6.12) and log `ENTER <mint> $X (live <sig>… | paper fill)`.
 
@@ -392,7 +405,8 @@ Why those guards exist:
 - **Floor**: a token far below the graduation cap a minute later was already dumped into its own pool. The motivating case (SOLL) had its creator sell 78% of supply 24 s after migration; the bot bought at a $450 cap. Sub-$30K entries went 1 for 7 overnight.
 - **Curve age**: filling a whole bonding curve in seconds takes one buyer. SOLL graduated 29 s after creation with six buyers.
 - **Holder concentration**: the wallet that holds a big slice at entry is the one that dumps. SOLL's creator held 59% at graduation.
-- **Split-wallet concentration**: checking only the largest individual wallet misses operators who divide supply among many wallets. The live gate now reconstructs shared-funder and early-purchase clusters and blocks the combined percentage. `BUNDLE_LOG_ONLY=1` is available only as an explicit canary mode; the default is enforcement.
+- **Split-wallet concentration**: checking only the largest individual wallet misses operators who divide supply among many wallets. The live gate reconstructs funding ancestry, token distributions, coordinated purchase bursts, and repeat-launch cohorts, then blocks their combined supply percentage. `BUNDLE_LOG_ONLY=1` is available only as an explicit canary mode; the default is enforcement.
+- **Canonical PumpSwap liquidity**: Pump.fun burns the LP tokens received when a coin graduates, so a generic “LP locked” badge is not an additional safety signal for canonical graduations. The bot instead requires two-way executable Jupiter liquidity immediately before signing the buy.
 
 ### 6.5 Position management and exit order
 
