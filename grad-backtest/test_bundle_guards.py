@@ -115,6 +115,54 @@ class TopHolderGuardTests(unittest.TestCase):
         self.assertIn("top wallet", executor.entry_guard_reason(cfg, GRAD, ENTRY, 1.0, 64_000, 600, 90))
 
 
+class MultiWalletBundleGuardTests(unittest.TestCase):
+    def test_defaults_and_legacy_fraction_env(self):
+        executor, p = fresh(MAX_CLUSTER_PCT="0.30")
+        self.addCleanup(p.stop)
+        cfg = executor.Config()
+        self.assertEqual(cfg.max_bundle_slot_pct, 30)
+        self.assertEqual(cfg.max_cluster_pct, 30)
+        self.assertEqual(cfg.max_dev_cluster_pct, 15)
+        self.assertEqual(cfg.max_top10_wallet_pct, 50)
+        self.assertEqual(cfg.max_early_buy_pct, 30)
+        self.assertTrue(cfg.bundle_fail_closed)
+
+    def test_connected_cluster_is_blocked(self):
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        cfg = executor.Config()
+        bundle = {"complete": True, "cluster_pct": 54.0}
+        reason = executor.entry_guard_reason(cfg, GRAD, ENTRY, 1.0, 64_000, 600, 8, bundle)
+        self.assertIn("connected funding cluster", reason)
+        self.assertIn("54.0%", reason)
+
+    def test_same_slot_dev_top10_and_early_thresholds(self):
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        cfg = executor.Config()
+        cases = [
+            ({"complete": True, "bundle_slot_pct": 31}, "same-slot"),
+            ({"complete": True, "dev_cluster_pct": 16}, "creator-linked"),
+            ({"complete": True, "top10_wallet_pct": 51}, "top ten"),
+            ({"complete": True, "early_buy_pct": 31}, "first three slots"),
+        ]
+        for bundle, expected in cases:
+            with self.subTest(expected=expected):
+                reason = executor.entry_guard_reason(cfg, GRAD, ENTRY, 1.0, 64_000, 600, 8, bundle)
+                self.assertIn(expected, reason)
+
+    def test_incomplete_bundle_data_fails_closed(self):
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        cfg = executor.Config()
+        reason = executor.entry_guard_reason(
+            cfg, GRAD, ENTRY, 1.0, 64_000, 600, 8,
+            {"complete": False, "error": "funder coverage 20.0%"},
+        )
+        self.assertIn("bundle data unavailable", reason)
+        self.assertIn("coverage", reason)
+
+
 class FakeRpc:
     """Scripted responses keyed by method; records calls."""
 
@@ -208,6 +256,40 @@ class TopWalletHolderTests(unittest.TestCase):
         self.assertIsNone(fake.rpc.top_wallet_holder("m"))
 
 
+class BundleSnapshotTests(unittest.TestCase):
+    def test_shared_funder_and_same_slot_are_measured(self):
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        cfg = executor.Config()
+        rpc = executor.Rpc(cfg)
+        wallets = [f"w{i}" for i in range(6)]
+        largest = {"value": [{"address": f"ta{i}", "amount": "9"} for i in range(6)]}
+        token_accounts = {"value": [token_account(wallet) for wallet in wallets]}
+        owner_accounts = {"value": [{"owner": executor.SYSTEM_PROGRAM} for _ in wallets]}
+        fake = FakeRpc(executor, {
+            "getTokenLargestAccounts": largest,
+            "getMultipleAccounts": [token_accounts, owner_accounts],
+        })
+        rpc.call = fake.call
+        rpc.enhanced_transactions = lambda address, **params: [{
+            "slot": 10,
+            "feePayer": "dev",
+            "tokenTransfers": [
+                {"mint": "m", "toUserAccount": wallet, "tokenAmount": 0.09, "decimals": 2}
+                for wallet in wallets
+            ],
+        }]
+        rpc.origin_funder = lambda wallet, before: "dev"
+        snapshot = rpc.bundle_snapshot("m", 1.0, 2, 900, 1000)
+        self.assertTrue(snapshot["complete"])
+        self.assertAlmostEqual(snapshot["bundle_slot_pct"], 54.0)
+        self.assertAlmostEqual(snapshot["cluster_pct"], 54.0)
+        self.assertAlmostEqual(snapshot["dev_cluster_pct"], 54.0)
+        self.assertAlmostEqual(snapshot["top10_wallet_pct"], 54.0)
+        self.assertAlmostEqual(snapshot["early_buy_pct"], 54.0)
+        self.assertAlmostEqual(snapshot["funder_coverage_pct"], 100.0)
+
+
 class EntryIntegrationTests(unittest.TestCase):
     """Paper-mode try_enter with SOLL's numbers: every lookup answers, the floor rejects it."""
 
@@ -228,6 +310,15 @@ class EntryIntegrationTests(unittest.TestCase):
         }
         FakeRpcLike = FakeRpc(self.executor, responses)
         ex.rpc.call = FakeRpcLike.call
+        ex.rpc.bundle_snapshot = lambda *args, **kwargs: {
+            "complete": True,
+            "bundle_slot_pct": 5.0,
+            "cluster_pct": 5.0,
+            "dev_cluster_pct": 2.0,
+            "top10_wallet_pct": 20.0,
+            "early_buy_pct": 5.0,
+            "funder_coverage_pct": 100.0,
+        }
         return FakeRpcLike
 
     def enter(self):
@@ -263,9 +354,32 @@ class EntryIntegrationTests(unittest.TestCase):
         self.assertEqual(pos["entry_top_holder_pct"], 5.0)
         self.assertGreater(pos["entry_market_cap_usd"], 25_000)
 
-    def test_lookup_failure_never_blocks(self):
+    def test_lookup_failure_blocks_when_bundle_data_is_mandatory(self):
         self.wire(out_tokens=150_000, created=GRAD - 3600)
         self.ex.rpc.call = lambda m, p: (_ for _ in ()).throw(RuntimeError("rpc down"))
+        skips = self.enter()
+        self.assertIn("bundle data unavailable", skips)
+        self.assertEqual(self.ex.state["positions"], [])
+
+    def test_connected_cluster_snapshot_blocks_entry(self):
+        self.wire(out_tokens=150_000, created=GRAD - 3600)
+        self.ex.rpc.bundle_snapshot = lambda *args, **kwargs: {
+            "complete": True,
+            "cluster_pct": 54.0,
+            "funder_coverage_pct": 100.0,
+        }
+        skips = self.enter()
+        self.assertIn("connected funding cluster", skips)
+        self.assertEqual(self.ex.state["positions"], [])
+
+    def test_log_only_canary_records_warning_but_enters(self):
+        self.ex.cfg.bundle_log_only = True
+        self.wire(out_tokens=150_000, created=GRAD - 3600)
+        self.ex.rpc.bundle_snapshot = lambda *args, **kwargs: {
+            "complete": True,
+            "cluster_pct": 54.0,
+            "funder_coverage_pct": 100.0,
+        }
         skips = self.enter()
         self.assertEqual(skips, "")
         self.assertEqual(len(self.ex.state["positions"]), 1)

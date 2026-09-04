@@ -133,6 +133,15 @@ class AdoptedSlotTests(unittest.TestCase):
             "getSignaturesForAddress": [{"signature": "s", "blockTime": 1}],
             "getTokenLargestAccounts": {"value": []},
         }[m]
+        ex.rpc.bundle_snapshot = lambda *args, **kwargs: {
+            "complete": True,
+            "bundle_slot_pct": 1.0,
+            "cluster_pct": 1.0,
+            "dev_cluster_pct": 0.0,
+            "top10_wallet_pct": 10.0,
+            "early_buy_pct": 1.0,
+            "funder_coverage_pct": 100.0,
+        }
         with mock.patch.object(executor, "now_ts", return_value=1030.0):
             ex.try_enter({"mint": "fresh", "graduated_ts": 1000.0}, 100.0)
         self.assertEqual([p["mint"] for p in ex.state["positions"]][-1], "fresh")

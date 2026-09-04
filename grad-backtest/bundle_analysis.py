@@ -1,5 +1,4 @@
-"""Pure bundle / funding-cluster math. No RPC. Executor will import these
-once the live wiring lands; tests can use them now."""
+"""Pure bundle / funding-cluster math shared by tests and the live executor."""
 from __future__ import annotations
 
 from typing import Any
@@ -57,6 +56,46 @@ def cluster_supply_pct(
             best_pct = pct
             best = list(group)
     return best_pct, best
+
+
+def related_holder_wallets(
+    wallet_to_funder: dict[str, str | None],
+    seed: str | None,
+    cex: set[str] | None = None,
+) -> list[str]:
+    """Return holder wallets connected to ``seed`` through non-CEX funding edges."""
+    if not seed:
+        return []
+    cex = cex if cex is not None else CEX_FUNDERS
+    graph: dict[str, set[str]] = {}
+    for wallet, funder in wallet_to_funder.items():
+        graph.setdefault(wallet, set())
+        if funder and funder not in cex:
+            graph.setdefault(funder, set())
+            graph[wallet].add(funder)
+            graph[funder].add(wallet)
+    seen = {seed}
+    pending = [seed]
+    while pending:
+        node = pending.pop()
+        for neighbour in graph.get(node, set()):
+            if neighbour not in seen:
+                seen.add(neighbour)
+                pending.append(neighbour)
+    return [wallet for wallet in wallet_to_funder if wallet in seen]
+
+
+def wallets_supply_pct(wallets: list[str], wallet_amounts: dict[str, float], supply: float) -> float:
+    if supply <= 0:
+        return 0.0
+    return sum(wallet_amounts.get(wallet, 0.0) for wallet in wallets) / supply * 100
+
+
+def top_wallets_supply_pct(wallet_amounts: dict[str, float], supply: float, limit: int = 10) -> float:
+    if supply <= 0 or limit <= 0:
+        return 0.0
+    held = sum(sorted(wallet_amounts.values(), reverse=True)[:limit])
+    return held / supply * 100
 
 
 def bundle_slot_pct(buys: list[dict[str, Any]], supply: float) -> tuple[float, int | None, int]:
