@@ -79,6 +79,7 @@ TRADE_COLUMNS = [
     "entry_ancestry_cluster_pct", "entry_transfer_cluster_pct", "entry_coordinated_buy_pct",
     "entry_repeat_cohort_pct",
     "entry_top10_wallet_pct", "entry_early_buy_pct", "entry_funder_coverage_pct",
+    "entry_funder_lookup_pct", "entry_funder_sample_count",
     "entry_holder_sample_count", "entry_bundle_confidence",
 ]
 
@@ -207,6 +208,7 @@ class Config:
         self.max_top10_wallet_pct = percent_env("MAX_TOP10_WALLET_PCT", 50)
         self.max_early_buy_pct = percent_env("MAX_EARLY_BUY_PCT", 30)
         self.min_funder_coverage_pct = percent_env("MIN_FUNDER_COVERAGE_PCT", 30)
+        self.min_funder_lookup_pct = percent_env("MIN_FUNDER_LOOKUP_PCT", 80)
         self.high_confidence_funder_coverage_pct = percent_env("HIGH_CONFIDENCE_FUNDER_COVERAGE_PCT", 60)
         self.partial_coverage_limit_multiplier = max(
             0.1, min(1.0, float(os.getenv("PARTIAL_COVERAGE_LIMIT_MULTIPLIER", "0.67")))
@@ -217,6 +219,13 @@ class Config:
         self.bundle_fail_closed = os.getenv("BUNDLE_FAIL_CLOSED", "1") == "1"
         self.bundle_lookup_timeout_ms = max(250, int(os.getenv("BUNDLE_LOOKUP_TIMEOUT_MS", "1500")))
         self.bundle_max_wallets = min(100, max(2, int(os.getenv("BUNDLE_MAX_WALLETS", "50"))))
+        # Keep the broad sample for transfer/coordination/concentration checks, but trace
+        # funding only for the largest wallets. Adding small holders must not mechanically
+        # lower the funding coverage of the economically important sample.
+        self.bundle_funder_max_wallets = min(
+            self.bundle_max_wallets,
+            max(2, int(os.getenv("BUNDLE_FUNDER_MAX_WALLETS", "20"))),
+        )
         self.wallet_graph_cache_days = max(1.0, float(os.getenv("WALLET_GRAPH_CACHE_DAYS", "30")))
         self.max_entry_lateness_seconds = float(os.getenv("MAX_ENTRY_LATENESS_SECONDS", "60"))
         # Startup wallet reconciliation (live only): adopt untracked holdings worth at least
@@ -670,10 +679,18 @@ class Rpc:
         except OSError as exc:
             log(f"WARN wallet graph cache could not be saved ({describe_error(exc)})")
 
-    def _lookup_funders(self, wallets: set[str], before_ts: float) -> dict[str, str | None]:
+    def _lookup_funders(
+        self, wallets: set[str], before_ts: float
+    ) -> tuple[dict[str, str | None], set[str]]:
+        """Return funders and wallets whose lookup actually completed.
+
+        A completed lookup with no identifiable funder is not an API failure. The old
+        representation collapsed both outcomes to ``None`` and hid provider timeouts.
+        """
         results: dict[str, str | None] = {wallet: None for wallet in wallets}
+        completed: set[str] = set()
         if not wallets:
-            return results
+            return results, completed
         timeout = self.cfg.bundle_lookup_timeout_ms / 1000
         workers = min(12, len(wallets))
         total_timeout = timeout * ((len(wallets) + workers - 1) // workers) + 0.5
@@ -684,13 +701,14 @@ class Rpc:
                 wallet = futures[future]
                 try:
                     results[wallet] = future.result()
+                    completed.add(wallet)
                 except Exception:
                     results[wallet] = None
         except TimeoutError:
             pass
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
-        return results
+        return results, completed
 
     def bundle_snapshot(
         self,
@@ -763,16 +781,24 @@ class Rpc:
         if not buys or create_slot is None:
             return {"complete": False, "error": "mint purchase history was empty or not yet indexed"}
 
-        funders = self._lookup_funders(holder_set, graduated_ts)
+        funding_wallets = {
+            wallet
+            for wallet, _amount in sorted(
+                wallet_amounts.items(), key=lambda item: item[1], reverse=True
+            )[: self.cfg.bundle_funder_max_wallets]
+        }
+        funders, funder_lookups_completed = self._lookup_funders(funding_wallets, graduated_ts)
         first_hop = {funder for funder in funders.values() if funder and funder not in CEX_FUNDERS}
-        second_hop = self._lookup_funders(first_hop, graduated_ts)
+        second_hop, _second_hop_completed = self._lookup_funders(first_hop, graduated_ts)
         ancestry = {
             wallet: [node for node in (funder, second_hop.get(funder) if funder else None) if node]
             for wallet, funder in funders.items()
         }
         covered_amount = sum(wallet_amounts[w] for w, funder in funders.items() if funder)
-        tracked_amount = sum(wallet_amounts.values())
+        tracked_amount = sum(wallet_amounts[w] for w in funding_wallets)
         coverage_pct = covered_amount / tracked_amount * 100 if tracked_amount else 0.0
+        completed_amount = sum(wallet_amounts[w] for w in funder_lookups_completed)
+        lookup_pct = completed_amount / tracked_amount * 100 if tracked_amount else 0.0
         clusters = cluster_wallets(funders)
         largest_cluster_pct, cluster_members = cluster_supply_pct(clusters, wallet_amounts, supply_ui)
         ancestry_groups = ancestry_clusters(ancestry)
@@ -808,10 +834,24 @@ class Rpc:
         coordinated_pct, coordinated_slot, coordinated_wallets = coordinated_buy_pct(
             buys, supply_ui, self.cfg.coordinated_window_slots, self.cfg.coordinated_min_wallets
         )
-        confidence = "high" if coverage_pct >= self.cfg.high_confidence_funder_coverage_pct else "partial"
+        enough_lookup = lookup_pct >= self.cfg.min_funder_lookup_pct
+        enough_coverage = coverage_pct >= self.cfg.min_funder_coverage_pct
+        complete = enough_lookup and enough_coverage
+        if not enough_lookup:
+            error = f"funder lookups completed for {lookup_pct:.1f}% of funding sample"
+        elif not enough_coverage:
+            error = f"funder coverage {coverage_pct:.1f}%"
+        else:
+            error = None
+        if not complete:
+            confidence = "insufficient"
+        elif coverage_pct >= self.cfg.high_confidence_funder_coverage_pct:
+            confidence = "high"
+        else:
+            confidence = "partial"
         return {
-            "complete": coverage_pct >= self.cfg.min_funder_coverage_pct,
-            "error": None if coverage_pct >= self.cfg.min_funder_coverage_pct else f"funder coverage {coverage_pct:.1f}%",
+            "complete": complete,
+            "error": error,
             "bundle_slot_pct": same_slot_pct,
             "bundle_slot": bundle_slot,
             "bundle_wallets": bundle_wallets,
@@ -830,6 +870,8 @@ class Rpc:
             "top10_wallet_pct": top_wallets_supply_pct(wallet_amounts, supply_ui),
             "early_buy_pct": early_buy_pct(buys, supply_ui, create_slot),
             "funder_coverage_pct": coverage_pct,
+            "funder_lookup_pct": lookup_pct,
+            "funder_sample_count": len(funding_wallets),
             "holder_sample_count": len(holders),
             "bundle_confidence": confidence,
             "creator": creator,
@@ -1131,11 +1173,15 @@ class Executor:
                 "top10_wallet_pct",
                 "early_buy_pct",
                 "funder_coverage_pct",
+                "funder_lookup_pct",
             )
             if bundle.get(key) is not None
         )
         if bundle.get("holder_sample_count") is not None:
-            summary += f" holders={bundle['holder_sample_count']} confidence={bundle.get('bundle_confidence', 'unknown')}"
+            summary += (
+                f" funders={bundle.get('funder_sample_count', 0)}/{bundle['holder_sample_count']}"
+                f" confidence={bundle.get('bundle_confidence', 'unknown')}"
+            )
         log(f"BUNDLE {mint}: {summary or bundle.get('error', 'no metrics')}")
         if bundle_guard:
             if self.cfg.bundle_log_only:
@@ -1200,6 +1246,8 @@ class Executor:
                 "entry_top10_wallet_pct": round(bundle["top10_wallet_pct"], 1) if bundle.get("top10_wallet_pct") is not None else None,
                 "entry_early_buy_pct": round(bundle["early_buy_pct"], 1) if bundle.get("early_buy_pct") is not None else None,
                 "entry_funder_coverage_pct": round(bundle["funder_coverage_pct"], 1) if bundle.get("funder_coverage_pct") is not None else None,
+                "entry_funder_lookup_pct": round(bundle["funder_lookup_pct"], 1) if bundle.get("funder_lookup_pct") is not None else None,
+                "entry_funder_sample_count": bundle.get("funder_sample_count"),
                 "entry_holder_sample_count": bundle.get("holder_sample_count"),
                 "entry_bundle_confidence": bundle.get("bundle_confidence"),
                 "peak_usd": size_usd,
@@ -1397,6 +1445,8 @@ class Executor:
                 "entry_top10_wallet_pct": pos.get("entry_top10_wallet_pct"),
                 "entry_early_buy_pct": pos.get("entry_early_buy_pct"),
                 "entry_funder_coverage_pct": pos.get("entry_funder_coverage_pct"),
+                "entry_funder_lookup_pct": pos.get("entry_funder_lookup_pct"),
+                "entry_funder_sample_count": pos.get("entry_funder_sample_count"),
                 "entry_holder_sample_count": pos.get("entry_holder_sample_count"),
                 "entry_bundle_confidence": pos.get("entry_bundle_confidence"),
                 "peak_gain_pct": round(peak_gain * 100, 1) if peak_gain is not None else None,
@@ -1490,6 +1540,8 @@ class Executor:
                 "entry_top10_wallet_pct": pos.get("entry_top10_wallet_pct"),
                 "entry_early_buy_pct": pos.get("entry_early_buy_pct"),
                 "entry_funder_coverage_pct": pos.get("entry_funder_coverage_pct"),
+                "entry_funder_lookup_pct": pos.get("entry_funder_lookup_pct"),
+                "entry_funder_sample_count": pos.get("entry_funder_sample_count"),
                 "entry_holder_sample_count": pos.get("entry_holder_sample_count"),
                 "entry_bundle_confidence": pos.get("entry_bundle_confidence"),
                 "peak_gain_pct": round(peak_gain * 100, 1) if peak_gain is not None else None,
@@ -1667,7 +1719,9 @@ class Executor:
             f"coordinated<={self.cfg.max_coordinated_buy_pct:.0f}% repeat<={self.cfg.max_repeat_cohort_pct:.0f}% "
             f"dev_cluster<={self.cfg.max_dev_cluster_pct:.0f}% top10<={self.cfg.max_top10_wallet_pct:.0f}% "
             f"early_buy<={self.cfg.max_early_buy_pct:.0f}% funder_coverage>={self.cfg.min_funder_coverage_pct:.0f}% "
-            f"high_confidence>={self.cfg.high_confidence_funder_coverage_pct:.0f}% holders={self.cfg.bundle_max_wallets} "
+            f"funder_lookup>={self.cfg.min_funder_lookup_pct:.0f}% "
+            f"high_confidence>={self.cfg.high_confidence_funder_coverage_pct:.0f}% "
+            f"holders={self.cfg.bundle_max_wallets} funders={self.cfg.bundle_funder_max_wallets} "
             f"bundle_mode={'log' if self.cfg.bundle_log_only else 'block'} "
             f"adopt>=${self.cfg.min_adopt_usd} "
             f"stuck_after={self.cfg.stuck_after_minutes:.0f}m "
