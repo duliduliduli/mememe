@@ -201,6 +201,7 @@ class TradeResult:
     both_barriers_same_candle: bool
     moon_bag_fraction: float = 0.0
     moon_bag_price: float = 0.0  # price the kept fraction is valued/sold at (last candle, ~24h)
+    scale_out_price: float = 0.0  # price at which the partial take-profit leg sold (0 = none)
 
 
 class GeckoTerminal:
@@ -318,6 +319,8 @@ def simulate_trade(
     side_cost: float,
     trailing_stop: float = 0.0,
     moon_bag: float = 0.0,
+    scale_out_at: float = 0.0,
+    scale_out_fraction: float = 0.5,
 ) -> TradeResult:
     tp_price = entry_price * (1.0 + take_profit)
     sl_price = entry_price * (1.0 - stop_loss)
@@ -332,6 +335,8 @@ def simulate_trade(
     ambiguous = False
     peak = entry_price  # high-water mark of PRIOR candles only, so a candle's
     # own high never arms the trailing stop that its own low then triggers.
+    scale_price = entry_price * (1.0 + scale_out_at) if scale_out_at > 0 else 0.0
+    scale_out_price = 0.0
     for candle in path:
         trail_price = peak * (1.0 - trailing_stop) if trailing_stop > 0 else 0.0
         hit_tp = candle.high >= tp_price
@@ -349,6 +354,10 @@ def simulate_trade(
             if hit_tp:
                 ambiguous = True  # both barriers in one candle; adverse ordering again
             break
+        if scale_price and not scale_out_price and candle.high >= scale_price:
+            # Partial take-profit leg fills at its threshold; the remainder keeps running under
+            # the same price thresholds (a reduced cost basis leaves them at the same token price).
+            scale_out_price = scale_price
         if hit_tp:
             exit_price, exit_ts, reason = tp_price, candle.timestamp, "take_profit"
             break
@@ -358,10 +367,16 @@ def simulate_trade(
     # the collected path (~24h) and sell there. Both sell legs pay side_cost, so
     # the blended effective exit price folds into the same cost formula.
     moon_bag_price = 0.0
-    effective_exit = exit_price
+    remainder_exit = exit_price
     if moon_bag > 0:
         moon_bag_price = sorted(minute_candles, key=lambda c: c.timestamp)[-1].close
-        effective_exit = exit_price * (1.0 - moon_bag) + moon_bag_price * moon_bag
+        remainder_exit = exit_price * (1.0 - moon_bag) + moon_bag_price * moon_bag
+    # Scale-out leg sold early at scale_out_price; the remaining fraction exits as above.
+    # Proportional costs are identical per leg, so blending before apply_costs is exact.
+    if scale_out_price:
+        effective_exit = scale_out_price * scale_out_fraction + remainder_exit * (1.0 - scale_out_fraction)
+    else:
+        effective_exit = remainder_exit
     gross, net = apply_costs(entry_price, effective_exit, side_cost)
     return TradeResult(
         mint_address=mint,
@@ -378,6 +393,7 @@ def simulate_trade(
         both_barriers_same_candle=ambiguous,
         moon_bag_fraction=moon_bag,
         moon_bag_price=moon_bag_price,
+        scale_out_price=scale_out_price,
     )
 
 
@@ -519,6 +535,8 @@ def run_backtest(args: argparse.Namespace) -> None:
                 args.side_cost,
                 args.trailing_stop,
                 args.moon_bag,
+                args.scale_out_at,
+                args.scale_out_fraction,
             )
             trades.append(asdict(trade))
             snapshots.extend(snapshot_rows(mint, graduation_ts, pool, minute_path))
@@ -553,6 +571,8 @@ def run_backtest(args: argparse.Namespace) -> None:
             "stop_loss": args.stop_loss,
             "trailing_stop": args.trailing_stop,
             "moon_bag": args.moon_bag,
+            "scale_out_at": args.scale_out_at,
+            "scale_out_fraction": args.scale_out_fraction,
             "time_stop_minutes": args.time_stop_minutes,
             "cost_each_side": args.side_cost,
             "round_trip_cost_at_flat_price": 1 - (1 - args.side_cost) / (1 + args.side_cost),
@@ -595,6 +615,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--moon-bag", type=float, default=0.0,
         help="Keep this fraction of the position at the primary exit and sell it at ~24h (0 disables)",
     )
+    run.add_argument(
+        "--scale-out-at", type=float, default=0.0,
+        help="Partial take-profit: sell --scale-out-fraction of the position at this gain (0 disables)",
+    )
+    run.add_argument("--scale-out-fraction", type=float, default=0.5, help="Fraction sold at the scale-out target")
     run.add_argument("--time-stop-minutes", type=int, default=30)
     run.add_argument("--side-cost", type=float, default=0.03, help="Fraction charged on entry and exit")
     run.set_defaults(func=run_backtest)

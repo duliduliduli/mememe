@@ -53,6 +53,7 @@ SKIPS_FILE = DATA_DIR / "skips.csv"
 TRADE_COLUMNS = [
     "opened_at", "closed_at", "mint", "mode", "position_usd", "exit_usd",
     "net_return", "exit_reason", "buy_signature", "sell_signature", "entry_price_impact_pct",
+    "peak_gain_pct",
 ]
 
 
@@ -90,6 +91,10 @@ class Config:
         self.stop_loss = float(os.getenv("STOP_LOSS", "0.30"))
         self.trailing_stop = float(os.getenv("TRAILING_STOP", "0"))  # fraction off peak; 0 disables
         self.moon_bag = min(0.5, max(0.0, float(os.getenv("MOON_BAG", "0"))))  # fraction kept at exit; 0 disables
+        # Partial take-profit: at +SCALE_OUT_AT sell SCALE_OUT_FRACTION of the position and let the
+        # remainder ride to the full take-profit under the same rules. 0 disables.
+        self.scale_out_at = float(os.getenv("SCALE_OUT_AT", "0"))
+        self.scale_out_fraction = min(0.9, max(0.0, float(os.getenv("SCALE_OUT_FRACTION", "0.5"))))
         self.time_stop_minutes = float(os.getenv("TIME_STOP_MINUTES", "30"))
         self.entry_delay_seconds = float(os.getenv("ENTRY_DELAY_SECONDS", "30"))
         self.max_entry_age_seconds = float(os.getenv("MAX_ENTRY_AGE_SECONDS", "120"))
@@ -451,13 +456,17 @@ class Executor:
         if self.cfg.mode == "live":
             amount = self.rpc.token_balance(self.wallet.pubkey, mint)
             if amount <= 0:
+                # A previous sell most likely landed after our confirmation timeout. Record the
+                # close at the last quoted value so the trade log stays complete, and flag it.
+                est = float(pos.get("last_value_usd") or 0.0)
                 log(
-                    f"WARN {mint}: no tokens on-chain to sell; dropping position. "
-                    "If a previous sell landed after timing out this is expected — "
-                    "check the wallet on an explorer to confirm the proceeds arrived."
+                    f"WARN {mint}: no tokens on-chain to sell; closing position at last quoted value "
+                    f"(${est:.2f}). Confirm the actual proceeds on an explorer."
                 )
+                self.state["daily"]["realized_pnl_usd"] = float(self.state["daily"]["realized_pnl_usd"]) + (est - pos["position_usd"])
                 self.state["positions"].remove(pos)
                 save_state(self.state)
+                self._record_close(pos, f"{reason}_unconfirmed", est, "", pos["position_usd"])
                 return
         else:
             amount = int(pos["tokens"])
@@ -485,11 +494,16 @@ class Executor:
         self.state["daily"]["realized_pnl_usd"] = float(self.state["daily"]["realized_pnl_usd"]) + (exit_usd - sold_cost)
         self.state["positions"].remove(pos)
         save_state(self.state)
+        self._record_close(pos, reason, exit_usd, sell_sig, sold_cost)
+
+    def _record_close(self, pos: dict[str, Any], reason: str, exit_usd: float, sell_sig: str, sold_cost: float) -> None:
+        net = exit_usd / sold_cost - 1.0 if sold_cost > 0 else 0.0
+        peak_gain = float(pos.get("peak_usd", 0.0)) / pos["position_usd"] - 1.0 if pos["position_usd"] else None
         record_trade(
             {
                 "opened_at": pos["opened_at"],
                 "closed_at": utc_iso(),
-                "mint": mint,
+                "mint": pos["mint"],
                 "mode": self.cfg.mode,
                 "position_usd": round(sold_cost, 2),
                 "exit_usd": round(exit_usd, 2),
@@ -498,9 +512,11 @@ class Executor:
                 "buy_signature": pos.get("buy_signature", ""),
                 "sell_signature": sell_sig,
                 "entry_price_impact_pct": pos.get("entry_price_impact_pct"),
+                "peak_gain_pct": round(peak_gain * 100, 1) if peak_gain is not None else None,
             }
         )
-        log(f"EXIT {mint} {reason} ${exit_usd:.2f} ({net:+.1%})")
+        peaked = f", peaked {peak_gain:+.1%}" if peak_gain is not None else ""
+        log(f"EXIT {pos['mint']} {reason} ${exit_usd:.2f} ({net:+.1%}{peaked})")
 
     def manage_positions(self, sol_price: float, panic: bool) -> None:
         for pos in list(self.state["positions"]):
@@ -508,6 +524,15 @@ class Executor:
                 quote = self.jup.quote(pos["mint"], WSOL, int(pos["tokens"]))
                 current_usd = int(quote["outAmount"]) / LAMPORTS * sol_price
                 pos["peak_usd"] = max(float(pos.get("peak_usd", pos["position_usd"])), current_usd)
+                pos["last_value_usd"] = current_usd
+                if (
+                    not panic
+                    and self.cfg.scale_out_at > 0
+                    and not pos.get("scaled_out")
+                    and current_usd >= pos["position_usd"] * (1.0 + self.cfg.scale_out_at)
+                ):
+                    self.scale_out(pos, sol_price)
+                    continue  # remainder is re-evaluated against a fresh quote next cycle
                 reason = "panic" if panic else decide_exit(
                     pos["position_usd"], current_usd, pos["opened_ts"], now_ts(), self.cfg, pos["peak_usd"]
                 )
@@ -515,6 +540,47 @@ class Executor:
                     self.close_position(pos, reason, sol_price)
             except Exception as exc:
                 log(f"WARN managing {pos['mint']}: {exc}")
+
+    def scale_out(self, pos: dict[str, Any], sol_price: float) -> None:
+        """Bank part of a winner at the first target. The remainder keeps the same TP/SL/trailing
+        rules on its reduced cost basis, which leaves every threshold at the same token price."""
+        mint = pos["mint"]
+        frac = self.cfg.scale_out_fraction
+        amount = self.rpc.token_balance(self.wallet.pubkey, mint) if self.cfg.mode == "live" else int(pos["tokens"])
+        sell_amount = int(amount * frac)
+        if sell_amount <= 0:
+            return
+        quote = self.jup.quote(mint, WSOL, sell_amount)
+        sig = self.execute_swap(quote) if self.cfg.mode == "live" else ""
+        proceeds = int(quote["outAmount"]) / LAMPORTS * sol_price
+        if self.cfg.mode == "paper":
+            self.state["paper_balance_usd"] = float(self.state["paper_balance_usd"]) + proceeds
+        sold_cost = pos["position_usd"] * frac
+        net = proceeds / sold_cost - 1.0 if sold_cost > 0 else 0.0
+        peak_gain = float(pos["peak_usd"]) / pos["position_usd"] - 1.0 if pos["position_usd"] else None
+        self.state["daily"]["realized_pnl_usd"] = float(self.state["daily"]["realized_pnl_usd"]) + (proceeds - sold_cost)
+        pos["tokens"] = amount - sell_amount
+        pos["position_usd"] = pos["position_usd"] - sold_cost
+        pos["peak_usd"] = float(pos["peak_usd"]) * (1.0 - frac)
+        pos["scaled_out"] = True
+        save_state(self.state)
+        record_trade(
+            {
+                "opened_at": pos["opened_at"],
+                "closed_at": utc_iso(),
+                "mint": mint,
+                "mode": self.cfg.mode,
+                "position_usd": round(sold_cost, 2),
+                "exit_usd": round(proceeds, 2),
+                "net_return": round(net, 4),
+                "exit_reason": "scale_out",
+                "buy_signature": pos.get("buy_signature", ""),
+                "sell_signature": sig,
+                "entry_price_impact_pct": pos.get("entry_price_impact_pct"),
+                "peak_gain_pct": round(peak_gain * 100, 1) if peak_gain is not None else None,
+            }
+        )
+        log(f"SCALE-OUT {mint}: sold {frac:.0%} for ${proceeds:.2f} ({net:+.1%}); remainder basis ${pos['position_usd']:.2f}")
 
     def liquidate_moon_bags(self, sol_price: float) -> None:
         for bag in list(self.state.get("moon_bags", [])):
