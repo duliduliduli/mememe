@@ -314,6 +314,7 @@ def simulate_trade(
     stop_loss: float,
     time_stop_minutes: int,
     side_cost: float,
+    trailing_stop: float = 0.0,
 ) -> TradeResult:
     tp_price = entry_price * (1.0 + take_profit)
     sl_price = entry_price * (1.0 - stop_loss)
@@ -326,9 +327,13 @@ def simulate_trade(
     exit_ts = path[-1].timestamp
     reason = "time_stop"
     ambiguous = False
+    peak = entry_price  # high-water mark of PRIOR candles only, so a candle's
+    # own high never arms the trailing stop that its own low then triggers.
     for candle in path:
+        trail_price = peak * (1.0 - trailing_stop) if trailing_stop > 0 else 0.0
         hit_tp = candle.high >= tp_price
         hit_sl = candle.low <= sl_price
+        hit_trail = trailing_stop > 0 and candle.low <= trail_price
         if hit_tp and hit_sl:
             # Intraminute ordering is unknowable from OHLC. Use adverse ordering.
             exit_price, exit_ts, reason, ambiguous = sl_price, candle.timestamp, "sl_ambiguous", True
@@ -336,9 +341,15 @@ def simulate_trade(
         if hit_sl:
             exit_price, exit_ts, reason = sl_price, candle.timestamp, "stop_loss"
             break
+        if hit_trail and trail_price > sl_price:
+            exit_price, exit_ts, reason = trail_price, candle.timestamp, "trailing_stop"
+            if hit_tp:
+                ambiguous = True  # both barriers in one candle; adverse ordering again
+            break
         if hit_tp:
             exit_price, exit_ts, reason = tp_price, candle.timestamp, "take_profit"
             break
+        peak = max(peak, candle.high)
 
     gross, net = apply_costs(entry_price, exit_price, side_cost)
     return TradeResult(
@@ -493,6 +504,7 @@ def run_backtest(args: argparse.Namespace) -> None:
                 args.stop_loss,
                 args.time_stop_minutes,
                 args.side_cost,
+                args.trailing_stop,
             )
             trades.append(asdict(trade))
             snapshots.extend(snapshot_rows(mint, graduation_ts, pool, minute_path))
@@ -525,6 +537,7 @@ def run_backtest(args: argparse.Namespace) -> None:
             "entry_delay_seconds": args.entry_delay_seconds,
             "take_profit": args.take_profit,
             "stop_loss": args.stop_loss,
+            "trailing_stop": args.trailing_stop,
             "time_stop_minutes": args.time_stop_minutes,
             "cost_each_side": args.side_cost,
             "round_trip_cost_at_flat_price": 1 - (1 - args.side_cost) / (1 + args.side_cost),
@@ -559,6 +572,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--entry-delay-seconds", type=int, default=30)
     run.add_argument("--take-profit", type=float, default=0.75)
     run.add_argument("--stop-loss", type=float, default=0.30)
+    run.add_argument(
+        "--trailing-stop", type=float, default=0.0,
+        help="Exit when price falls this fraction from its post-entry peak (0 disables)",
+    )
     run.add_argument("--time-stop-minutes", type=int, default=30)
     run.add_argument("--side-cost", type=float, default=0.03, help="Fraction charged on entry and exit")
     run.set_defaults(func=run_backtest)
