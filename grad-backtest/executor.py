@@ -88,6 +88,7 @@ class Config:
         self.daily_loss_limit_usd = float(os.getenv("DAILY_LOSS_LIMIT_USD", "30"))
         self.take_profit = float(os.getenv("TAKE_PROFIT", "0.75"))
         self.stop_loss = float(os.getenv("STOP_LOSS", "0.30"))
+        self.trailing_stop = float(os.getenv("TRAILING_STOP", "0"))  # fraction off peak; 0 disables
         self.time_stop_minutes = float(os.getenv("TIME_STOP_MINUTES", "30"))
         self.entry_delay_seconds = float(os.getenv("ENTRY_DELAY_SECONDS", "30"))
         self.max_entry_age_seconds = float(os.getenv("MAX_ENTRY_AGE_SECONDS", "120"))
@@ -195,12 +196,21 @@ def position_size_usd(cfg: Config, equity_usd: float, open_positions: int, daily
     return round(size, 2)
 
 
-def decide_exit(entry_usd: float, current_usd: float, opened_ts: float, now: float, cfg: Config) -> str | None:
-    """TP/SL/time-stop against the executable exit value of the whole position."""
+def decide_exit(
+    entry_usd: float,
+    current_usd: float,
+    opened_ts: float,
+    now: float,
+    cfg: Config,
+    peak_usd: float | None = None,
+) -> str | None:
+    """TP/SL/trailing/time-stop against the executable exit value of the whole position."""
     if current_usd >= entry_usd * (1.0 + cfg.take_profit):
         return "take_profit"
     if current_usd <= entry_usd * (1.0 - cfg.stop_loss):
         return "stop_loss"
+    if cfg.trailing_stop > 0 and peak_usd and current_usd <= peak_usd * (1.0 - cfg.trailing_stop):
+        return "trailing_stop"
     if now - opened_ts >= cfg.time_stop_minutes * 60:
         return "time_stop"
     return None
@@ -415,6 +425,7 @@ class Executor:
                 "graduated_at": utc_iso(item["graduated_ts"]),
                 "buy_signature": buy_sig,
                 "entry_price_impact_pct": impact,
+                "peak_usd": size_usd,
             }
         )
         save_state(self.state)
@@ -463,8 +474,9 @@ class Executor:
             try:
                 quote = self.jup.quote(pos["mint"], WSOL, int(pos["tokens"]))
                 current_usd = int(quote["outAmount"]) / LAMPORTS * sol_price
+                pos["peak_usd"] = max(float(pos.get("peak_usd", pos["position_usd"])), current_usd)
                 reason = "panic" if panic else decide_exit(
-                    pos["position_usd"], current_usd, pos["opened_ts"], now_ts(), self.cfg
+                    pos["position_usd"], current_usd, pos["opened_ts"], now_ts(), self.cfg, pos["peak_usd"]
                 )
                 if reason:
                     self.close_position(pos, reason, sol_price)

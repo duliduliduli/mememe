@@ -54,3 +54,47 @@ class GuardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TrailingStopTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="grad-trail-test-")
+        patcher = mock.patch.dict(os.environ, {"DATA_DIR": self.tmp, "TRAILING_STOP": "0.20"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        import importlib
+        import executor
+        importlib.reload(executor)
+        self.executor = executor
+        self.cfg = executor.Config()
+
+    def test_trailing_stop_triggers_off_peak(self):
+        d = self.executor.decide_exit
+        # entry $10, ran to peak $16, now $12.5 = 21.9% off peak -> trailing exit
+        self.assertEqual(d(10.0, 12.5, 0, 60, self.cfg, peak_usd=16.0), "trailing_stop")
+        # $13.0 is only 18.75% off peak -> hold
+        self.assertIsNone(d(10.0, 13.0, 0, 60, self.cfg, peak_usd=16.0))
+        # TP still wins when reached
+        self.assertEqual(d(10.0, 17.6, 0, 60, self.cfg, peak_usd=17.6), "take_profit")
+
+    def test_disabled_by_default(self):
+        with mock.patch.dict(os.environ, {"TRAILING_STOP": "0"}):
+            cfg = self.executor.Config()
+            self.assertIsNone(self.executor.decide_exit(10.0, 5.1 + 2, 0, 60, cfg, peak_usd=100.0))
+
+    def test_backtest_trailing_stop(self):
+        from grad_backtest import Candle, simulate_trade
+        candles = [
+            Candle(100, 100, 150, 99, 150, 1),   # peak becomes 150
+            Candle(160, 150, 180, 150, 175, 1),  # peak becomes 180
+            Candle(220, 175, 176, 130, 135, 1),  # low 130 <= 180*0.8=144 -> trail exit
+        ]
+        result = simulate_trade("m", 0, "p", "pump", 100, 100, candles, 1.00, 0.30, 30, 0.03, trailing_stop=0.20)
+        self.assertEqual(result.exit_reason, "trailing_stop")
+        self.assertAlmostEqual(result.exit_price, 144.0)
+
+    def test_backtest_unchanged_when_disabled(self):
+        from grad_backtest import Candle, simulate_trade
+        candles = [Candle(100, 100, 180, 99, 170, 1)]
+        result = simulate_trade("m", 0, "p", "pump", 100, 100, candles, 0.75, 0.30, 30, 0.03)
+        self.assertEqual(result.exit_reason, "take_profit")

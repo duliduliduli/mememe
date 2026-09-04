@@ -177,6 +177,24 @@ Entry guards, applied before every buy:
 Every skipped opportunity is recorded to `skips.csv` with its reason, and each
 trade records its quoted entry price impact, so filters can be tuned from data.
 
+### Trailing stop (off by default — backtest it first)
+
+Many rugs bleed downward for minutes before the liquidity pull. A trailing stop
+("exit when price falls X% from its post-entry peak") sells that fade instead of
+riding it to the time stop. Both layers support it:
+
+```bash
+# Measure it against your collected sample before using it live:
+python grad_backtest.py run --output-dir data/trail25 --trailing-stop 0.25
+python grad_backtest.py run --output-dir data/trail35 --trailing-stop 0.35
+python position_sizing.py --input data/trail25/trade_results.csv --output data/trail25/sizing.json
+```
+
+Then, if the numbers beat the plain TP/SL/time-stop run, set `TRAILING_STOP`
+(e.g. `0.25`) on the executor. `0` (default) disables it. Tune it from the
+backtest sample, not from one chart — a single example proves the mechanism,
+not the parameter.
+
 Control it through the dashboard API (all require the `x-admin-token` header):
 
 ```bash
