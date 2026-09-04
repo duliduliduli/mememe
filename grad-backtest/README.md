@@ -217,6 +217,31 @@ Then, if the numbers beat the plain TP/SL/time-stop run, set `TRAILING_STOP`
 backtest sample, not from one chart — a single example proves the mechanism,
 not the parameter.
 
+### Scale-out / partial take-profit (off by default — backtest it first)
+
+A position that reaches +40% and then rugs is worth nothing under a single
++75% take-profit. A scale-out banks part of the winner at a first target and
+lets the rest ride to the full take-profit under the same rules:
+
+```bash
+python grad_backtest.py run --output-dir data/scale40 --scale-out-at 0.40 --scale-out-fraction 0.5
+python optimize.py            # the sweep now includes --scale-out-ats 0,0.4
+```
+
+On the executor, `SCALE_OUT_AT=0.40` and `SCALE_OUT_FRACTION=0.5` sell half at
++40%; the remainder keeps the same take-profit, stop-loss and trailing rules on
+its reduced cost basis, which leaves every threshold at the same token price.
+Each scale-out is recorded in `live_trades.csv` as its own `scale_out` row.
+The cost is a second sell leg per winner (extra fixed fees, which matter at
+$5 positions) and a smaller share riding to the full target when a winner
+keeps running. Whether that trade-off pays is exactly what the optimizer
+measures; the WTF-shaped reversal it protects against is common enough that
+it is worth measuring early.
+
+Every closed trade now also records `peak_gain_pct`, the highest value the
+position reached before exit, so a postmortem can see "peaked at +41%, exited
+at −88%" directly from the trade log.
+
 ### Moon bag (off by default — backtest it first)
 
 Some tokens dump past our exit and then rerun hours or days later. A moon bag

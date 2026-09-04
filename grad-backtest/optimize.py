@@ -78,6 +78,7 @@ def evaluate(dataset: list[dict[str, Any]], combo: dict[str, float], side_cost: 
                 item["minute_path"],
                 combo["take_profit"], combo["stop_loss"], int(combo["time_stop_minutes"]),
                 side_cost, combo["trailing_stop"], combo["moon_bag"],
+                scale_out_at=combo.get("scale_out_at", 0.0),
             )
             nets.append(result.net_return)
         except ValueError:
@@ -108,6 +109,7 @@ def main() -> None:
     parser.add_argument("--time-stops", default="15,30,60")
     parser.add_argument("--trailing-stops", default="0,0.2,0.3")
     parser.add_argument("--moon-bags", default="0,0.15")
+    parser.add_argument("--scale-out-ats", default="0,0.4", help="partial take-profit thresholds; 0 = off")
     parser.add_argument("--top", type=int, default=5)
     args = parser.parse_args()
 
@@ -124,11 +126,13 @@ def main() -> None:
         print("WARNING: train set under 50 tokens; treat every number below as provisional.")
 
     grid = [
-        {"take_profit": tp, "stop_loss": sl, "time_stop_minutes": ts, "trailing_stop": tr, "moon_bag": mb}
-        for tp, sl, ts, tr, mb in itertools.product(
+        {"take_profit": tp, "stop_loss": sl, "time_stop_minutes": ts, "trailing_stop": tr, "moon_bag": mb,
+         "scale_out_at": sc}
+        for tp, sl, ts, tr, mb, sc in itertools.product(
             parse_grid(args.take_profits), parse_grid(args.stop_losses), parse_grid(args.time_stops),
-            parse_grid(args.trailing_stops), parse_grid(args.moon_bags),
+            parse_grid(args.trailing_stops), parse_grid(args.moon_bags), parse_grid(args.scale_out_ats),
         )
+        if not (sc and sc >= tp)  # a scale-out at or above the take-profit is meaningless
     ]
     print(f"Sweeping {len(grid)} parameter combinations from cache (no API calls)...")
 
@@ -139,17 +143,18 @@ def main() -> None:
             results.append(row)
     results.sort(key=lambda r: (r["median"], r["mean"]), reverse=True)
 
-    baseline = {"take_profit": 0.75, "stop_loss": 0.30, "time_stop_minutes": 30, "trailing_stop": 0.0, "moon_bag": 0.0}
+    baseline = {"take_profit": 0.75, "stop_loss": 0.30, "time_stop_minutes": 30, "trailing_stop": 0.0,
+                "moon_bag": 0.0, "scale_out_at": 0.0}
     baseline_val = evaluate(val, baseline, args.side_cost)
 
-    print(f"\n{'tp':>5} {'sl':>5} {'time':>5} {'trail':>6} {'moon':>5} | {'train_med':>9} {'train_win':>9} | {'val_med':>8} {'val_win':>7}")
+    print(f"\n{'tp':>5} {'sl':>5} {'time':>5} {'trail':>6} {'moon':>5} {'scale':>6} | {'train_med':>9} {'train_win':>9} | {'val_med':>8} {'val_win':>7}")
     top_rows = []
     for row in results[: args.top]:
         v = evaluate(val, {k: row[k] for k in baseline}, args.side_cost)
         top_rows.append({"train": row, "validation": v})
         print(
             f"{row['take_profit']:>5.2f} {row['stop_loss']:>5.2f} {row['time_stop_minutes']:>5.0f} "
-            f"{row['trailing_stop']:>6.2f} {row['moon_bag']:>5.2f} | {row['median']:>9.2%} {row['win_rate']:>9.1%} | "
+            f"{row['trailing_stop']:>6.2f} {row['moon_bag']:>5.2f} {row['scale_out_at']:>6.2f} | {row['median']:>9.2%} {row['win_rate']:>9.1%} | "
             f"{(v['median'] if v['median'] is not None else float('nan')):>8.2%} "
             f"{(v['win_rate'] if v['win_rate'] is not None else float('nan')):>7.1%}"
         )
