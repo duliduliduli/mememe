@@ -33,6 +33,33 @@ class ClusterMathTests(unittest.TestCase):
         self.assertAlmostEqual(ba.wallets_supply_pct(members, amounts, 1.0), 20.0)
         self.assertAlmostEqual(ba.top_wallets_supply_pct(amounts, 1.0, 3), 20.0)
 
+    def test_two_hop_ancestry_finds_split_funders(self):
+        ancestry = {f"w{i}": [f"relay{i}", "treasury"] for i in range(5)}
+        clusters = ba.ancestry_clusters(ancestry, set())
+        pct, members = ba.cluster_supply_pct(clusters, {f"w{i}": 0.09 for i in range(5)}, 1.0)
+        self.assertAlmostEqual(pct, 45.0)
+        self.assertEqual(set(members), set(ancestry))
+
+    def test_distributor_transfer_cluster_counts_current_supply(self):
+        holders = {f"w{i}" for i in range(6)} | {"unrelated"}
+        edges = [("distributor", f"w{i}") for i in range(6)]
+        clusters = ba.transfer_clusters(edges, holders)
+        amounts = {f"w{i}": 0.07 for i in range(6)} | {"unrelated": 0.2}
+        pct, members = ba.cluster_supply_pct(clusters, amounts, 1.0)
+        self.assertAlmostEqual(pct, 42.0)
+        self.assertEqual(set(members), {f"w{i}" for i in range(6)})
+
+    def test_coordinated_rolling_window_spans_nearby_slots(self):
+        buys = [
+            {"wallet": "w1", "slot": 10, "amount": 0.08},
+            {"wallet": "w2", "slot": 14, "amount": 0.09},
+            {"wallet": "w3", "slot": 20, "amount": 0.07},
+            {"wallet": "late", "slot": 40, "amount": 0.50},
+        ]
+        pct, slot, count = ba.coordinated_buy_pct(buys, 1.0, window_slots=12, min_wallets=3)
+        self.assertAlmostEqual(pct, 24.0)
+        self.assertEqual((slot, count), (10, 3))
+
 
 class GuardReasonShapeTests(unittest.TestCase):
     def test_runner_style_split_clears_single_holder_and_trips_cluster(self):
