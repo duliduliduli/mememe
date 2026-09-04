@@ -9,12 +9,16 @@ COPY grad-backtest/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY grad-backtest/grad_backtest.py grad-backtest/position_sizing.py grad-backtest/server.py \
-     grad-backtest/executor.py grad-backtest/optimize.py grad-backtest/test_grad_backtest.py \
-     grad-backtest/test_position_sizing.py grad-backtest/test_server.py \
+     grad-backtest/executor.py grad-backtest/bundle_analysis.py grad-backtest/optimize.py \
+     grad-backtest/test_grad_backtest.py grad-backtest/test_position_sizing.py grad-backtest/test_server.py \
      grad-backtest/test_executor.py grad-backtest/test_executor_guards.py \
      grad-backtest/test_optimize.py grad-backtest/test_scale_out.py grad-backtest/test_slippage_retry.py grad-backtest/test_market_cap.py grad-backtest/test_reconcile.py grad-backtest/test_bundle_guards.py grad-backtest/test_rate_limits.py grad-backtest/test_moon_bag_target.py ./
 COPY grad-backtest/static static
 COPY grad-backtest/data/graduations.example.csv data/
+
+# Catch missing runtime modules during the image build instead of after
+# Railway has already started the web server and autostarted the executor.
+RUN python -c "import bundle_analysis, executor"
 
 ENV PYTHONUNBUFFERED=1
 # All scripts read/write here; mount a Railway volume at /data to persist
