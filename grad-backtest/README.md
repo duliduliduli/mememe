@@ -217,8 +217,36 @@ Entry guards, applied before every buy:
   The backtest equivalent is `--max-entry-runup` (skip tokens whose entry price
   is more than that fraction above the graduation price); `optimize.py` accepts
   the same flag as a dataset filter.
+- **Market cap floor** — entries with an implied market cap below
+  `MIN_ENTRY_MARKET_CAP_USD` (default $25,000) are skipped. Graduation is
+  about $69k, so a token far below that a minute later was already dumped into
+  its own pool. The case that motivated it: SOLL's creator sold 78% of supply
+  24 seconds after migration and the bot then bought at a $450 cap; overnight,
+  entries under $30k went 1 for 7. Uses the same supply lookup as the ceiling.
+- **Curve age** — a token that graduated less than `MIN_CURVE_AGE_SECONDS`
+  (default 120) after it was created is skipped. Filling a whole bonding curve
+  in seconds takes one buyer, which is the definition of a bundle (SOLL:
+  created to graduated in 29 seconds, six buyers). Creation time comes from the
+  mint's signature history (`getSignaturesForAddress`, usually one call; the
+  scan stops as soon as it sees a transaction older than the threshold, and a
+  token too busy to conclude within three pages is treated as unknown, never
+  rejected).
+- **Holder concentration** — if the largest plain-wallet holder owns more than
+  `MAX_TOP_HOLDER_PCT` (default 20%) of supply, the entry is skipped and the
+  wallet is named in the skip reason. Program-owned accounts (the AMM pool,
+  bonding curve, Mayhem vault) are not counted because they cannot dump on us;
+  our own wallet is excluded. Three RPC calls (`getTokenLargestAccounts`, then
+  the token accounts' owners, then whether each owner is a wallet or a
+  program). SOLL's creator held 59% at graduation.
 - **Staleness** — an entry more than `MAX_ENTRY_LATENESS_SECONDS` (60s) past
   its target time is skipped; a late entry is not the trade the backtest models.
+
+Every one of the metadata guards fails open: if its lookup errors or times
+out, a `WARN` is logged and that check is skipped for the entry, so an RPC
+hiccup can neither block trading nor be mistaken for a clean token. Each
+position and trade row records `entry_market_cap_usd`,
+`entry_curve_age_seconds`, and `entry_top_holder_pct` so the guards can be
+tuned from real outcomes later. Set any threshold to `0` to disable it.
 
 Every skipped opportunity is recorded to `skips.csv` with its reason, and each
 trade records its quoted entry price impact, so filters can be tuned from data.
