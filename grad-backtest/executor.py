@@ -208,7 +208,10 @@ class Config:
         self.max_top10_wallet_pct = percent_env("MAX_TOP10_WALLET_PCT", 50)
         self.max_early_buy_pct = percent_env("MAX_EARLY_BUY_PCT", 30)
         self.min_funder_coverage_pct = percent_env("MIN_FUNDER_COVERAGE_PCT", 30)
-        self.min_funder_lookup_pct = percent_env("MIN_FUNDER_LOOKUP_PCT", 80)
+        # Live free-tier Helius evidence showed 20 concurrent address-history calls complete
+        # only 20-50% before throttling. Keep lookup health visible, but do not demand a higher
+        # completion percentage than the evidence threshold itself.
+        self.min_funder_lookup_pct = percent_env("MIN_FUNDER_LOOKUP_PCT", 30)
         self.high_confidence_funder_coverage_pct = percent_env("HIGH_CONFIDENCE_FUNDER_COVERAGE_PCT", 60)
         self.partial_coverage_limit_multiplier = max(
             0.1, min(1.0, float(os.getenv("PARTIAL_COVERAGE_LIMIT_MULTIPLIER", "0.67")))
@@ -218,6 +221,7 @@ class Config:
         self.bundle_log_only = os.getenv("BUNDLE_LOG_ONLY", "0") == "1"
         self.bundle_fail_closed = os.getenv("BUNDLE_FAIL_CLOSED", "1") == "1"
         self.bundle_lookup_timeout_ms = max(250, int(os.getenv("BUNDLE_LOOKUP_TIMEOUT_MS", "1500")))
+        self.bundle_lookup_workers = min(12, max(1, int(os.getenv("BUNDLE_LOOKUP_WORKERS", "6"))))
         self.bundle_max_wallets = min(100, max(2, int(os.getenv("BUNDLE_MAX_WALLETS", "50"))))
         # Keep the broad sample for transfer/coordination/concentration checks, but trace
         # funding only for the largest wallets. Adding small holders must not mechanically
@@ -692,7 +696,7 @@ class Rpc:
         if not wallets:
             return results, completed
         timeout = self.cfg.bundle_lookup_timeout_ms / 1000
-        workers = min(12, len(wallets))
+        workers = min(self.cfg.bundle_lookup_workers, len(wallets))
         total_timeout = timeout * ((len(wallets) + workers - 1) // workers) + 0.5
         pool = ThreadPoolExecutor(max_workers=workers)
         futures = {pool.submit(self.cached_origin_funder, wallet, before_ts): wallet for wallet in wallets}
@@ -1004,15 +1008,23 @@ class Executor:
 
     # ---- detection -------------------------------------------------------
     def poll_graduations(self) -> None:
+        if now_ts() < float(getattr(self, "_helius_poll_cooldown_until", 0.0)):
+            return
         url = f"https://api-mainnet.helius-rpc.com/v0/addresses/{self.cfg.migration_address}/transactions"
         try:
-            batch = requests.get(
+            response = requests.get(
                 url,
                 params={"api-key": self.cfg.helius_api_key, "limit": 10},
                 timeout=self.cfg.helius_poll_timeout_seconds,
-            ).json()
+            )
+            response.raise_for_status()
+            batch = response.json()
         except Exception as exc:
-            log(f"WARN helius poll failed: {exc}")
+            if is_rate_limited(exc):
+                self._helius_poll_cooldown_until = now_ts() + 30
+                log("WARN helius poll rate limited; pausing detection polls for 30s")
+            else:
+                log(f"WARN helius poll failed: {exc}")
             return
         if not isinstance(batch, list):
             log(f"WARN helius poll unexpected response: {str(batch)[:200]}")
@@ -1028,13 +1040,20 @@ class Executor:
                 if mints:
                     self.skip(",".join(mints), f"ambiguous graduation tx {signature[:16]}… ({len(mints)} candidate mints)")
                 continue
+            mint = mints[0]
+            # One mint can appear in more than one migration-address transaction. Do not queue
+            # duplicate analysis/buys or spend twice the Helius budget on the same launch.
+            already_queued = any(p.get("mint") == mint for p in self.pending)
+            already_owned = any(p.get("mint") == mint for p in self.state.get("positions", []))
+            if already_queued or already_owned:
+                continue
             age = now_ts() - int(timestamp)
             if age > self.cfg.max_entry_age_seconds:
-                self.skip(mints[0], f"graduation too old at detection ({age:.0f}s)")
+                self.skip(mint, f"graduation too old at detection ({age:.0f}s)")
                 continue
             enter_at = int(timestamp) + self.cfg.entry_delay_seconds
-            self.pending.append({"mint": mints[0], "graduated_ts": int(timestamp), "enter_at": enter_at})
-            log(f"DETECTED graduation {mints[0]} (age {age:.0f}s, entering at +{self.cfg.entry_delay_seconds:.0f}s)")
+            self.pending.append({"mint": mint, "graduated_ts": int(timestamp), "enter_at": enter_at})
+            log(f"DETECTED graduation {mint} (age {age:.0f}s, entering at +{self.cfg.entry_delay_seconds:.0f}s)")
 
     def _prune_stale_pending(self) -> None:
         """Drop entry work that became unsafe while the process was stopped."""
@@ -1722,6 +1741,7 @@ class Executor:
             f"funder_lookup>={self.cfg.min_funder_lookup_pct:.0f}% "
             f"high_confidence>={self.cfg.high_confidence_funder_coverage_pct:.0f}% "
             f"holders={self.cfg.bundle_max_wallets} funders={self.cfg.bundle_funder_max_wallets} "
+            f"funder_workers={self.cfg.bundle_lookup_workers} "
             f"bundle_mode={'log' if self.cfg.bundle_log_only else 'block'} "
             f"adopt>=${self.cfg.min_adopt_usd} "
             f"stuck_after={self.cfg.stuck_after_minutes:.0f}m "

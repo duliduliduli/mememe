@@ -231,10 +231,11 @@ Bundle graph defaults: inspect up to 50 holders and trace funding for the larges
 (`30%`), two-hop ancestry (`20%`), unpaid token-transfer (`12%`), coordinated
 12-slot acquisition (`20%`), repeat-launch cohort (`12%`), creator-linked (`15%`),
 top-ten (`50%`), and first-three-slot (`30%`) concentration. Funding lookup completion
-below `80%` or identifiable-funder coverage below `30%` fails closed. Coverage from
+below `30%` or identifiable-funder coverage below `30%` fails closed. Coverage from
 `30%` through `60%` is classified as partial and multiplies every limit by `0.67`;
 higher coverage uses the normal limits. Configure those controls with
-`BUNDLE_MAX_WALLETS`, `BUNDLE_FUNDER_MAX_WALLETS`, `MIN_FUNDER_LOOKUP_PCT`, and
+`BUNDLE_MAX_WALLETS`, `BUNDLE_FUNDER_MAX_WALLETS`, `BUNDLE_LOOKUP_WORKERS`,
+`MIN_FUNDER_LOOKUP_PCT`, and
 `MIN_FUNDER_COVERAGE_PCT`. Wallet funders and launch appearances are cached in
 `DATA_DIR/wallet_graph_cache.json`.
 

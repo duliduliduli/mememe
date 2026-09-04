@@ -117,6 +117,37 @@ class SolPriceCacheTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
 
 
+class HeliusPollProtectionTests(unittest.TestCase):
+    def test_rate_limit_starts_cooldown_instead_of_hammering_every_cycle(self):
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        ex = executor.Executor(executor.Config())
+        response = mock.Mock()
+        response.raise_for_status.side_effect = http_error(429)
+        get = mock.Mock(return_value=response)
+        with mock.patch.object(executor.requests, "get", get), mock.patch.object(
+            executor, "now_ts", return_value=1000.0
+        ):
+            ex.poll_graduations()
+            ex.poll_graduations()
+        self.assertEqual(get.call_count, 1)
+        self.assertEqual(ex._helius_poll_cooldown_until, 1030.0)
+
+    def test_same_mint_is_not_queued_twice(self):
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        ex = executor.Executor(executor.Config())
+        ex.pending.append({"mint": "m", "graduated_ts": 990, "enter_at": 1020})
+        response = mock.Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = [{"signature": "new-sig", "timestamp": 998}]
+        with mock.patch.object(executor.requests, "get", return_value=response), mock.patch.object(
+            executor, "candidate_mints", return_value=["m"]
+        ), mock.patch.object(executor, "now_ts", return_value=1000.0):
+            ex.poll_graduations()
+        self.assertEqual([item["mint"] for item in ex.pending], ["m"])
+
+
 class AdoptedSlotTests(unittest.TestCase):
     def test_adopted_positions_do_not_take_entry_slots(self):
         executor, p = fresh(MAX_CONCURRENT_POSITIONS="3")
