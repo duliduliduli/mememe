@@ -195,7 +195,7 @@ prints the important ones.
 | `ACCOUNT_FRACTION` | `0.10` | Fraction of equity per position. Equity in live mode is spendable SOL (balance minus `MIN_SOL_RESERVE`) times the SOL price. |
 | `MAX_POSITION_USD` | `20` | Hard cap on position size. |
 | `MIN_POSITION_USD` | `5` | If the computed size is below this, no entry. Lower it if you want small fractional sizing on a small account. |
-| `MAX_CONCURRENT_POSITIONS` | `2` | Maximum bot-opened positions at once. Adopted holdings do not count. |
+| `MAX_CONCURRENT_POSITIONS` | `5` | Maximum bot-opened positions at once. Adopted holdings do not count. |
 | `DAILY_LOSS_LIMIT_USD` | `30` | Once realized P&L for the UTC day is at or below minus this, no new entries until the next UTC day. Measured from quoted closes and reset by a restart. Use a huge number to effectively disable; `0` would block after any loss. |
 | `MIN_SOL_RESERVE` | `0.05` | SOL kept back for fees when computing live equity. |
 
