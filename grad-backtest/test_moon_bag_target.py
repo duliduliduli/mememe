@@ -116,7 +116,7 @@ class TargetTests(unittest.TestCase):
 
     def test_check_interval_respected(self):
         calls = []
-        self.ex.jup.quote = lambda *a, **kw: (calls.append(1), {"outAmount": "1000"})[1]
+        self.ex.jup.quote = lambda *a, **kw: (calls.append(1), {"outAmount": str(int(1.0 / SOL * 1e9))})[1]  # alive, below target
         with mock.patch.object(self.executor, "now_ts", return_value=1000.0):
             self.ex.manage_moon_bags(SOL)
             self.ex.manage_moon_bags(SOL)
@@ -140,6 +140,54 @@ class TargetTests(unittest.TestCase):
         self.ex.liquidate_bags(SOL, "moon_bags", "panic_moon_bag")
         self.assertEqual(self.ex.state["moon_bags"], [])
         self.assertAlmostEqual(self.ex.state["paper_balance_usd"], 100.5)
+
+
+class CleanupTests(unittest.TestCase):
+    def test_tiny_bag_not_kept(self):
+        executor, p = fresh(MOON_BAG="0.05")
+        self.addCleanup(p.stop)
+        ex = executor.Executor(executor.Config())
+        ex.state["positions"] = [position(last_value=7.0)]  # 5% of $7 = $0.35 < $0.50
+        ex.jup.quote = sol_quote(7.0)
+        ex.close_position(ex.state["positions"][0], "take_profit", SOL)
+        self.assertEqual(ex.state.get("moon_bags", []), [])
+
+    def test_bag_kept_when_above_minimum(self):
+        executor, p = fresh(MOON_BAG="0.05", MIN_MOON_BAG_USD="0.25")
+        self.addCleanup(p.stop)
+        ex = executor.Executor(executor.Config())
+        ex.state["positions"] = [position(last_value=7.0)]
+        ex.jup.quote = sol_quote(6.65)
+        ex.close_position(ex.state["positions"][0], "take_profit", SOL)
+        self.assertEqual(len(ex.state["moon_bags"]), 1)
+
+    def test_dead_bag_burned_and_recorded(self):
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        ex = executor.Executor(executor.Config())
+        ex.state["moon_bags"] = [bag(kept=1.75)]
+        ex.jup.quote = sol_quote(0.05)  # under 5% of $1.75
+        ex.manage_moon_bags(SOL)
+        self.assertEqual(ex.state["moon_bags"], [])
+        trades = open(os.path.join(os.environ["DATA_DIR"], "live_trades.csv")).read()
+        self.assertIn("moon_bag_dead", trades)
+        self.assertAlmostEqual(ex.state["daily"]["realized_pnl_usd"], -1.0)
+
+    def test_dead_check_disabled_by_zero(self):
+        executor, p = fresh(MOON_BAG_DEAD_PCT="0")
+        self.addCleanup(p.stop)
+        ex = executor.Executor(executor.Config())
+        ex.state["moon_bags"] = [bag(kept=1.75)]
+        ex.jup.quote = sol_quote(0.01)
+        ex.manage_moon_bags(SOL)
+        self.assertEqual(len(ex.state["moon_bags"]), 1)
+
+    def test_error_text_redacts_api_key(self):
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        text = executor.describe_error(RuntimeError("429 for url: https://rpc.example/?api-key=SECRET123&x=1"))
+        self.assertNotIn("SECRET123", text)
+        self.assertIn("api-key=…", text)
 
 
 if __name__ == "__main__":

@@ -28,6 +28,7 @@ import base64
 import csv
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -124,6 +125,11 @@ class Config:
         self.moon_bag_winners_only = os.getenv("MOON_BAG_WINNERS_ONLY", "1") == "1"
         self.moon_bag_target_x = max(0.0, float(os.getenv("MOON_BAG_TARGET_X", "100")))
         self.moon_bag_check_seconds = float(os.getenv("MOON_BAG_CHECK_SECONDS", "60"))
+        # A bag worth less than MIN_MOON_BAG_USD is not worth its own rent (0.002 SOL) and is
+        # sold with the rest. A bag that has fallen to MOON_BAG_DEAD_PCT of the value it was kept
+        # at is burned and its account closed: the rent is worth more than the tokens.
+        self.min_moon_bag_usd = float(os.getenv("MIN_MOON_BAG_USD", "0.5"))
+        self.moon_bag_dead_pct = float(os.getenv("MOON_BAG_DEAD_PCT", "5"))
         # Partial take-profit: at +SCALE_OUT_AT sell SCALE_OUT_FRACTION of the position and let the
         # remainder ride to the full take-profit under the same rules. 0 disables.
         self.scale_out_at = float(os.getenv("SCALE_OUT_AT", "0"))
@@ -245,7 +251,7 @@ def quote_price_impact_pct(quote: dict[str, Any]) -> float | None:
 def describe_error(exc: BaseException) -> str:
     """Compact, human-readable form of swap/RPC failures for the log. The raw RPC error
     carries the whole simulation log (thousands of characters); the code is what matters."""
-    text = str(exc)
+    text = re.sub(r"api-key=[^&\s]+", "api-key=…", str(exc))
     if "0x1771" in text or "'Custom': 6001" in text or '"Custom": 6001' in text or '"Custom":6001' in text:
         return "Jupiter 6001: slippage tolerance exceeded (price moved past tolerance between quote and execution)"
     if "0x1770" in text or "'Custom': 6000" in text or '"Custom": 6000' in text:
@@ -754,6 +760,8 @@ class Executor:
             last_value = pos.get("last_value_usd")
             if last_value is None or float(last_value) <= float(pos["position_usd"]):
                 mb = 0.0
+        if mb > 0 and float(pos.get("last_value_usd") or 0.0) * mb < self.cfg.min_moon_bag_usd:
+            mb = 0.0  # too small to be worth the rent it would lock
         if self.cfg.mode == "live":
             amount = self.rpc.token_balance(self.wallet.pubkey, mint)
             if amount <= 0:
@@ -1057,7 +1065,37 @@ class Executor:
                     log(f"MOONBAG TARGET {bag['mint']}: worth ${value:,.2f} = {value / kept:.0f}x the ${kept:.2f} kept; sold for ${proceeds:,.2f}")
                 except Exception as exc:
                     log(f"WARN moon bag {bag['mint']} hit {value / kept:.0f}x but sell failed: {describe_error(exc)}")
+            elif kept > 0 and self.cfg.moon_bag_dead_pct > 0 and value < kept * self.cfg.moon_bag_dead_pct / 100:
+                self.burn_dead_bag(bag, value)
         save_state(self.state)
+
+    def burn_dead_bag(self, bag: dict[str, Any], value: float) -> None:
+        """A bag worth a few cents is not worth a swap; burn it and take the rent back."""
+        mint = bag["mint"]
+        try:
+            if self.cfg.mode == "live":
+                for acct in self.rpc.token_accounts(self.wallet.pubkey, mint=mint):
+                    self.close_token_account(acct["pubkey"], acct["program"], mint, burn_amount=acct["amount"])
+            self.state["moon_bags"].remove(bag)
+            basis = float(bag.get("cost_usd") or 0.0)
+            self.state["daily"]["realized_pnl_usd"] = float(self.state["daily"]["realized_pnl_usd"]) - basis
+            record_trade(
+                {
+                    "opened_at": bag.get("created_at"),
+                    "closed_at": utc_iso(),
+                    "mint": mint,
+                    "mode": self.cfg.mode,
+                    "position_usd": round(basis, 2),
+                    "exit_usd": 0.0,
+                    "net_return": -1.0 if basis else 0.0,
+                    "exit_reason": "moon_bag_dead",
+                    "sell_signature": "",
+                    "peak_gain_pct": round((float(bag["peak_usd"]) / basis - 1.0) * 100, 1) if basis and bag.get("peak_usd") else None,
+                }
+            )
+            log(f"MOONBAG DEAD {mint}: worth ${value:.2f} vs ${bag.get('kept_usd', 0):.2f} kept; burned, rent reclaimed (~{TOKEN_ACCOUNT_RENT_SOL:.4f} SOL)")
+        except Exception as exc:
+            log(f"WARN {mint}: could not burn dead moon bag: {describe_error(exc)}")
 
     def liquidate_bags(self, sol_price: float, key: str, reason: str) -> None:
         """Market-sell everything in state[key] (moon bags or stuck positions) during panic."""
@@ -1092,7 +1130,8 @@ class Executor:
             f"time_stop={self.cfg.time_stop_minutes:.0f}m trail={self.cfg.trailing_stop:.0%} "
             f"scale_out={self.cfg.scale_out_at:.0%}x{self.cfg.scale_out_fraction:.0%} moon_bag={self.cfg.moon_bag:.0%}"
             f"{'(winners only)' if self.cfg.moon_bag_winners_only else ''}"
-            f"{f'@{self.cfg.moon_bag_target_x:.0f}x' if self.cfg.moon_bag_target_x > 0 else '@hold'} "
+            f"{f'@{self.cfg.moon_bag_target_x:.0f}x' if self.cfg.moon_bag_target_x > 0 else '@hold'}"
+            f"(min${self.cfg.min_moon_bag_usd:.2f},dead<{self.cfg.moon_bag_dead_pct:.0f}%) "
             f"slippage={self.cfg.slippage_bps}/{self.cfg.sell_slippage_bps}bps(buy/sell) "
             f"mcap=${self.cfg.min_entry_market_cap_usd:,.0f}-${self.cfg.max_entry_market_cap_usd:,.0f} "
             f"curve_age>={self.cfg.min_curve_age_seconds:.0f}s top_holder<={self.cfg.max_top_holder_pct:.0f}% "
