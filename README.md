@@ -8,6 +8,9 @@ OHLCV from GeckoTerminal, and simulates a +75% TP / -30% SL / 30-minute time-sto
 strategy with configurable friction costs.
 
 - Code and full usage docs: [`grad-backtest/`](grad-backtest/README.md)
+- Public web dashboard (`server.py` + `static/`) showing equity curve, win rate,
+  return distribution, recent trades, and a live activity log — deployable to
+  Railway with a public URL.
 - Run it in the cloud: the **"Run backtest in the cloud"** GitHub Actions workflow
   (results download as artifacts), or deploy `grad-backtest/` to Railway using the
   bundled `Dockerfile` + `railway.json`. Both need `HELIUS_API_KEY` and

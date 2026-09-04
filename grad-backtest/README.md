@@ -145,6 +145,29 @@ contains no live executor: never commit or paste wallet private keys anywhere;
 if you later automate execution, use a dedicated burner wallet holding only what
 you can lose, with the key supplied as a runtime environment variable.
 
+## Dashboard
+
+`server.py` serves a public, read-only web dashboard over the result files:
+simulated equity curve, win rate, net-return distribution, recent trades,
+skipped tokens, and a live activity log of the running job. Run it locally:
+
+```bash
+python server.py            # http://localhost:8000
+```
+
+Environment knobs:
+
+- `DATA_DIR` — where results live (default `data`)
+- `START_BALANCE`, `FIXED_FEE_PER_SIDE`, `ACCOUNT_FRACTION` — parameters of the
+  simulated equity curve shown on the dashboard; the fraction is overridden
+  automatically by the recommendation in `data/sizing_summary.json` when present
+- `ADMIN_TOKEN` — when set, `POST /api/run` (header `x-admin-token`) can launch
+  `collect`, `run`, or `sizing` jobs in the background; without it, job
+  launching is disabled and the dashboard is purely read-only
+
+Everyone who can reach the URL can see your numbers — the dashboard exposes no
+credentials, but treat the performance data itself as public once deployed.
+
 ## Running in the cloud
 
 ### GitHub Actions (no infrastructure needed)
@@ -164,23 +187,35 @@ runs via the Actions cache, so you can `collect` once and then do several `run`
 sensitivity passes. GitHub-hosted jobs are capped at 6 hours; at the keyless
 GeckoTerminal rate a full 500-token run fits, but use `--limit` first to validate.
 
-### Railway
+### Railway (public dashboard + job runner)
 
-The folder includes a `Dockerfile` and `railway.json` (Dockerfile build, no restart
-on exit — this is a batch job, not a server).
+The folder includes a `Dockerfile` and `railway.json`. By default the container
+serves the dashboard; it can also launch backtest jobs itself, so one Railway
+service does everything.
 
 1. Create a new Railway project → **Deploy from GitHub repo** and pick this repo.
 2. In the service settings, set **Root Directory** to `grad-backtest`.
 3. Add environment variables:
-   - `HELIUS_API_KEY`
-   - `MIGRATION_ADDRESS`
-   - `BACKTEST_COMMAND` — the subcommand and flags to execute, e.g.
-     `run --limit 5` or `collect --count 500`. Defaults to `run`.
-4. (Recommended) Attach a **Volume** mounted at `/app/data` so collected CSVs,
-   the OHLCV cache, and results survive between deploys.
-5. Deploy. Each deploy executes the command once and exits; check the deploy logs
-   for the printed summary, and read result files from the volume (e.g. via
-   `railway run` / `railway ssh`, or by setting `BACKTEST_COMMAND` to a follow-up run).
+   - `HELIUS_API_KEY` and `MIGRATION_ADDRESS` (needed for `collect` jobs)
+   - `ADMIN_TOKEN` — a long random string; required to launch jobs via the API
+   - optionally `START_BALANCE`, `FIXED_FEE_PER_SIDE`, `GECKO_REQUESTS_PER_MINUTE`
+4. Attach a **Volume** mounted at `/app/data` so collected CSVs, the OHLCV
+   cache, and results survive restarts and redeploys.
+5. Under **Settings → Networking**, click **Generate Domain** — that's your
+   public dashboard URL.
+6. Kick off jobs from anywhere:
+
+```bash
+curl -X POST https://YOUR-APP.up.railway.app/api/run \
+  -H "x-admin-token: $ADMIN_TOKEN" -H "content-type: application/json" \
+  -d '{"stage": "collect", "extra_args": "--count 500"}'
+curl -X POST ... -d '{"stage": "run", "extra_args": "--limit 5"}'
+curl -X POST ... -d '{"stage": "sizing"}'
+```
+
+The dashboard refreshes itself every 15 seconds and shows job progress live.
+Batch mode still exists: set `BACKTEST_COMMAND` (e.g. `run --limit 5`) and the
+container runs that once and exits instead of serving the dashboard.
 
 The same image works on any container host (Fly.io, Cloud Run jobs, a plain VPS):
 
