@@ -206,6 +206,17 @@ Entry guards, applied before every buy:
 - **Price impact** — entries with quoted impact above `MAX_PRICE_IMPACT_PCT`
   (default 5%) are skipped: the pool is too thin for our size and the real
   round-trip cost would eat the trade.
+- **Market cap ceiling** — entries with an implied market cap above
+  `MAX_ENTRY_MARKET_CAP_USD` (default $300,000) are skipped. Pump.fun tokens
+  graduate near $69k and genuine ones sit around $30k–200k at entry; a token at
+  $900k–$150M thirty seconds after migration was pumped by a bundled buy before
+  we arrived, and that buyer dumps into whoever follows. The cap is computed
+  from the actual buy quote (USD in ÷ tokens out × circulating supply, one
+  `getTokenSupply` RPC call), so it reflects the price we would really pay. If
+  the supply lookup fails the entry proceeds rather than blocking on metadata.
+  The backtest equivalent is `--max-entry-runup` (skip tokens whose entry price
+  is more than that fraction above the graduation price); `optimize.py` accepts
+  the same flag as a dataset filter.
 - **Staleness** — an entry more than `MAX_ENTRY_LATENESS_SECONDS` (60s) past
   its target time is skipped; a late entry is not the trade the backtest models.
 

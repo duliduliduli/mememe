@@ -521,6 +521,16 @@ def run_backtest(args: argparse.Namespace) -> None:
 
             entry_target = graduation_ts + args.entry_delay_seconds
             entry_price, entry_ts = price_at_or_after(entry_candles, entry_target, tolerance=90)
+            if args.max_entry_runup > 0:
+                # Live equivalent of the executor's market-cap ceiling: if the token already ran
+                # far past its graduation price before our entry, we are buying someone else's pump.
+                graduation_price, _ = price_at_or_after(minute_path, graduation_ts, tolerance=180)
+                runup = entry_price / graduation_price - 1.0 if graduation_price > 0 else 0.0
+                if runup > args.max_entry_runup:
+                    raise ValueError(
+                        f"entry run-up {runup:.0%} above graduation price exceeds "
+                        f"{args.max_entry_runup:.0%} limit"
+                    )
             trade = simulate_trade(
                 mint,
                 graduation_ts,
@@ -573,6 +583,7 @@ def run_backtest(args: argparse.Namespace) -> None:
             "moon_bag": args.moon_bag,
             "scale_out_at": args.scale_out_at,
             "scale_out_fraction": args.scale_out_fraction,
+            "max_entry_runup": args.max_entry_runup,
             "time_stop_minutes": args.time_stop_minutes,
             "cost_each_side": args.side_cost,
             "round_trip_cost_at_flat_price": 1 - (1 - args.side_cost) / (1 + args.side_cost),
@@ -620,6 +631,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Partial take-profit: sell --scale-out-fraction of the position at this gain (0 disables)",
     )
     run.add_argument("--scale-out-fraction", type=float, default=0.5, help="Fraction sold at the scale-out target")
+    run.add_argument(
+        "--max-entry-runup", type=float, default=0.0,
+        help="Skip tokens whose entry price is more than this fraction above the graduation price (0 disables)",
+    )
     run.add_argument("--time-stop-minutes", type=int, default=30)
     run.add_argument("--side-cost", type=float, default=0.03, help="Fraction charged on entry and exit")
     run.set_defaults(func=run_backtest)

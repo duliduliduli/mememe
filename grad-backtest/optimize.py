@@ -38,7 +38,9 @@ def parse_grid(text: str) -> list[float]:
     return [float(x) for x in text.split(",") if x.strip() != ""]
 
 
-def load_dataset(input_csv: Path, cache_dir: Path, entry_delay: int) -> list[dict[str, Any]]:
+def load_dataset(
+    input_csv: Path, cache_dir: Path, entry_delay: int, max_entry_runup: float = 0.0
+) -> list[dict[str, Any]]:
     frame = pd.read_csv(input_csv)
     if "extraction_status" in frame:
         frame = frame[frame["extraction_status"].fillna("confirmed") == "confirmed"]
@@ -55,6 +57,10 @@ def load_dataset(input_csv: Path, cache_dir: Path, entry_delay: int) -> list[dic
             minute_path = [Candle(**item) for item in cached["minute_path"]]
             entry_candles = [Candle(**item) for item in cached["entry_candles"]]
             entry_price, entry_ts = price_at_or_after(entry_candles, graduation_ts + entry_delay, tolerance=90)
+            if max_entry_runup > 0:
+                graduation_price, _ = price_at_or_after(minute_path, graduation_ts, tolerance=180)
+                if graduation_price > 0 and entry_price / graduation_price - 1.0 > max_entry_runup:
+                    continue  # already pumped past graduation before our entry
         except Exception:
             continue
         dataset.append(
@@ -110,10 +116,17 @@ def main() -> None:
     parser.add_argument("--trailing-stops", default="0,0.2,0.3")
     parser.add_argument("--moon-bags", default="0,0.15")
     parser.add_argument("--scale-out-ats", default="0,0.4", help="partial take-profit thresholds; 0 = off")
+    parser.add_argument(
+        "--max-entry-runup", type=float, default=0.0,
+        help="Exclude tokens that ran more than this fraction above graduation price before entry "
+             "(0 disables). Note this changes the sample, so compare against a run using the same value.",
+    )
     parser.add_argument("--top", type=int, default=5)
     args = parser.parse_args()
 
-    dataset = load_dataset(Path(args.input), Path(args.cache_dir), args.entry_delay_seconds)
+    dataset = load_dataset(
+        Path(args.input), Path(args.cache_dir), args.entry_delay_seconds, args.max_entry_runup
+    )
     if len(dataset) < 30:
         raise SystemExit(
             f"Only {len(dataset)} cached tokens. Run `grad_backtest.py run` on a bigger sample first; "

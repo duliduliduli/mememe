@@ -53,7 +53,7 @@ SKIPS_FILE = DATA_DIR / "skips.csv"
 TRADE_COLUMNS = [
     "opened_at", "closed_at", "mint", "mode", "position_usd", "exit_usd",
     "net_return", "exit_reason", "buy_signature", "sell_signature", "entry_price_impact_pct",
-    "peak_gain_pct",
+    "peak_gain_pct", "entry_market_cap_usd",
 ]
 
 
@@ -107,6 +107,11 @@ class Config:
         self.entry_retry_seconds = float(os.getenv("ENTRY_RETRY_SECONDS", "3"))
         self.poll_seconds = float(os.getenv("POLL_SECONDS", "5"))
         self.max_price_impact_pct = float(os.getenv("MAX_PRICE_IMPACT_PCT", "5"))
+        # Pump.fun tokens graduate around $69k and genuine ones sit near $30k-200k at entry. A
+        # market cap far above that 30s after migration means a bundled buy already pumped it
+        # and we would be buying the top of someone else's pump, which then dumps into us.
+        # Observed live: 15-holder tokens at $5M, $150M caps one minute old. 0 disables.
+        self.max_entry_market_cap_usd = float(os.getenv("MAX_ENTRY_MARKET_CAP_USD", "300000"))
         self.max_entry_lateness_seconds = float(os.getenv("MAX_ENTRY_LATENESS_SECONDS", "60"))
         self.min_sol_reserve = float(os.getenv("MIN_SOL_RESERVE", "0.05"))
         self.paper_start_balance = float(os.getenv("START_BALANCE", "100"))
@@ -197,13 +202,37 @@ def describe_error(exc: BaseException) -> str:
     return text[:240] + "…" if len(text) > 240 else text
 
 
-def entry_guard_reason(cfg: Config, graduated_ts: float, now: float, price_impact_pct: float | None) -> str | None:
+def entry_market_cap_usd(size_usd: float, out_amount_raw: int, supply_ui: float, decimals: int) -> float | None:
+    """Market cap implied by the executable buy quote: the USD we put in divided by the tokens
+    we actually receive is the price we are really paying, times circulating supply."""
+    tokens_ui = out_amount_raw / (10 ** decimals)
+    if tokens_ui <= 0 or supply_ui <= 0:
+        return None
+    return supply_ui * (size_usd / tokens_ui)
+
+
+def entry_guard_reason(
+    cfg: Config,
+    graduated_ts: float,
+    now: float,
+    price_impact_pct: float | None,
+    market_cap_usd: float | None = None,
+) -> str | None:
     """Reject entries that are no longer the trade the backtest models."""
     lateness = now - (graduated_ts + cfg.entry_delay_seconds)
     if lateness > cfg.max_entry_lateness_seconds:
         return f"stale entry: {lateness:.0f}s past target"
     if price_impact_pct is not None and price_impact_pct > cfg.max_price_impact_pct:
         return f"price impact {price_impact_pct:.1f}% > {cfg.max_price_impact_pct:.1f}% (pool too thin for our size)"
+    if (
+        market_cap_usd is not None
+        and cfg.max_entry_market_cap_usd > 0
+        and market_cap_usd > cfg.max_entry_market_cap_usd
+    ):
+        return (
+            f"market cap ${market_cap_usd:,.0f} > ${cfg.max_entry_market_cap_usd:,.0f} "
+            "(already pumped far past graduation)"
+        )
     return None
 
 
@@ -269,6 +298,11 @@ class Rpc:
             info = acct["account"]["data"]["parsed"]["info"]
             total += int(info["tokenAmount"]["amount"])
         return total
+
+    def token_supply(self, mint: str) -> tuple[float, int]:
+        """(circulating supply in UI units, decimals) for a mint."""
+        value = self.call("getTokenSupply", [mint])["value"]
+        return float(value["uiAmountString"]), int(value["decimals"])
 
     def send_raw(self, raw: bytes) -> str:
         return self.call(
@@ -424,7 +458,15 @@ class Executor:
         if tokens <= 0:
             raise RuntimeError("zero-token quote")
         impact = quote_price_impact_pct(quote)
-        guard = entry_guard_reason(self.cfg, item["graduated_ts"], now_ts(), impact)
+        market_cap = None
+        if self.cfg.max_entry_market_cap_usd > 0:
+            try:
+                supply_ui, decimals = self.rpc.token_supply(mint)
+                market_cap = entry_market_cap_usd(size_usd, tokens, supply_ui, decimals)
+            except Exception as exc:
+                # Never block an entry because a metadata lookup failed; log and continue.
+                log(f"WARN {mint}: market cap check unavailable ({describe_error(exc)})")
+        guard = entry_guard_reason(self.cfg, item["graduated_ts"], now_ts(), impact, market_cap)
         if guard:
             self.skip(mint, guard)
             return
@@ -461,6 +503,7 @@ class Executor:
                 "graduated_at": utc_iso(item["graduated_ts"]),
                 "buy_signature": buy_sig,
                 "entry_price_impact_pct": impact,
+                "entry_market_cap_usd": round(market_cap) if market_cap else None,
                 "peak_usd": size_usd,
             }
         )
@@ -531,6 +574,7 @@ class Executor:
                 "buy_signature": pos.get("buy_signature", ""),
                 "sell_signature": sell_sig,
                 "entry_price_impact_pct": pos.get("entry_price_impact_pct"),
+                "entry_market_cap_usd": pos.get("entry_market_cap_usd"),
                 "peak_gain_pct": round(peak_gain * 100, 1) if peak_gain is not None else None,
             }
         )
@@ -596,6 +640,7 @@ class Executor:
                 "buy_signature": pos.get("buy_signature", ""),
                 "sell_signature": sig,
                 "entry_price_impact_pct": pos.get("entry_price_impact_pct"),
+                "entry_market_cap_usd": pos.get("entry_market_cap_usd"),
                 "peak_gain_pct": round(peak_gain * 100, 1) if peak_gain is not None else None,
             }
         )
@@ -654,6 +699,7 @@ class Executor:
             f"time_stop={self.cfg.time_stop_minutes:.0f}m trail={self.cfg.trailing_stop:.0%} "
             f"scale_out={self.cfg.scale_out_at:.0%}x{self.cfg.scale_out_fraction:.0%} moon_bag={self.cfg.moon_bag:.0%} "
             f"slippage={self.cfg.slippage_bps}/{self.cfg.sell_slippage_bps}bps(buy/sell) "
+            f"max_mcap=${self.cfg.max_entry_market_cap_usd:,.0f} "
             f"retries={self.cfg.entry_retries} daily_loss_limit=${self.cfg.daily_loss_limit_usd}")
         if self.cfg.mode == "live":
             log(f"live wallet: {self.wallet.pubkey} (burner only!)")

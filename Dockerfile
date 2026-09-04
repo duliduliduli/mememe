@@ -12,7 +12,7 @@ COPY grad-backtest/grad_backtest.py grad-backtest/position_sizing.py grad-backte
      grad-backtest/executor.py grad-backtest/optimize.py grad-backtest/test_grad_backtest.py \
      grad-backtest/test_position_sizing.py grad-backtest/test_server.py \
      grad-backtest/test_executor.py grad-backtest/test_executor_guards.py \
-     grad-backtest/test_optimize.py grad-backtest/test_scale_out.py grad-backtest/test_slippage_retry.py ./
+     grad-backtest/test_optimize.py grad-backtest/test_scale_out.py grad-backtest/test_slippage_retry.py grad-backtest/test_market_cap.py ./
 COPY grad-backtest/static static
 COPY grad-backtest/data/graduations.example.csv data/
 
