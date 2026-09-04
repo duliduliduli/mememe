@@ -11,6 +11,10 @@ strategy with configurable friction costs.
 - Public web dashboard (`server.py` + `static/`) showing equity curve, win rate,
   return distribution, recent trades, and a live activity log — deployable to
   Railway with a public URL.
+- Deploying to Railway: point it at this repo and it builds from the root
+  `Dockerfile` with no configuration (no Root Directory setting needed). Add a
+  volume at `/data` and the env vars, then generate a public domain for the
+  dashboard.
 - Run it in the cloud: the **"Run backtest in the cloud"** GitHub Actions workflow
   (results download as artifacts), or deploy `grad-backtest/` to Railway using the
   bundled `Dockerfile` + `railway.json`. Both need `HELIUS_API_KEY` and
