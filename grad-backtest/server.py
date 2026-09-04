@@ -248,10 +248,11 @@ def _start_executor() -> None:
     global _executor_proc
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     EXECUTOR_STOP.unlink(missing_ok=True)
-    log_fh = (DATA_DIR / "executor.log").open("a")
-    _executor_proc = subprocess.Popen(
-        [sys.executable, "executor.py"], stdout=log_fh, stderr=subprocess.STDOUT, cwd=Path(__file__).parent
-    )
+    # executor.py's own log() already appends every line to executor.log, so the
+    # child's stdout/stderr are left inherited: activity and crash tracebacks show
+    # up in the container log (Railway's deploy view) instead of vanishing into a
+    # file, and lines stop being written to executor.log twice.
+    _executor_proc = subprocess.Popen([sys.executable, "executor.py"], cwd=Path(__file__).parent)
 
 
 @app.get("/api/live")
@@ -314,8 +315,17 @@ def executor_panic(request: Request) -> JSONResponse:
 
 @app.on_event("startup")
 def maybe_autostart_executor() -> None:
-    if os.getenv("EXECUTOR_AUTOSTART", "0") == "1" and not _executor_running():
+    autostart = os.getenv("EXECUTOR_AUTOSTART", "0") == "1"
+    mode = os.getenv("EXECUTOR_MODE", "paper")
+    if autostart and not _executor_running():
         _start_executor()
+        print(f"[server] autostart enabled: launched executor in {mode} mode", flush=True)
+    elif not autostart:
+        print(
+            f"[server] EXECUTOR_AUTOSTART is not 1 — executor NOT started "
+            f"(configured mode would be {mode}); POST /api/executor/start to run it",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":
