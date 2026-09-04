@@ -412,7 +412,18 @@ class Executor:
             return
         buy_sig = ""
         if self.cfg.mode == "live":
-            buy_sig = self.execute_swap(quote)
+            try:
+                buy_sig = self.execute_swap(quote)
+            except Exception as exc:
+                # A swap can still land after our confirmation timeout. Check for
+                # the tokens before giving up, or they become an untracked bag
+                # sitting in the wallet that nothing will ever sell.
+                time.sleep(15)
+                landed = self.rpc.token_balance(self.wallet.pubkey, mint)
+                if landed <= 0:
+                    raise
+                log(f"WARN {mint}: entry reported failure ({exc}) but {landed} tokens landed; adopting position")
+                buy_sig = "unconfirmed"
             tokens = self.rpc.token_balance(self.wallet.pubkey, mint) or tokens
         else:
             self.state["paper_balance_usd"] = float(self.state["paper_balance_usd"]) - size_usd
@@ -440,7 +451,11 @@ class Executor:
         if self.cfg.mode == "live":
             amount = self.rpc.token_balance(self.wallet.pubkey, mint)
             if amount <= 0:
-                log(f"WARN {mint}: no tokens on-chain to sell; dropping position")
+                log(
+                    f"WARN {mint}: no tokens on-chain to sell; dropping position. "
+                    "If a previous sell landed after timing out this is expected — "
+                    "check the wallet on an explorer to confirm the proceeds arrived."
+                )
                 self.state["positions"].remove(pos)
                 save_state(self.state)
                 return
@@ -537,6 +552,13 @@ class Executor:
             f"time_stop={self.cfg.time_stop_minutes:.0f}m daily_loss_limit=${self.cfg.daily_loss_limit_usd}")
         if self.cfg.mode == "live":
             log(f"live wallet: {self.wallet.pubkey} (burner only!)")
+            try:
+                balance = self.rpc.sol_balance(self.wallet.pubkey)
+                log(f"wallet balance: {balance:.4f} SOL ({self.cfg.min_sol_reserve} SOL reserved for fees)")
+                if balance <= self.cfg.min_sol_reserve:
+                    log("WARNING: balance at or below the fee reserve — no entries will be taken until funded")
+            except Exception as exc:
+                log(f"WARN could not read wallet balance: {exc}")
         if self.state["positions"]:
             log(f"resuming {len(self.state['positions'])} open position(s) from state file")
         while True:
