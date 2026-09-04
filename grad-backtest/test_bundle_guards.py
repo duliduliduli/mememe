@@ -129,6 +129,9 @@ class MultiWalletBundleGuardTests(unittest.TestCase):
         self.assertEqual(cfg.max_dev_cluster_pct, 15)
         self.assertEqual(cfg.max_top10_wallet_pct, 50)
         self.assertEqual(cfg.max_early_buy_pct, 30)
+        self.assertEqual(cfg.min_funder_lookup_pct, 80)
+        self.assertEqual(cfg.bundle_max_wallets, 50)
+        self.assertEqual(cfg.bundle_funder_max_wallets, 20)
         self.assertTrue(cfg.bundle_fail_closed)
 
     def test_mike_apeson_pattern_is_blocked_by_transfer_graph(self):
@@ -324,6 +327,23 @@ class WalletGraphCacheTests(unittest.TestCase):
         second.origin_funder = lambda wallet, before: (_ for _ in ()).throw(AssertionError("cache miss"))
         self.assertEqual(second.cached_origin_funder("w", GRAD), "treasury")
 
+    def test_lookup_completion_distinguishes_no_funder_from_failure(self):
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        rpc = executor.Rpc(executor.Config())
+
+        def lookup(wallet, _before):
+            if wallet == "failed":
+                raise RuntimeError("provider timeout")
+            return "treasury" if wallet == "funded" else None
+
+        rpc.cached_origin_funder = lookup
+        funders, completed = rpc._lookup_funders({"funded", "unfunded", "failed"}, GRAD)
+        self.assertEqual(funders["funded"], "treasury")
+        self.assertIsNone(funders["unfunded"])
+        self.assertIsNone(funders["failed"])
+        self.assertEqual(completed, {"funded", "unfunded"})
+
 
 class BundleSnapshotTests(unittest.TestCase):
     def test_shared_funder_and_same_slot_are_measured(self):
@@ -359,8 +379,55 @@ class BundleSnapshotTests(unittest.TestCase):
         self.assertAlmostEqual(snapshot["top10_wallet_pct"], 54.0)
         self.assertAlmostEqual(snapshot["early_buy_pct"], 54.0)
         self.assertAlmostEqual(snapshot["funder_coverage_pct"], 100.0)
+        self.assertAlmostEqual(snapshot["funder_lookup_pct"], 100.0)
+        self.assertEqual(snapshot["funder_sample_count"], 6)
         self.assertEqual(snapshot["holder_sample_count"], 6)
         self.assertEqual(snapshot["bundle_confidence"], "high")
+
+    def test_funding_coverage_uses_top_twenty_but_graph_keeps_fifty(self):
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        rpc = executor.Rpc(executor.Config())
+        holders = [(f"w{i}", 100 - i) for i in range(50)]
+        rpc.plain_wallet_holders = lambda mint, exclude, limit: holders
+        rpc.enhanced_transactions = lambda address, **params: [{
+            "slot": 10,
+            "feePayer": "dev",
+            "tokenTransfers": [
+                {"mint": "m", "toUserAccount": wallet, "tokenAmount": raw, "decimals": 0}
+                for wallet, raw in holders
+            ],
+        }]
+        rpc.origin_funder = lambda wallet, before: "treasury" if wallet.startswith("w") else None
+
+        snapshot = rpc.bundle_snapshot("m", 10_000.0, 0, 900, 1000)
+        self.assertTrue(snapshot["complete"])
+        self.assertEqual(snapshot["holder_sample_count"], 50)
+        self.assertEqual(snapshot["funder_sample_count"], 20)
+        self.assertAlmostEqual(snapshot["funder_coverage_pct"], 100.0)
+        self.assertAlmostEqual(snapshot["funder_lookup_pct"], 100.0)
+
+    def test_completed_but_unidentifiable_funding_is_insufficient_not_timeout(self):
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        rpc = executor.Rpc(executor.Config())
+        holders = [("w1", 60), ("w2", 40)]
+        rpc.plain_wallet_holders = lambda mint, exclude, limit: holders
+        rpc.enhanced_transactions = lambda address, **params: [{
+            "slot": 10,
+            "feePayer": "dev",
+            "tokenTransfers": [
+                {"mint": "m", "toUserAccount": wallet, "tokenAmount": raw, "decimals": 0}
+                for wallet, raw in holders
+            ],
+        }]
+        rpc.origin_funder = lambda wallet, before: None
+
+        snapshot = rpc.bundle_snapshot("m", 1_000.0, 0, 900, 1000)
+        self.assertFalse(snapshot["complete"])
+        self.assertAlmostEqual(snapshot["funder_lookup_pct"], 100.0)
+        self.assertEqual(snapshot["bundle_confidence"], "insufficient")
+        self.assertIn("funder coverage 0.0%", snapshot["error"])
 
 
 class EntryIntegrationTests(unittest.TestCase):

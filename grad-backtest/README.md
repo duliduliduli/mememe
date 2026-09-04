@@ -227,13 +227,16 @@ prints the important ones.
 | `MIN_CURVE_AGE_SECONDS` | `120` | Skip if the token graduated less than this many seconds after it was created. `0` disables. |
 | `MAX_TOP_HOLDER_PCT` | `20` | Skip if the largest plain-wallet holder owns more than this share of supply. `0` disables. |
 
-Bundle graph defaults: inspect up to 50 holders; block same-slot (`30%`), direct-funder
+Bundle graph defaults: inspect up to 50 holders and trace funding for the largest 20; block same-slot (`30%`), direct-funder
 (`30%`), two-hop ancestry (`20%`), unpaid token-transfer (`12%`), coordinated
 12-slot acquisition (`20%`), repeat-launch cohort (`12%`), creator-linked (`15%`),
-top-ten (`50%`), and first-three-slot (`30%`) concentration. Funder coverage below
-`30%` fails closed. Coverage from `30%` through `60%` is classified as partial and
-multiplies every limit by `0.67`; higher coverage uses the normal limits. Wallet
-funders and launch appearances are cached in `DATA_DIR/wallet_graph_cache.json`.
+top-ten (`50%`), and first-three-slot (`30%`) concentration. Funding lookup completion
+below `80%` or identifiable-funder coverage below `30%` fails closed. Coverage from
+`30%` through `60%` is classified as partial and multiplies every limit by `0.67`;
+higher coverage uses the normal limits. Configure those controls with
+`BUNDLE_MAX_WALLETS`, `BUNDLE_FUNDER_MAX_WALLETS`, `MIN_FUNDER_LOOKUP_PCT`, and
+`MIN_FUNDER_COVERAGE_PCT`. Wallet funders and launch appearances are cached in
+`DATA_DIR/wallet_graph_cache.json`.
 
 ### 4.5 Swaps, slippage, retries
 
@@ -376,7 +379,7 @@ entry can land.
    - token supply → implied market cap = supply × (USD in ÷ tokens out), i.e. the price we would actually pay;
    - mint creation time via `getSignaturesForAddress` with early stop → curve age = graduation − creation;
    - largest plain-wallet holder via `getTokenLargestAccounts` plus two `getMultipleAccounts` calls, ignoring program-owned accounts (the pool, the bonding curve, the Mayhem vault) and our own wallet.
-   - a mandatory bundle graph over up to 50 plain-wallet holders. It combines same-slot and short-window purchases, first-three-slot purchases, top-ten concentration, direct and two-hop non-CEX funding ancestry, unpaid wallet-to-wallet token distributions, creator linkage, and wallet cohorts previously seen together. Holder histories are fetched concurrently and cached. With `BUNDLE_FAIL_CLOSED=1`, missing supply, creation history, purchase history, or less than 30% funder coverage skips the entry; 30–60% coverage applies stricter thresholds.
+   - a mandatory bundle graph over up to 50 plain-wallet holders. It combines same-slot and short-window purchases, first-three-slot purchases, top-ten concentration, direct and two-hop non-CEX funding ancestry, unpaid wallet-to-wallet token distributions, creator linkage, and wallet cohorts previously seen together. The broad 50-holder sample feeds transfer, coordination, repeat-cohort and concentration checks; funding ancestry is traced over the largest 20 holders so adding small holders does not dilute coverage. Lookup completion is measured separately from identifiable-funder coverage. With `BUNDLE_FAIL_CLOSED=1`, missing supply, creation history, purchase history, less than 80% lookup completion, or less than 30% funder coverage skips the entry; 30–60% coverage applies stricter thresholds.
 4. **`entry_guard_reason`**, first hit wins:
    1. lateness > `MAX_ENTRY_LATENESS_SECONDS` → `stale entry: Ns past target`
    2. price impact > `MAX_PRICE_IMPACT_PCT` → `price impact X% > 5.0% (pool too thin for our size)`
