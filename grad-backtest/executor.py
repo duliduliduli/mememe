@@ -36,7 +36,7 @@ from typing import Any
 
 import requests
 
-from grad_backtest import WSOL, candidate_mints
+from grad_backtest import KNOWN_QUOTES, WSOL, candidate_mints
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 STATE_FILE = DATA_DIR / "executor_state.json"
@@ -47,6 +47,9 @@ PANIC_FLAG = DATA_DIR / "executor.panic"
 
 USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 LAMPORTS = 1_000_000_000
+TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+TOKEN_ACCOUNT_RENT_SOL = 0.00203928
 
 SKIPS_FILE = DATA_DIR / "skips.csv"
 
@@ -113,6 +116,15 @@ class Config:
         # Observed live: 15-holder tokens at $5M, $150M caps one minute old. 0 disables.
         self.max_entry_market_cap_usd = float(os.getenv("MAX_ENTRY_MARKET_CAP_USD", "300000"))
         self.max_entry_lateness_seconds = float(os.getenv("MAX_ENTRY_LATENESS_SECONDS", "60"))
+        # Startup wallet reconciliation (live only): adopt untracked holdings worth at least
+        # MIN_ADOPT_USD as managed positions so a restart never strands a bag, and close empty
+        # token accounts to reclaim their rent. Holdings under the threshold are left alone,
+        # so nothing the wallet held before the bot is ever burned.
+        self.min_adopt_usd = float(os.getenv("MIN_ADOPT_USD", "1.0"))
+        self.close_empty_accounts = os.getenv("CLOSE_EMPTY_ACCOUNTS", "1") == "1"
+        # A position whose sells keep failing this long past its time stop is moved to
+        # state["stuck"] so it stops blocking a slot; panic still tries to liquidate it.
+        self.stuck_after_minutes = float(os.getenv("STUCK_AFTER_MINUTES", "15"))
         self.min_sol_reserve = float(os.getenv("MIN_SOL_RESERVE", "0.05"))
         self.paper_start_balance = float(os.getenv("START_BALANCE", "100"))
         self.wallet_key = os.getenv("WALLET_PRIVATE_KEY") or ""
@@ -299,6 +311,25 @@ class Rpc:
             total += int(info["tokenAmount"]["amount"])
         return total
 
+    def token_accounts(self, owner: str, mint: str | None = None) -> list[dict[str, Any]]:
+        """Token accounts the wallet owns: every one across both token programs, or those for a mint."""
+        filters = [{"mint": mint}] if mint else [{"programId": TOKEN_PROGRAM}, {"programId": TOKEN_2022_PROGRAM}]
+        out: list[dict[str, Any]] = []
+        for flt in filters:
+            result = self.call("getTokenAccountsByOwner", [owner, flt, {"encoding": "jsonParsed"}])
+            for acct in result.get("value") or []:
+                info = acct["account"]["data"]["parsed"]["info"]
+                out.append(
+                    {
+                        "pubkey": acct["pubkey"],
+                        "program": acct["account"]["owner"],
+                        "mint": info["mint"],
+                        "amount": int(info["tokenAmount"]["amount"]),
+                        "decimals": int(info["tokenAmount"]["decimals"]),
+                    }
+                )
+        return out
+
     def token_supply(self, mint: str) -> tuple[float, int]:
         """(circulating supply in UI units, decimals) for a mint."""
         value = self.call("getTokenSupply", [mint])["value"]
@@ -378,6 +409,15 @@ class Wallet:
 
         tx = VersionedTransaction.from_bytes(raw_tx)
         return bytes(VersionedTransaction(tx.message, [self.keypair]))
+
+    def sign_instructions(self, instructions: list, blockhash: str) -> bytes:
+        from solders.hash import Hash
+        from solders.transaction import Transaction
+
+        tx = Transaction.new_signed_with_payer(
+            instructions, self.keypair.pubkey(), [self.keypair], Hash.from_string(blockhash)
+        )
+        return bytes(tx)
 
 
 class Executor:
@@ -557,6 +597,97 @@ class Executor:
         self.state["positions"].remove(pos)
         save_state(self.state)
         self._record_close(pos, reason, exit_usd, sell_sig, sold_cost)
+        if self.cfg.mode == "live" and keep == 0 and self.cfg.close_empty_accounts:
+            self.reclaim_rent(mint)
+
+    def close_token_account(self, account: str, program: str, mint: str, burn_amount: int = 0) -> str:
+        """Reclaim a token account's rent (~0.002 SOL). Burns leftover dust first; only ever
+        called with burn_amount > 0 on tokens the bot itself bought."""
+        from solders.instruction import AccountMeta, Instruction
+        from solders.pubkey import Pubkey
+
+        owner = self.wallet.keypair.pubkey()
+        prog, acct, mint_pk = Pubkey.from_string(program), Pubkey.from_string(account), Pubkey.from_string(mint)
+        instructions = []
+        if burn_amount > 0:
+            instructions.append(
+                Instruction(
+                    prog,
+                    bytes([8]) + int(burn_amount).to_bytes(8, "little"),  # SPL Token: Burn
+                    [AccountMeta(acct, False, True), AccountMeta(mint_pk, False, True), AccountMeta(owner, True, False)],
+                )
+            )
+        instructions.append(
+            Instruction(
+                prog,
+                bytes([9]),  # SPL Token: CloseAccount (rent returns to owner)
+                [AccountMeta(acct, False, True), AccountMeta(owner, False, True), AccountMeta(owner, True, False)],
+            )
+        )
+        blockhash = self.rpc.call("getLatestBlockhash", [{"commitment": "finalized"}])["value"]["blockhash"]
+        return self.rpc.send_raw(self.wallet.sign_instructions(instructions, blockhash))
+
+    def reclaim_rent(self, mint: str) -> None:
+        try:
+            for acct in self.rpc.token_accounts(self.wallet.pubkey, mint=mint):
+                sig = self.close_token_account(acct["pubkey"], acct["program"], mint, burn_amount=acct["amount"])
+                log(f"RENT reclaimed ~{TOKEN_ACCOUNT_RENT_SOL:.4f} SOL from {mint}'s token account ({sig[:16]}…)")
+        except Exception as exc:
+            log(f"WARN {mint}: could not close token account: {describe_error(exc)}")
+
+    def reconcile_wallet(self, sol_price: float) -> None:
+        """Startup pass over every token account the wallet holds. Untracked holdings worth at
+        least MIN_ADOPT_USD become managed positions (basis = current value, clock starts now)
+        so a restart can never strand a bag; empty accounts are closed for their rent; anything
+        under the threshold is left untouched."""
+        tracked = {p["mint"] for p in self.state["positions"]}
+        tracked |= {b["mint"] for b in self.state.get("moon_bags", [])}
+        tracked |= {b["mint"] for b in self.state.get("stuck", [])}
+        closed = adopted = 0
+        for acct in self.rpc.token_accounts(self.wallet.pubkey):
+            mint = acct["mint"]
+            if mint in KNOWN_QUOTES:
+                continue
+            if acct["amount"] == 0:
+                if self.cfg.close_empty_accounts:
+                    try:
+                        self.close_token_account(acct["pubkey"], acct["program"], mint)
+                        closed += 1
+                        time.sleep(0.2)
+                    except Exception as exc:
+                        log(f"WARN could not close empty account {acct['pubkey'][:8]}…: {describe_error(exc)}")
+                continue
+            if mint in tracked:
+                continue
+            try:
+                quote = self.jup.quote(mint, WSOL, acct["amount"], slippage_bps=self.cfg.sell_slippage_bps)
+                value = int(quote["outAmount"]) / LAMPORTS * sol_price
+            except Exception as exc:
+                log(f"WARN {mint}: held but not quotable ({describe_error(exc)}); leaving it alone")
+                continue
+            if value < self.cfg.min_adopt_usd:
+                continue
+            self.state["positions"].append(
+                {
+                    "mint": mint,
+                    "tokens": acct["amount"],
+                    "position_usd": round(value, 2),
+                    "opened_ts": now_ts(),
+                    "opened_at": utc_iso(),
+                    "graduated_at": None,
+                    "buy_signature": "adopted",
+                    "entry_price_impact_pct": None,
+                    "entry_market_cap_usd": None,
+                    "peak_usd": value,
+                    "adopted": True,
+                }
+            )
+            adopted += 1
+            log(f"ADOPTED untracked holding {mint} worth ${value:.2f}; managing it from here (basis = current value)")
+        if closed or adopted:
+            save_state(self.state)
+        log(f"wallet reconciled: adopted {adopted} position(s), closed {closed} empty token account(s)"
+            + (f" (~{closed * TOKEN_ACCOUNT_RENT_SOL:.4f} SOL rent)" if closed else ""))
 
     def _record_close(self, pos: dict[str, Any], reason: str, exit_usd: float, sell_sig: str, sold_cost: float) -> None:
         net = exit_usd / sold_cost - 1.0 if sold_cost > 0 else 0.0
@@ -601,8 +732,20 @@ class Executor:
                 )
                 if reason:
                     self.close_position(pos, reason, sol_price)
+                else:
+                    pos["sell_failures"] = 0
             except Exception as exc:
-                log(f"WARN managing {pos['mint']}: {describe_error(exc)}")
+                reason_text = describe_error(exc)
+                log(f"WARN managing {pos['mint']}: {reason_text}")
+                pos["sell_failures"] = int(pos.get("sell_failures", 0)) + 1
+                pos["last_sell_error"] = reason_text
+                overdue = pos["opened_ts"] + (self.cfg.time_stop_minutes + self.cfg.stuck_after_minutes) * 60
+                if now_ts() > overdue and pos["sell_failures"] >= 3:
+                    self.state["positions"].remove(pos)
+                    self.state.setdefault("stuck", []).append({**pos, "stuck_at": utc_iso()})
+                    save_state(self.state)
+                    log(f"STUCK {pos['mint']}: {pos['sell_failures']} consecutive sell failures past its time stop "
+                        f"({reason_text}). Slot freed; moved to state.stuck. Panic will retry it, or sell manually.")
 
     def scale_out(self, pos: dict[str, Any], sol_price: float) -> None:
         """Bank part of a winner at the first target. The remainder keeps the same TP/SL/trailing
@@ -646,8 +789,9 @@ class Executor:
         )
         log(f"SCALE-OUT {mint}: sold {frac:.0%} for ${proceeds:.2f} ({net:+.1%}); remainder basis ${pos['position_usd']:.2f}")
 
-    def liquidate_moon_bags(self, sol_price: float) -> None:
-        for bag in list(self.state.get("moon_bags", [])):
+    def liquidate_bags(self, sol_price: float, key: str, reason: str) -> None:
+        """Market-sell everything in state[key] (moon bags or stuck positions) during panic."""
+        for bag in list(self.state.get(key, [])):
             try:
                 amount = bag["tokens"]
                 if self.cfg.mode == "live":
@@ -657,23 +801,24 @@ class Executor:
                 proceeds = int(quote["outAmount"]) / LAMPORTS * sol_price
                 if self.cfg.mode == "paper":
                     self.state["paper_balance_usd"] = float(self.state["paper_balance_usd"]) + proceeds
-                self.state["moon_bags"].remove(bag)
+                self.state[key].remove(bag)
+                basis = float(bag.get("cost_usd", bag.get("position_usd", 0.0)) or 0.0)
                 record_trade(
                     {
-                        "opened_at": bag["created_at"],
+                        "opened_at": bag.get("created_at") or bag.get("opened_at"),
                         "closed_at": utc_iso(),
                         "mint": bag["mint"],
                         "mode": self.cfg.mode,
-                        "position_usd": bag["cost_usd"],
+                        "position_usd": round(basis, 2),
                         "exit_usd": round(proceeds, 2),
-                        "net_return": round(proceeds / bag["cost_usd"] - 1.0, 4) if bag["cost_usd"] else 0.0,
-                        "exit_reason": "panic_moon_bag",
+                        "net_return": round(proceeds / basis - 1.0, 4) if basis else 0.0,
+                        "exit_reason": reason,
                         "sell_signature": sig,
                     }
                 )
-                log(f"EXIT moon bag {bag['mint']} ${proceeds:.2f}")
+                log(f"EXIT {key[:-1] if key.endswith('s') else key} {bag['mint']} ${proceeds:.2f}")
             except Exception as exc:
-                log(f"WARN liquidating moon bag {bag['mint']}: {describe_error(exc)}")
+                log(f"WARN liquidating {key} {bag['mint']}: {describe_error(exc)}")
 
     def enter_with_retry(self, item: dict[str, Any], sol_price: float) -> None:
         """Slippage rejections are transient (the price moved during the ~1s between quote and
@@ -699,7 +844,8 @@ class Executor:
             f"time_stop={self.cfg.time_stop_minutes:.0f}m trail={self.cfg.trailing_stop:.0%} "
             f"scale_out={self.cfg.scale_out_at:.0%}x{self.cfg.scale_out_fraction:.0%} moon_bag={self.cfg.moon_bag:.0%} "
             f"slippage={self.cfg.slippage_bps}/{self.cfg.sell_slippage_bps}bps(buy/sell) "
-            f"max_mcap=${self.cfg.max_entry_market_cap_usd:,.0f} "
+            f"max_mcap=${self.cfg.max_entry_market_cap_usd:,.0f} adopt>=${self.cfg.min_adopt_usd} "
+            f"stuck_after={self.cfg.stuck_after_minutes:.0f}m "
             f"retries={self.cfg.entry_retries} daily_loss_limit=${self.cfg.daily_loss_limit_usd}")
         if self.cfg.mode == "live":
             log(f"live wallet: {self.wallet.pubkey} (burner only!)")
@@ -712,6 +858,11 @@ class Executor:
                 log(f"WARN could not read wallet balance: {exc}")
         if self.state["positions"]:
             log(f"resuming {len(self.state['positions'])} open position(s) from state file")
+        if self.cfg.mode == "live":
+            try:
+                self.reconcile_wallet(self.sol_price_usd())
+            except Exception as exc:
+                log(f"WARN wallet reconciliation failed: {describe_error(exc)}")
         while True:
             try:
                 roll_daily(self.state)
@@ -731,9 +882,11 @@ class Executor:
                     self.enter_with_retry(item, sol_price)
                 if self.state["positions"]:
                     self.manage_positions(sol_price, panic)
-                if panic and self.state.get("moon_bags"):
-                    self.liquidate_moon_bags(sol_price or self.sol_price_usd())
-                if panic and not self.state["positions"] and not self.state.get("moon_bags"):
+                if panic and (self.state.get("moon_bags") or self.state.get("stuck")):
+                    price = sol_price or self.sol_price_usd()
+                    self.liquidate_bags(price, "moon_bags", "panic_moon_bag")
+                    self.liquidate_bags(price, "stuck", "panic_stuck")
+                if panic and not self.state["positions"] and not self.state.get("moon_bags") and not self.state.get("stuck"):
                     PANIC_FLAG.unlink(missing_ok=True)
                     STOP_FLAG.touch()
                     log("panic complete: all positions and moon bags closed, executor draining")
