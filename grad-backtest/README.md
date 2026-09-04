@@ -354,6 +354,12 @@ current multiple). Two settings decide what happens to a bag afterwards:
   dollar target). Bags are re-quoted every `MOON_BAG_CHECK_SECONDS` (default
   60), not every loop. `0` holds forever; `panic` is then the only exit.
 
+- `MIN_MOON_BAG_USD` (default `0.5`): a bag that would be worth less than
+  this is not kept at all; its rent (0.002 SOL) would exceed its value.
+- `MOON_BAG_DEAD_PCT` (default `5`): a bag that has fallen to this percent of
+  the value it was kept at is burned and its token account closed, taking the
+  rent back. Logged as `MOONBAG DEAD` and recorded as a `moon_bag_dead` trade.
+
 `panic` still liquidates every bag along with everything else. Bags live in
 the state file, so without a persistent `/data` volume a redeploy forgets
 them: the restart adopts the tokens as an ordinary position and sells them on
