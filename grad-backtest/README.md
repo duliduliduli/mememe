@@ -100,6 +100,28 @@ python grad_backtest.py run --output-dir data/cost_4pct --side-cost 0.04
 python -m unittest -v
 ```
 
+## Parameter optimizer ("training" done honestly)
+
+After one full `run` has populated the cache, `optimize.py` sweeps the whole
+parameter grid — take-profit, stop-loss, time stop, trailing stop, moon bag —
+against every cached token, with zero API calls:
+
+```bash
+python optimize.py                      # defaults: 270 combos
+python optimize.py --take-profits 0.5,0.75 --moon-bags 0,0.1,0.2
+```
+
+It splits the sample chronologically (default 70% train / 30% validation),
+ranks combos by train median net return, then reports how the winners perform
+on the validation tokens the sweep never saw. **Judge combos by the validation
+column.** A big train-vs-validation gap is the overfitting alarm — it means
+the "winning" parameters memorized the past instead of finding an edge. This
+is also why parameters are never tuned on a handful of hand-picked charts:
+the tokens you noticed are the ones that moved.
+
+Runs in the cloud via the dashboard: `{"stage": "optimize"}` (results land in
+`optimize_summary.json` on the volume).
+
 ## Position sizing for a small account
 
 `position_sizing.py` answers "what fraction of my balance should each trade use?"
