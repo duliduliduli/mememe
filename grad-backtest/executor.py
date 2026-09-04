@@ -117,6 +117,13 @@ class Config:
         self.stop_loss = float(os.getenv("STOP_LOSS", "0.30"))
         self.trailing_stop = float(os.getenv("TRAILING_STOP", "0"))  # fraction off peak; 0 disables
         self.moon_bag = min(0.5, max(0.0, float(os.getenv("MOON_BAG", "0"))))  # fraction kept at exit; 0 disables
+        # Keep a bag only when the exit was profitable (a stop-loss remnant just rides to zero and
+        # locks its rent), and sell a bag once it is worth MOON_BAG_TARGET_X times what was kept
+        # (0 = hold forever; panic is then the only way out). Bags are re-quoted every
+        # MOON_BAG_CHECK_SECONDS, not every loop, since they are off the Jupiter budget otherwise.
+        self.moon_bag_winners_only = os.getenv("MOON_BAG_WINNERS_ONLY", "1") == "1"
+        self.moon_bag_target_x = max(0.0, float(os.getenv("MOON_BAG_TARGET_X", "100")))
+        self.moon_bag_check_seconds = float(os.getenv("MOON_BAG_CHECK_SECONDS", "60"))
         # Partial take-profit: at +SCALE_OUT_AT sell SCALE_OUT_FRACTION of the position and let the
         # remainder ride to the full take-profit under the same rules. 0 disables.
         self.scale_out_at = float(os.getenv("SCALE_OUT_AT", "0"))
@@ -739,8 +746,14 @@ class Executor:
     def close_position(self, pos: dict[str, Any], reason: str, sol_price: float) -> None:
         mint = pos["mint"]
         sell_sig = ""
-        # Panic dumps everything; otherwise keep the configured moon-bag fraction.
+        # Panic dumps everything; otherwise keep the configured moon-bag fraction, and only on
+        # a winning exit when MOON_BAG_WINNERS_ONLY is set (the value the position was just
+        # managed at is what decided the exit, so it is the right profit test).
         mb = 0.0 if reason == "panic" else self.cfg.moon_bag
+        if mb > 0 and self.cfg.moon_bag_winners_only:
+            last_value = pos.get("last_value_usd")
+            if last_value is None or float(last_value) <= float(pos["position_usd"]):
+                mb = 0.0
         if self.cfg.mode == "live":
             amount = self.rpc.token_balance(self.wallet.pubkey, mint)
             if amount <= 0:
@@ -769,16 +782,20 @@ class Executor:
         sold_cost = pos["position_usd"] * (1.0 - mb)
         net = exit_usd / sold_cost - 1.0 if sold_cost > 0 else 0.0
         if keep > 0:
+            kept_usd = exit_usd * keep / sell_amount if sell_amount else 0.0  # what we gave up by keeping it
             self.state.setdefault("moon_bags", []).append(
                 {
                     "mint": mint,
                     "tokens": keep,
                     "cost_usd": round(pos["position_usd"] * mb, 2),
+                    "kept_usd": round(kept_usd, 2),
+                    "peak_usd": round(kept_usd, 2),
                     "created_at": utc_iso(),
                     "from_exit": reason,
                 }
             )
-            log(f"MOONBAG {mint}: keeping {mb:.0%} ({keep} tokens, ${pos['position_usd'] * mb:.2f} basis)")
+            target = f", sells at {self.cfg.moon_bag_target_x:.0f}x (${kept_usd * self.cfg.moon_bag_target_x:,.0f})" if self.cfg.moon_bag_target_x > 0 else ", held until panic"
+            log(f"MOONBAG {mint}: keeping {mb:.0%} ({keep} tokens, worth ${kept_usd:.2f} now{target})")
         self.state["daily"]["realized_pnl_usd"] = float(self.state["daily"]["realized_pnl_usd"]) + (exit_usd - sold_cost)
         self.state["positions"].remove(pos)
         save_state(self.state)
@@ -981,33 +998,72 @@ class Executor:
         )
         log(f"SCALE-OUT {mint}: sold {frac:.0%} for ${proceeds:.2f} ({net:+.1%}); remainder basis ${pos['position_usd']:.2f}")
 
+    def sell_bag(self, bag: dict[str, Any], key: str, reason: str, sol_price: float, quote: dict[str, Any] | None = None) -> float:
+        """Market-sell one bag from state[key] (moon bags or stuck positions), record the trade,
+        reclaim its rent. Returns the USD proceeds."""
+        if quote is None:
+            amount = bag["tokens"]
+            if self.cfg.mode == "live":
+                amount = self.rpc.token_balance(self.wallet.pubkey, bag["mint"]) or amount
+            quote = self.jup.quote(bag["mint"], WSOL, int(amount), slippage_bps=self.cfg.sell_slippage_bps)
+        sig = self.execute_swap(quote) if self.cfg.mode == "live" else ""
+        proceeds = int(quote["outAmount"]) / LAMPORTS * sol_price
+        if self.cfg.mode == "paper":
+            self.state["paper_balance_usd"] = float(self.state["paper_balance_usd"]) + proceeds
+        self.state[key].remove(bag)
+        basis = float(bag.get("cost_usd", bag.get("position_usd", 0.0)) or 0.0)
+        self.state["daily"]["realized_pnl_usd"] = float(self.state["daily"]["realized_pnl_usd"]) + (proceeds - basis)
+        record_trade(
+            {
+                "opened_at": bag.get("created_at") or bag.get("opened_at"),
+                "closed_at": utc_iso(),
+                "mint": bag["mint"],
+                "mode": self.cfg.mode,
+                "position_usd": round(basis, 2),
+                "exit_usd": round(proceeds, 2),
+                "net_return": round(proceeds / basis - 1.0, 4) if basis else 0.0,
+                "exit_reason": reason,
+                "sell_signature": sig,
+                "peak_gain_pct": round((float(bag["peak_usd"]) / basis - 1.0) * 100, 1) if basis and bag.get("peak_usd") else None,
+            }
+        )
+        save_state(self.state)
+        if self.cfg.mode == "live" and self.cfg.close_empty_accounts:
+            self.reclaim_rent(bag["mint"])
+        return proceeds
+
+    def manage_moon_bags(self, sol_price: float) -> None:
+        """Every MOON_BAG_CHECK_SECONDS, value each moon bag and sell any that has reached
+        MOON_BAG_TARGET_X times the value it was kept at. Quote failures are silent: a dead bag
+        is expected to be unquotable and would otherwise fill the log once a minute."""
+        if self.cfg.moon_bag_target_x <= 0 or not self.state.get("moon_bags"):
+            return
+        if now_ts() - float(self.state.get("moon_bags_checked_ts") or 0) < self.cfg.moon_bag_check_seconds:
+            return
+        self.state["moon_bags_checked_ts"] = now_ts()
+        for bag in list(self.state["moon_bags"]):
+            try:
+                quote = self.jup.quote(bag["mint"], WSOL, int(bag["tokens"]), slippage_bps=self.cfg.sell_slippage_bps)
+            except Exception:
+                continue
+            value = int(quote["outAmount"]) / LAMPORTS * sol_price
+            kept = float(bag.get("kept_usd") or bag.get("cost_usd") or 0.0)
+            bag["last_value_usd"] = round(value, 2)
+            bag["peak_usd"] = round(max(float(bag.get("peak_usd") or 0.0), value), 2)
+            bag["last_x"] = round(value / kept, 1) if kept > 0 else None
+            if kept > 0 and value >= kept * self.cfg.moon_bag_target_x:
+                try:
+                    proceeds = self.sell_bag(bag, "moon_bags", "moon_bag_target", sol_price, quote)
+                    log(f"MOONBAG TARGET {bag['mint']}: worth ${value:,.2f} = {value / kept:.0f}x the ${kept:.2f} kept; sold for ${proceeds:,.2f}")
+                except Exception as exc:
+                    log(f"WARN moon bag {bag['mint']} hit {value / kept:.0f}x but sell failed: {describe_error(exc)}")
+        save_state(self.state)
+
     def liquidate_bags(self, sol_price: float, key: str, reason: str) -> None:
         """Market-sell everything in state[key] (moon bags or stuck positions) during panic."""
         for bag in list(self.state.get(key, [])):
             try:
-                amount = bag["tokens"]
-                if self.cfg.mode == "live":
-                    amount = self.rpc.token_balance(self.wallet.pubkey, bag["mint"]) or amount
-                quote = self.jup.quote(bag["mint"], WSOL, int(amount), slippage_bps=self.cfg.sell_slippage_bps)
-                sig = self.execute_swap(quote) if self.cfg.mode == "live" else ""
-                proceeds = int(quote["outAmount"]) / LAMPORTS * sol_price
-                if self.cfg.mode == "paper":
-                    self.state["paper_balance_usd"] = float(self.state["paper_balance_usd"]) + proceeds
-                self.state[key].remove(bag)
-                basis = float(bag.get("cost_usd", bag.get("position_usd", 0.0)) or 0.0)
-                record_trade(
-                    {
-                        "opened_at": bag.get("created_at") or bag.get("opened_at"),
-                        "closed_at": utc_iso(),
-                        "mint": bag["mint"],
-                        "mode": self.cfg.mode,
-                        "position_usd": round(basis, 2),
-                        "exit_usd": round(proceeds, 2),
-                        "net_return": round(proceeds / basis - 1.0, 4) if basis else 0.0,
-                        "exit_reason": reason,
-                        "sell_signature": sig,
-                    }
-                )
+                proceeds = self.sell_bag(bag, key, reason, sol_price)
                 log(f"EXIT {key[:-1] if key.endswith('s') else key} {bag['mint']} ${proceeds:.2f}")
             except Exception as exc:
                 log(f"WARN liquidating {key} {bag['mint']}: {describe_error(exc)}")
@@ -1034,7 +1090,9 @@ class Executor:
         log(f"executor starting: mode={self.cfg.mode} fraction={self.cfg.account_fraction} "
             f"max_pos=${self.cfg.max_position_usd} tp=+{self.cfg.take_profit:.0%} sl=-{self.cfg.stop_loss:.0%} "
             f"time_stop={self.cfg.time_stop_minutes:.0f}m trail={self.cfg.trailing_stop:.0%} "
-            f"scale_out={self.cfg.scale_out_at:.0%}x{self.cfg.scale_out_fraction:.0%} moon_bag={self.cfg.moon_bag:.0%} "
+            f"scale_out={self.cfg.scale_out_at:.0%}x{self.cfg.scale_out_fraction:.0%} moon_bag={self.cfg.moon_bag:.0%}"
+            f"{'(winners only)' if self.cfg.moon_bag_winners_only else ''}"
+            f"{f'@{self.cfg.moon_bag_target_x:.0f}x' if self.cfg.moon_bag_target_x > 0 else '@hold'} "
             f"slippage={self.cfg.slippage_bps}/{self.cfg.sell_slippage_bps}bps(buy/sell) "
             f"mcap=${self.cfg.min_entry_market_cap_usd:,.0f}-${self.cfg.max_entry_market_cap_usd:,.0f} "
             f"curve_age>={self.cfg.min_curve_age_seconds:.0f}s top_holder<={self.cfg.max_top_holder_pct:.0f}% "
@@ -1076,6 +1134,8 @@ class Executor:
                     self.enter_with_retry(item, sol_price)
                 if self.state["positions"]:
                     self.manage_positions(sol_price, panic)
+                if self.state.get("moon_bags") and not panic:
+                    self.manage_moon_bags(sol_price or self.sol_price_usd())
                 if panic and (self.state.get("moon_bags") or self.state.get("stuck")):
                     price = sol_price or self.sol_price_usd()
                     self.liquidate_bags(price, "moon_bags", "panic_moon_bag")

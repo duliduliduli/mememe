@@ -343,11 +343,21 @@ python grad_backtest.py run --output-dir data/mb15_trail --moon-bag 0.15 --trail
 
 If it wins across the sample, set `MOON_BAG` (e.g. `0.15`, capped at `0.5`) on
 the executor: each exit sells the rest and parks the kept tokens in the state
-file's `moon_bags` list (shown on the dashboard's Live panel). Moon bags are
-not actively managed; `panic` liquidates them along with everything else. Note
-the cost: on stop-loss exits the kept fraction usually rides to ~zero, so the
-24h-sale backtest number is the honest measure of whether the occasional
-rerun pays for all the bags that die.
+file's `moon_bags` list (shown on the dashboard's Live panel with their
+current multiple). Two settings decide what happens to a bag afterwards:
+
+- `MOON_BAG_WINNERS_ONLY` (default `1`) keeps a bag only when the exit was
+  profitable. A stop-loss remnant rides to zero and locks 0.002 SOL of rent,
+  so losers are sold in full and their rent reclaimed.
+- `MOON_BAG_TARGET_X` (default `100`) sells a bag once a sell quote is worth
+  that multiple of the value it was kept at (the `MOONBAG` log line states the
+  dollar target). Bags are re-quoted every `MOON_BAG_CHECK_SECONDS` (default
+  60), not every loop. `0` holds forever; `panic` is then the only exit.
+
+`panic` still liquidates every bag along with everything else. Bags live in
+the state file, so without a persistent `/data` volume a redeploy forgets
+them: the restart adopts the tokens as an ordinary position and sells them on
+the time stop.
 
 Control it through the dashboard API (all require the `x-admin-token` header):
 
