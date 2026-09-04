@@ -9,7 +9,8 @@ COPY grad-backtest/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY grad-backtest/grad_backtest.py grad-backtest/position_sizing.py grad-backtest/server.py \
-     grad-backtest/test_grad_backtest.py grad-backtest/test_position_sizing.py grad-backtest/test_server.py ./
+     grad-backtest/executor.py grad-backtest/test_grad_backtest.py \
+     grad-backtest/test_position_sizing.py grad-backtest/test_server.py grad-backtest/test_executor.py ./
 COPY grad-backtest/static static
 COPY grad-backtest/data/graduations.example.csv data/
 

@@ -145,6 +145,45 @@ contains no live executor: never commit or paste wallet private keys anywhere;
 if you later automate execution, use a dedicated burner wallet holding only what
 you can lose, with the key supplied as a runtime environment variable.
 
+## Live executor (paper by default)
+
+`executor.py` trades the strategy in real time: it polls Helius for new
+graduations, enters 30s after migration via Jupiter, and manages each position
+against TP/SL/time-stop using executable Jupiter sell quotes. Two modes:
+
+- **`EXECUTOR_MODE=paper`** (default): real detection, real quotes, simulated
+  fills. No wallet, no key, no risk. Run this first — for days, not minutes —
+  and judge the results on the dashboard's Live panel.
+- **`EXECUTOR_MODE=live`**: signs and sends real swaps. Requires
+  `WALLET_PRIVATE_KEY` — a **burner wallet's** exported private key (Phantom:
+  account settings → Show private key for that one account). NEVER your seed
+  phrase, never your main wallet, never more money than you can lose entirely.
+
+Safety rails enforced in both modes: `ACCOUNT_FRACTION` (default 10%) capped by
+`MAX_POSITION_USD` (default $20), `MAX_CONCURRENT_POSITIONS` (2),
+`DAILY_LOSS_LIMIT_USD` (default $30 — halts new entries until next UTC day),
+`MIN_SOL_RESERVE` kept for fees, and `SLIPPAGE_BPS` (300) on every swap.
+
+Control it through the dashboard API (all require the `x-admin-token` header):
+
+```bash
+curl -X POST .../api/executor/start -H "x-admin-token: $TOK"   # begin trading
+curl -X POST .../api/executor/stop  -H "x-admin-token: $TOK"   # drain: no new buys, manage open positions
+curl -X POST .../api/executor/panic -H "x-admin-token: $TOK"   # sell everything at market NOW
+```
+
+Set `EXECUTOR_AUTOSTART=1` on Railway so the executor restarts with the
+container and resumes managing any open positions from `executor_state.json`.
+Closed trades land in `live_trades.csv` and the dashboard shows a Live panel
+(balance/PnL, open positions, closed trades, executor log) whenever the
+executor has activity. Trades happen on the Solana blockchain via Jupiter
+(`JUPITER_BASE_URL`, default `https://lite-api.jup.ag/swap/v1`); tokens land
+at the wallet's address and are visible in any explorer.
+
+Honest expectations: the backtest exists to tell you whether this strategy has
+an edge. Running live before the backtest says yes means the safety rails are
+limiting how fast you can lose, not making you money.
+
 ## Dashboard
 
 `server.py` serves a public, read-only web dashboard over the result files:

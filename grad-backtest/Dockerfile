@@ -5,7 +5,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY grad_backtest.py position_sizing.py server.py test_grad_backtest.py test_position_sizing.py ./
+COPY grad_backtest.py position_sizing.py server.py executor.py \
+     test_grad_backtest.py test_position_sizing.py test_server.py test_executor.py ./
 COPY static static
 COPY data/graduations.example.csv data/
 

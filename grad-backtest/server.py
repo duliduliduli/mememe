@@ -36,11 +36,15 @@ FIXED_FEE_PER_SIDE = float(os.getenv("FIXED_FEE_PER_SIDE", "0.10"))
 LOG_FILE = DATA_DIR / "run.log"
 
 ALLOWED_STAGES = {"collect", "run", "sizing"}
+EXECUTOR_STATE = DATA_DIR / "executor_state.json"
+EXECUTOR_STOP = DATA_DIR / "executor.stop"
+EXECUTOR_PANIC = DATA_DIR / "executor.panic"
 
 app = FastAPI(title="grad-backtest dashboard", docs_url=None, redoc_url=None)
 
 _job_lock = threading.Lock()
 _job: dict[str, Any] = {"running": False, "stage": None, "started_at": None, "returncode": None}
+_executor_proc: subprocess.Popen | None = None
 
 
 def read_csv(name: str) -> pd.DataFrame:
@@ -195,13 +199,7 @@ def _run_job(argv: list[str], stage: str) -> None:
 
 @app.post("/api/run")
 async def run_job(request: Request) -> JSONResponse:
-    token = os.getenv("ADMIN_TOKEN", "")
-    supplied = request.headers.get("x-admin-token", "")
-    if not token:
-        raise HTTPException(503, "ADMIN_TOKEN is not configured; job launching is disabled")
-    if not hmac.compare_digest(supplied, token):
-        raise HTTPException(401, "bad token")
-
+    _require_admin(request)
     body = await request.json()
     stage = str(body.get("stage", ""))
     if stage not in ALLOWED_STAGES:
@@ -230,6 +228,92 @@ async def run_job(request: Request) -> JSONResponse:
         )
     threading.Thread(target=_run_job, args=(argv, stage), daemon=True).start()
     return JSONResponse({"started": True, "stage": stage})
+
+
+def _require_admin(request: Request) -> None:
+    token = os.getenv("ADMIN_TOKEN", "")
+    if not token:
+        raise HTTPException(503, "ADMIN_TOKEN is not configured")
+    if not hmac.compare_digest(request.headers.get("x-admin-token", ""), token):
+        raise HTTPException(401, "bad token")
+
+
+def _executor_running() -> bool:
+    return _executor_proc is not None and _executor_proc.poll() is None
+
+
+def _start_executor() -> None:
+    global _executor_proc
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    EXECUTOR_STOP.unlink(missing_ok=True)
+    log_fh = (DATA_DIR / "executor.log").open("a")
+    _executor_proc = subprocess.Popen(
+        [sys.executable, "executor.py"], stdout=log_fh, stderr=subprocess.STDOUT, cwd=Path(__file__).parent
+    )
+
+
+@app.get("/api/live")
+def live(limit: int = 100) -> JSONResponse:
+    state = None
+    if EXECUTOR_STATE.exists():
+        try:
+            state = json.loads(EXECUTOR_STATE.read_text())
+        except Exception:
+            state = None
+    trades = read_csv("live_trades.csv")
+    if not trades.empty and "closed_at" in trades.columns:
+        trades = trades.sort_values("closed_at", ascending=False)
+    log_tail: list[str] = []
+    log_path = DATA_DIR / "executor.log"
+    if log_path.exists():
+        log_tail = log_path.read_text(errors="replace").splitlines()[-60:]
+    returns = []
+    if not trades.empty and "net_return" in trades.columns:
+        returns = [float(r) for r in trades["net_return"].dropna()]
+    return JSONResponse(
+        {
+            "running": _executor_running(),
+            "draining": EXECUTOR_STOP.exists() or EXECUTOR_PANIC.exists(),
+            "mode": (state or {}).get("mode"),
+            "state": state,
+            "trades": frame_records(trades.head(limit)),
+            "stats": {
+                "closed_count": len(returns),
+                "win_rate": sum(r > 0 for r in returns) / len(returns) if returns else None,
+                "realized_pnl_usd": float(sum(t.get("exit_usd", 0) - t.get("position_usd", 0) for t in frame_records(trades))) if len(returns) else 0.0,
+            },
+            "log": log_tail,
+        }
+    )
+
+
+@app.post("/api/executor/start")
+def executor_start(request: Request) -> JSONResponse:
+    _require_admin(request)
+    if _executor_running():
+        raise HTTPException(409, "executor already running")
+    _start_executor()
+    return JSONResponse({"started": True, "mode": os.getenv("EXECUTOR_MODE", "paper")})
+
+
+@app.post("/api/executor/stop")
+def executor_stop(request: Request) -> JSONResponse:
+    _require_admin(request)
+    EXECUTOR_STOP.touch()
+    return JSONResponse({"draining": True, "note": "no new entries; open positions still managed until closed"})
+
+
+@app.post("/api/executor/panic")
+def executor_panic(request: Request) -> JSONResponse:
+    _require_admin(request)
+    EXECUTOR_PANIC.touch()
+    return JSONResponse({"panic": True, "note": "selling all open positions at market, then draining"})
+
+
+@app.on_event("startup")
+def maybe_autostart_executor() -> None:
+    if os.getenv("EXECUTOR_AUTOSTART", "0") == "1" and not _executor_running():
+        _start_executor()
 
 
 if __name__ == "__main__":

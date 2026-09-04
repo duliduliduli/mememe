@@ -65,6 +65,7 @@ h1 { font-size: 20px; margin: 0; }
 .sub { color: var(--text-muted); font-size: 12px; }
 .pill { font-size: 12px; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--border); color: var(--text-secondary); }
 .pill.running { color: var(--status-good); border-color: var(--status-good); }
+.pill.down { color: var(--delta-down); border-color: var(--delta-down); }
 .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 16px 0; }
 .tile { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
 .tile .label { color: var(--text-secondary); font-size: 12px; }
@@ -119,6 +120,15 @@ a { color: var(--series-1); }
       <h2>Net return per trade — distribution</h2>
       <div class="note">After proportional costs on both sides</div>
       <div id="histChart"><div class="empty">No trade results yet.</div></div>
+    </div>
+  </div>
+
+  <div class="cards section" id="liveSection" hidden>
+    <div class="card">
+      <h2>Live executor <span class="pill" id="livePill"></span> <span class="pill" id="liveMode"></span></h2>
+      <div class="note" id="liveNote"></div>
+      <div class="kpis" id="liveKpis"></div>
+      <div style="overflow-x:auto"><table id="liveTable"></table></div>
     </div>
   </div>
 
@@ -336,15 +346,58 @@ function renderTable(el, cols, rows, renderCell) {
 
 const shortMint = (m) => m ? String(m).slice(0, 4) + "…" + String(m).slice(-4) : "–";
 
+function renderLive(l) {
+  const section = $("liveSection");
+  const hasAnything = l.running || (l.state && (l.state.positions?.length || l.trades.length));
+  section.hidden = !hasAnything;
+  if (!hasAnything) return;
+  const pill = $("livePill");
+  if (l.running && l.draining) { pill.textContent = "draining"; pill.className = "pill"; }
+  else if (l.running) { pill.textContent = "running"; pill.className = "pill running"; }
+  else { pill.textContent = "stopped"; pill.className = "pill"; }
+  $("liveMode").textContent = l.mode === "live" ? "LIVE MONEY" : "paper trading";
+  $("liveMode").className = l.mode === "live" ? "pill down" : "pill";
+  const open = l.state?.positions || [];
+  $("liveNote").textContent = open.length
+    ? open.length + " open position(s): " + open.map(p => shortMint(p.mint) + " ($" + p.position_usd + ")").join(", ")
+    : "No open positions.";
+  const k = $("liveKpis"); k.replaceChildren();
+  const balance = l.mode === "live" ? null : l.state?.paper_balance_usd;
+  k.append(
+    tile(l.mode === "live" ? "Realized PnL" : "Paper balance",
+         l.mode === "live" ? fmtUsd(l.stats.realized_pnl_usd) : fmtUsd(balance),
+         (l.mode === "live" ? l.stats.realized_pnl_usd : (balance ?? 0) - 100) >= 0 ? "up" : "down"),
+    tile("Closed trades", fmtNum(l.stats.closed_count), ""),
+    tile("Win rate", fmtPct(l.stats.win_rate), ""),
+    tile("Today's PnL", fmtUsd(l.state?.daily?.realized_pnl_usd),
+         (l.state?.daily?.realized_pnl_usd ?? 0) >= 0 ? "up" : "down", "resets at UTC midnight")
+  );
+  renderTable("liveTable",
+    [{k: "closed_at", label: "Closed (UTC)"}, {k: "mint", label: "Token"}, {k: "exit_reason", label: "Exit"},
+     {k: "position_usd", label: "In"}, {k: "exit_usd", label: "Out"}, {k: "net_return", label: "Net"}],
+    l.trades.slice(0, 15),
+    (c, r) => {
+      const td = document.createElement("td");
+      if (c.k === "net_return") { const v = Number(r[c.k]); td.textContent = fmtPct(v); td.className = v > 0 ? "up" : v < 0 ? "down" : ""; }
+      else if (c.k === "mint") { td.textContent = shortMint(r[c.k]); td.className = "mono"; td.title = r[c.k] || ""; }
+      else if (c.k === "position_usd" || c.k === "exit_usd") td.textContent = fmtUsd(r[c.k]);
+      else if (c.k === "closed_at") td.textContent = String(r[c.k] || "–").replace("T", " ").replace("Z", "");
+      else td.textContent = r[c.k] == null ? "–" : String(r[c.k]);
+      return td;
+    });
+}
+
 async function refresh() {
   const app = $("app");
   try {
-    const [o, t, e, a] = await Promise.all([
+    const [o, t, e, a, l] = await Promise.all([
       fetch("/api/overview").then(r => r.json()),
       fetch("/api/trades?limit=25").then(r => r.json()),
       fetch("/api/errors?limit=15").then(r => r.json()),
       fetch("/api/activity?lines=80").then(r => r.json()),
+      fetch("/api/live?limit=50").then(r => r.json()),
     ]);
+    renderLive(l);
     const pill = $("jobPill");
     if (o.job.running) { pill.textContent = "job running: " + o.job.stage; pill.className = "pill running"; }
     else { pill.textContent = "idle"; pill.className = "pill"; }
@@ -380,7 +433,9 @@ async function refresh() {
         else td.textContent = r[c.k] == null ? "–" : String(r[c.k]);
         return td;
       });
-    $("log").textContent = a.log.length ? a.log.join("\n") : "No activity yet.";
+    let logText = a.log.length ? a.log.join("\n") : "No activity yet.";
+    if (l.log && l.log.length) logText += "\n\n--- executor ---\n" + l.log.join("\n");
+    $("log").textContent = logText;
     app.classList.remove("stale");
   } catch (err) {
     app.classList.add("stale");
