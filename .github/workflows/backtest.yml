@@ -1,0 +1,68 @@
+name: Run backtest in the cloud
+
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "Which stage to run"
+        type: choice
+        required: true
+        default: run
+        options:
+          - collect
+          - run
+          - collect-then-run
+      extra_args:
+        description: "Extra CLI flags, e.g. --limit 5 --side-cost 0.02"
+        type: string
+        required: false
+        default: ""
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    defaults:
+      run:
+        working-directory: grad-backtest
+    env:
+      HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+      MIGRATION_ADDRESS: ${{ secrets.MIGRATION_ADDRESS }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: grad-backtest/requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Restore OHLCV cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            grad-backtest/data/cache
+            grad-backtest/data/graduations.csv
+          key: gecko-ohlcv-cache-${{ github.run_id }}
+          restore-keys: gecko-ohlcv-cache-
+
+      - name: Collect graduations
+        if: inputs.command == 'collect' || inputs.command == 'collect-then-run'
+        run: python grad_backtest.py collect ${{ inputs.command == 'collect' && inputs.extra_args || '' }}
+
+      - name: Run backtest
+        if: inputs.command == 'run' || inputs.command == 'collect-then-run'
+        run: python grad_backtest.py run ${{ inputs.command != 'collect' && inputs.extra_args || '' }}
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-results-${{ github.run_number }}
+          path: |
+            grad-backtest/data/**
+            !grad-backtest/data/cache/**
+          if-no-files-found: warn

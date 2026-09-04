@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Grad Backtest</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface-1: #fcfcfb;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #898781;
+  --grid: #e1e0d9;
+  --baseline: #c3c2b7;
+  --border: rgba(11,11,11,0.10);
+  --series-1: #2a78d6;
+  --delta-up: #006300;
+  --delta-down: #d03b3b;
+  --status-good: #0ca30c;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface-1: #1a1a19;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+    --grid: #2c2c2a;
+    --baseline: #383835;
+    --border: rgba(255,255,255,0.10);
+    --series-1: #3987e5;
+    --delta-up: #0ca30c;
+    --delta-down: #d03b3b;
+    --status-good: #0ca30c;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d;
+  --surface-1: #1a1a19;
+  --text-primary: #ffffff;
+  --text-secondary: #c3c2b7;
+  --text-muted: #898781;
+  --grid: #2c2c2a;
+  --baseline: #383835;
+  --border: rgba(255,255,255,0.10);
+  --series-1: #3987e5;
+  --delta-up: #0ca30c;
+  --delta-down: #d03b3b;
+  --status-good: #0ca30c;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--text-primary);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+.wrap { max-width: 1080px; margin: 0 auto; padding: 20px 16px 48px; }
+header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 4px; }
+h1 { font-size: 20px; margin: 0; }
+.sub { color: var(--text-muted); font-size: 12px; }
+.pill { font-size: 12px; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--border); color: var(--text-secondary); }
+.pill.running { color: var(--status-good); border-color: var(--status-good); }
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 16px 0; }
+.tile { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+.tile .label { color: var(--text-secondary); font-size: 12px; }
+.tile .value { font-size: 24px; font-weight: 600; margin-top: 2px; }
+.tile .hint { color: var(--text-muted); font-size: 11px; margin-top: 2px; }
+.up { color: var(--delta-up); }
+.down { color: var(--delta-down); }
+.cards { display: grid; grid-template-columns: 1fr; gap: 12px; }
+@media (min-width: 860px) { .cards.two { grid-template-columns: 3fr 2fr; } }
+.card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
+.card h2 { font-size: 13px; font-weight: 600; margin: 0 0 2px; }
+.card .note { color: var(--text-muted); font-size: 11px; margin-bottom: 8px; }
+svg { display: block; width: 100%; }
+svg text { font: 11px system-ui, -apple-system, "Segoe UI", sans-serif; fill: var(--text-muted); }
+.tooltip {
+  position: fixed; pointer-events: none; z-index: 10; display: none;
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 10px; font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,.15);
+}
+.tooltip .v { font-weight: 600; color: var(--text-primary); }
+.tooltip .k { color: var(--text-secondary); }
+.tooltip .key { display: inline-block; width: 12px; height: 0; border-top: 2px solid var(--series-1); vertical-align: middle; margin-right: 6px; }
+table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+th { text-align: left; color: var(--text-secondary); font-weight: 500; border-bottom: 1px solid var(--baseline); padding: 6px 8px; }
+td { padding: 6px 8px; border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }
+td.mono, .log { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11.5px; }
+.log { white-space: pre-wrap; color: var(--text-secondary); max-height: 260px; overflow-y: auto; margin: 0; }
+.empty { color: var(--text-muted); padding: 16px 0; }
+.section { margin-top: 14px; }
+.stale { opacity: .55; transition: opacity .2s; }
+a { color: var(--series-1); }
+</style>
+</head>
+<body>
+<div class="wrap" id="app">
+  <header>
+    <h1>Grad Backtest</h1>
+    <span class="pill" id="jobPill">loading…</span>
+    <span class="sub" id="updated"></span>
+  </header>
+  <div class="sub">Pump.fun graduation strategy — backtested performance and activity. Research data, not live trading or investment advice.</div>
+
+  <div class="kpis" id="kpis"></div>
+
+  <div class="cards two section">
+    <div class="card">
+      <h2>Simulated equity — $<span id="eqStart">100</span> start</h2>
+      <div class="note" id="eqNote"></div>
+      <div id="equityChart"><div class="empty">No trade results yet.</div></div>
+    </div>
+    <div class="card">
+      <h2>Net return per trade — distribution</h2>
+      <div class="note">After proportional costs on both sides</div>
+      <div id="histChart"><div class="empty">No trade results yet.</div></div>
+    </div>
+  </div>
+
+  <div class="cards section">
+    <div class="card">
+      <h2>Recent trades</h2>
+      <div class="note">Newest first · net return includes entry+exit costs</div>
+      <div style="overflow-x:auto"><table id="tradesTable"></table></div>
+    </div>
+  </div>
+
+  <div class="cards two section">
+    <div class="card">
+      <h2>Activity log</h2>
+      <div class="note">Live output of the most recent job</div>
+      <pre class="log" id="log">No activity yet.</pre>
+    </div>
+    <div class="card">
+      <h2>Skipped tokens</h2>
+      <div class="note">Errors during pool discovery or pricing</div>
+      <div style="overflow-x:auto"><table id="errorsTable"></table></div>
+    </div>
+  </div>
+</div>
+<div class="tooltip" id="tip"></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const tip = $("tip");
+const fmtPct = (x, d = 1) => (x == null || isNaN(x)) ? "–" : (x * 100).toFixed(d) + "%";
+const fmtUsd = (x) => (x == null || isNaN(x)) ? "–" : "$" + Number(x).toLocaleString(undefined, {maximumFractionDigits: 2});
+const fmtNum = (x) => (x == null || isNaN(x)) ? "–" : Number(x).toLocaleString();
+const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+function showTip(html, x, y) {
+  tip.replaceChildren(...html);
+  tip.style.display = "block";
+  const r = tip.getBoundingClientRect();
+  tip.style.left = Math.min(x + 14, window.innerWidth - r.width - 8) + "px";
+  tip.style.top = Math.max(8, y - r.height - 10) + "px";
+}
+function hideTip() { tip.style.display = "none"; }
+function row(strongText, labelText, withKey) {
+  const div = document.createElement("div");
+  if (withKey) { const k = document.createElement("span"); k.className = "key"; div.appendChild(k); }
+  const v = document.createElement("span"); v.className = "v"; v.textContent = strongText;
+  const l = document.createElement("span"); l.className = "k"; l.textContent = labelText ? " " + labelText : "";
+  div.append(v, l);
+  return div;
+}
+function svgEl(tag, attrs) {
+  const el = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+  return el;
+}
+function niceTicks(min, max, count) {
+  if (min === max) { max = min + 1; }
+  const span = max - min, step0 = span / Math.max(1, count);
+  const mag = Math.pow(10, Math.floor(Math.log10(step0)));
+  const step = [1, 2, 5, 10].map(m => m * mag).find(s => span / s <= count) || 10 * mag;
+  const ticks = [];
+  for (let t = Math.ceil(min / step) * step; t <= max + 1e-9; t += step) ticks.push(t);
+  return ticks;
+}
+
+function tile(label, value, cls, hint) {
+  const t = document.createElement("div"); t.className = "tile";
+  const l = document.createElement("div"); l.className = "label"; l.textContent = label;
+  const v = document.createElement("div"); v.className = "value" + (cls ? " " + cls : ""); v.textContent = value;
+  t.append(l, v);
+  if (hint) { const h = document.createElement("div"); h.className = "hint"; h.textContent = hint; t.appendChild(h); }
+  return t;
+}
+
+function renderKpis(o) {
+  const k = $("kpis"); k.replaceChildren();
+  const s = o.stats, eq = o.equity || [];
+  const final = eq.length ? eq[eq.length - 1].balance : null;
+  const ret = final != null ? final / o.config.start_balance - 1 : null;
+  k.append(
+    tile("Simulated balance", fmtUsd(final), ret == null ? "" : (ret >= 0 ? "up" : "down"),
+      ret == null ? "run the backtest to populate" : fmtPct(ret) + " vs start"),
+    tile("Trades", fmtNum(s.trade_count), "", s.error_count ? fmtNum(s.error_count) + " tokens skipped" : ""),
+    tile("Win rate", fmtPct(s.win_rate), "", "trades with positive net return"),
+    tile("Median net / trade", fmtPct(s.median_net_return), s.median_net_return > 0 ? "up" : s.median_net_return < 0 ? "down" : ""),
+    tile("Mean net / trade", fmtPct(s.mean_net_return), s.mean_net_return > 0 ? "up" : s.mean_net_return < 0 ? "down" : ""),
+    tile("Position size", fmtPct(o.config.account_fraction, 0),
+      "", o.config.fraction_source === "sizing_recommendation" ? "from sizing analysis" : "default (run sizing to tune)")
+  );
+}
+
+function renderEquity(points, startBalance) {
+  const host = $("equityChart"); host.replaceChildren();
+  if (!points || points.length < 2) { host.innerHTML = '<div class="empty">No trade results yet.</div>'; return; }
+  const W = 560, H = 240, m = {t: 12, r: 12, b: 22, l: 44};
+  const xs = points.map(p => p.trade);
+  const ys = points.map(p => p.balance);
+  const xMin = 0, xMax = Math.max(...xs);
+  const yMin = Math.min(...ys, startBalance), yMax = Math.max(...ys, startBalance);
+  const pad = (yMax - yMin) * 0.08 || 1;
+  const X = x => m.l + (x - xMin) / (xMax - xMin) * (W - m.l - m.r);
+  const Y = y => m.t + (1 - (y - (yMin - pad)) / ((yMax + pad) - (yMin - pad))) * (H - m.t - m.b);
+  const svg = svgEl("svg", {viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "Simulated account balance over the trade sequence"});
+
+  for (const t of niceTicks(yMin - pad, yMax + pad, 4)) {
+    svg.append(svgEl("line", {x1: m.l, x2: W - m.r, y1: Y(t), y2: Y(t), stroke: css("--grid"), "stroke-width": 1}));
+    const lbl = svgEl("text", {x: m.l - 6, y: Y(t) + 3, "text-anchor": "end"});
+    lbl.textContent = "$" + Math.round(t).toLocaleString();
+    svg.append(lbl);
+  }
+  // start-balance reference
+  svg.append(svgEl("line", {x1: m.l, x2: W - m.r, y1: Y(startBalance), y2: Y(startBalance), stroke: css("--baseline"), "stroke-width": 1, "stroke-dasharray": "none"}));
+  for (const t of niceTicks(0, xMax, 6)) {
+    if (X(t) > W - m.r - 52) continue; // keep clear of the axis caption
+    const lbl = svgEl("text", {x: X(t), y: H - 6, "text-anchor": "middle"});
+    lbl.textContent = Math.round(t);
+    svg.append(lbl);
+  }
+  const xt = svgEl("text", {x: W - m.r, y: H - 6, "text-anchor": "end"}); xt.textContent = "trade #";
+  svg.append(xt);
+
+  const line = points.map((p, i) => (i ? "L" : "M") + X(p.trade).toFixed(1) + " " + Y(p.balance).toFixed(1)).join("");
+  const area = line + `L${X(xMax).toFixed(1)} ${Y(yMin - pad).toFixed(1)}L${X(0).toFixed(1)} ${Y(yMin - pad).toFixed(1)}Z`;
+  svg.append(svgEl("path", {d: area, fill: css("--series-1"), opacity: 0.1}));
+  svg.append(svgEl("path", {d: line, fill: "none", stroke: css("--series-1"), "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round"}));
+  const last = points[points.length - 1];
+  svg.append(svgEl("circle", {cx: X(last.trade), cy: Y(last.balance), r: 4, fill: css("--series-1"), stroke: css("--surface-1"), "stroke-width": 2}));
+  const tail = points.slice(-Math.max(2, Math.round(points.length / 8)));
+  const labelBelow = tail.some(p => p.balance > last.balance);
+  const endLbl = svgEl("text", {x: X(last.trade) - 6, y: Y(last.balance) + (labelBelow ? 16 : -8), "text-anchor": "end", fill: css("--text-secondary"), "font-weight": 600});
+  endLbl.textContent = fmtUsd(last.balance);
+  svg.append(endLbl);
+
+  const cross = svgEl("line", {y1: m.t, y2: H - m.b, stroke: css("--baseline"), "stroke-width": 1, visibility: "hidden"});
+  const dot = svgEl("circle", {r: 4, fill: css("--series-1"), stroke: css("--surface-1"), "stroke-width": 2, visibility: "hidden"});
+  svg.append(cross, dot);
+  svg.addEventListener("pointermove", (ev) => {
+    const rect = svg.getBoundingClientRect();
+    const px = (ev.clientX - rect.left) / rect.width * W;
+    const idx = Math.max(0, Math.min(points.length - 1, Math.round((px - m.l) / (W - m.l - m.r) * (xMax - xMin))));
+    const p = points.find(q => q.trade === idx) || points[points.length - 1];
+    cross.setAttribute("x1", X(p.trade)); cross.setAttribute("x2", X(p.trade));
+    cross.setAttribute("visibility", "visible");
+    dot.setAttribute("cx", X(p.trade)); dot.setAttribute("cy", Y(p.balance));
+    dot.setAttribute("visibility", "visible");
+    const parts = [row(fmtUsd(p.balance), "balance after trade " + p.trade, true)];
+    if (p.net_return != null) parts.push(row(fmtPct(p.net_return), "this trade net"));
+    if (p.timestamp) parts.push(row(String(p.timestamp).replace("T", " ").replace("Z", ""), "entry (UTC)"));
+    showTip(parts, ev.clientX, ev.clientY);
+  });
+  svg.addEventListener("pointerleave", () => { cross.setAttribute("visibility", "hidden"); dot.setAttribute("visibility", "hidden"); hideTip(); });
+  host.append(svg);
+}
+
+function renderHistogram(returns) {
+  const host = $("histChart"); host.replaceChildren();
+  if (!returns || !returns.length) { host.innerHTML = '<div class="empty">No trade results yet.</div>'; return; }
+  const W = 400, H = 240, m = {t: 12, r: 10, b: 24, l: 30};
+  const lo = Math.min(...returns), hi = Math.max(...returns);
+  const nb = Math.min(14, Math.max(6, Math.round(Math.sqrt(returns.length))));
+  const step = (hi - lo) / nb || 0.01;
+  const bins = Array.from({length: nb}, (_, i) => ({x0: lo + i * step, x1: lo + (i + 1) * step, n: 0}));
+  for (const r of returns) bins[Math.min(nb - 1, Math.floor((r - lo) / step))].n++;
+  const maxN = Math.max(...bins.map(b => b.n));
+  const X = i => m.l + i / nb * (W - m.l - m.r);
+  const Y = n => m.t + (1 - n / maxN) * (H - m.t - m.b);
+  const svg = svgEl("svg", {viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "Distribution of net returns per trade"});
+  for (const t of niceTicks(0, maxN, 3)) {
+    svg.append(svgEl("line", {x1: m.l, x2: W - m.r, y1: Y(t), y2: Y(t), stroke: css("--grid"), "stroke-width": 1}));
+    const lbl = svgEl("text", {x: m.l - 5, y: Y(t) + 3, "text-anchor": "end"});
+    lbl.textContent = Math.round(t); svg.append(lbl);
+  }
+  const bw = (W - m.l - m.r) / nb;
+  bins.forEach((b, i) => {
+    const h = (H - m.t - m.b) * b.n / maxN;
+    const bar = svgEl("path", {fill: css("--series-1")});
+    const x = X(i) + 1, w = Math.max(1, bw - 2), yTop = Y(b.n), yBase = H - m.b, r = Math.min(4, w / 2, h);
+    bar.setAttribute("d", h <= 0 ? "" :
+      `M${x} ${yBase}L${x} ${yTop + r}Q${x} ${yTop} ${x + r} ${yTop}L${x + w - r} ${yTop}Q${x + w} ${yTop} ${x + w} ${yTop + r}L${x + w} ${yBase}Z`);
+    const hit = svgEl("rect", {x: X(i), y: m.t, width: bw, height: H - m.t - m.b, fill: "transparent"});
+    hit.addEventListener("pointermove", (ev) => {
+      bar.setAttribute("opacity", "0.8");
+      showTip([row(b.n + (b.n === 1 ? " trade" : " trades"), "", true),
+               row(fmtPct(b.x0, 0) + " to " + fmtPct(b.x1, 0), "net return")], ev.clientX, ev.clientY);
+    });
+    hit.addEventListener("pointerleave", () => { bar.removeAttribute("opacity"); hideTip(); });
+    svg.append(bar, hit);
+  });
+  svg.append(svgEl("line", {x1: m.l, x2: W - m.r, y1: H - m.b, y2: H - m.b, stroke: css("--baseline"), "stroke-width": 1}));
+  [lo, 0, hi].forEach(v => {
+    if (v < lo || v > hi) return;
+    const lbl = svgEl("text", {x: m.l + (v - lo) / (hi - lo || 1) * (W - m.l - m.r), y: H - 8, "text-anchor": "middle"});
+    lbl.textContent = fmtPct(v, 0); svg.append(lbl);
+  });
+  host.append(svg);
+}
+
+function renderTable(el, cols, rows, renderCell) {
+  const table = $(el); table.replaceChildren();
+  if (!rows.length) {
+    const tr = document.createElement("tr"); const td = document.createElement("td");
+    td.className = "empty"; td.colSpan = cols.length; td.textContent = "Nothing yet.";
+    tr.appendChild(td); table.appendChild(tr); return;
+  }
+  const head = document.createElement("tr");
+  for (const c of cols) { const th = document.createElement("th"); th.textContent = c.label; head.appendChild(th); }
+  table.appendChild(head);
+  for (const r of rows) {
+    const tr = document.createElement("tr");
+    for (const c of cols) tr.appendChild(renderCell(c, r));
+    table.appendChild(tr);
+  }
+}
+
+const shortMint = (m) => m ? String(m).slice(0, 4) + "…" + String(m).slice(-4) : "–";
+
+async function refresh() {
+  const app = $("app");
+  try {
+    const [o, t, e, a] = await Promise.all([
+      fetch("/api/overview").then(r => r.json()),
+      fetch("/api/trades?limit=25").then(r => r.json()),
+      fetch("/api/errors?limit=15").then(r => r.json()),
+      fetch("/api/activity?lines=80").then(r => r.json()),
+    ]);
+    const pill = $("jobPill");
+    if (o.job.running) { pill.textContent = "job running: " + o.job.stage; pill.className = "pill running"; }
+    else { pill.textContent = "idle"; pill.className = "pill"; }
+    $("updated").textContent = o.data_updated_at ? "data updated " + o.data_updated_at.replace("T", " ").slice(0, 19) + " UTC" : "no data files yet";
+    $("eqStart").textContent = Math.round(o.config.start_balance);
+    $("eqNote").textContent = `Historical trades replayed at ${fmtPct(o.config.account_fraction, 0)} of balance per trade, ` +
+      `${fmtUsd(o.config.fixed_fee_per_side)} fixed fee per side` +
+      (o.config.fraction_source === "sizing_recommendation" ? " (fraction from sizing analysis)" : "");
+    renderKpis(o);
+    renderEquity(o.equity, o.config.start_balance);
+    renderHistogram(o.returns);
+    renderTable("tradesTable",
+      [{k: "entry_timestamp", label: "Entry (UTC)"}, {k: "mint_address", label: "Token"}, {k: "dex_id", label: "DEX"},
+       {k: "exit_reason", label: "Exit"}, {k: "net_return", label: "Net return"}],
+      t.trades,
+      (c, r) => {
+        const td = document.createElement("td");
+        if (c.k === "net_return") {
+          const v = Number(r[c.k]);
+          td.textContent = fmtPct(v);
+          td.className = v > 0 ? "up" : v < 0 ? "down" : "";
+        } else if (c.k === "mint_address") { td.textContent = shortMint(r[c.k]); td.className = "mono"; td.title = r[c.k] || ""; }
+        else if (c.k === "entry_timestamp") { td.textContent = String(r[c.k] || "–").replace("T", " ").replace("Z", ""); }
+        else td.textContent = r[c.k] == null ? "–" : String(r[c.k]);
+        return td;
+      });
+    renderTable("errorsTable",
+      [{k: "mint_address", label: "Token"}, {k: "error", label: "Reason"}],
+      e.errors,
+      (c, r) => {
+        const td = document.createElement("td");
+        if (c.k === "mint_address") { td.textContent = shortMint(r[c.k]); td.className = "mono"; td.title = r[c.k] || ""; }
+        else td.textContent = r[c.k] == null ? "–" : String(r[c.k]);
+        return td;
+      });
+    $("log").textContent = a.log.length ? a.log.join("\n") : "No activity yet.";
+    app.classList.remove("stale");
+  } catch (err) {
+    app.classList.add("stale");
+  }
+}
+refresh();
+setInterval(refresh, 15000);
+</script>
+</body>
+</html>
