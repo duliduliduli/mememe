@@ -7,7 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY grad_backtest.py position_sizing.py server.py executor.py optimize.py \
      test_grad_backtest.py test_position_sizing.py test_server.py \
-     test_executor.py test_executor_guards.py test_optimize.py test_scale_out.py test_slippage_retry.py ./
+     test_executor.py test_executor_guards.py test_optimize.py test_scale_out.py test_slippage_retry.py test_market_cap.py ./
 COPY static static
 COPY data/graduations.example.csv data/
 
