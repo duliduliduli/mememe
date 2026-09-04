@@ -164,6 +164,19 @@ Safety rails enforced in both modes: `ACCOUNT_FRACTION` (default 10%) capped by
 `DAILY_LOSS_LIMIT_USD` (default $30 — halts new entries until next UTC day),
 `MIN_SOL_RESERVE` kept for fees, and `SLIPPAGE_BPS` (300) on every swap.
 
+Entry guards, applied before every buy:
+
+- **Sellability** — a reverse (sell) route must exist for the token, or the
+  entry is skipped as a possible honeypot.
+- **Price impact** — entries with quoted impact above `MAX_PRICE_IMPACT_PCT`
+  (default 5%) are skipped: the pool is too thin for our size and the real
+  round-trip cost would eat the trade.
+- **Staleness** — an entry more than `MAX_ENTRY_LATENESS_SECONDS` (60s) past
+  its target time is skipped; a late entry is not the trade the backtest models.
+
+Every skipped opportunity is recorded to `skips.csv` with its reason, and each
+trade records its quoted entry price impact, so filters can be tuned from data.
+
 Control it through the dashboard API (all require the `x-admin-token` header):
 
 ```bash

@@ -48,9 +48,11 @@ PANIC_FLAG = DATA_DIR / "executor.panic"
 USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 LAMPORTS = 1_000_000_000
 
+SKIPS_FILE = DATA_DIR / "skips.csv"
+
 TRADE_COLUMNS = [
     "opened_at", "closed_at", "mint", "mode", "position_usd", "exit_usd",
-    "net_return", "exit_reason", "buy_signature", "sell_signature",
+    "net_return", "exit_reason", "buy_signature", "sell_signature", "entry_price_impact_pct",
 ]
 
 
@@ -91,6 +93,8 @@ class Config:
         self.max_entry_age_seconds = float(os.getenv("MAX_ENTRY_AGE_SECONDS", "120"))
         self.slippage_bps = int(os.getenv("SLIPPAGE_BPS", "300"))
         self.poll_seconds = float(os.getenv("POLL_SECONDS", "5"))
+        self.max_price_impact_pct = float(os.getenv("MAX_PRICE_IMPACT_PCT", "5"))
+        self.max_entry_lateness_seconds = float(os.getenv("MAX_ENTRY_LATENESS_SECONDS", "60"))
         self.min_sol_reserve = float(os.getenv("MIN_SOL_RESERVE", "0.05"))
         self.paper_start_balance = float(os.getenv("START_BALANCE", "100"))
         self.wallet_key = os.getenv("WALLET_PRIVATE_KEY") or ""
@@ -136,12 +140,47 @@ def roll_daily(state: dict[str, Any]) -> None:
 
 def record_trade(row: dict[str, Any]) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    columns = TRADE_COLUMNS
     new = not TRADES_FILE.exists()
+    if not new:  # keep appending against whatever header the file already has
+        with TRADES_FILE.open() as fh:
+            existing = fh.readline().strip().split(",")
+        if existing and existing != [""]:
+            columns = existing
     with TRADES_FILE.open("a", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=TRADE_COLUMNS)
+        writer = csv.DictWriter(fh, fieldnames=columns, extrasaction="ignore")
         if new:
             writer.writeheader()
-        writer.writerow({k: row.get(k) for k in TRADE_COLUMNS})
+        writer.writerow({k: row.get(k) for k in columns})
+
+
+def record_skip(mint: str, reason: str) -> None:
+    """Audit trail of everything the bot passed on, and why."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    new = not SKIPS_FILE.exists()
+    with SKIPS_FILE.open("a", newline="") as fh:
+        writer = csv.writer(fh)
+        if new:
+            writer.writerow(["timestamp", "mint", "reason"])
+        writer.writerow([utc_iso(), mint, reason])
+
+
+def quote_price_impact_pct(quote: dict[str, Any]) -> float | None:
+    raw = quote.get("priceImpactPct")
+    try:
+        return abs(float(raw)) * 100 if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def entry_guard_reason(cfg: Config, graduated_ts: float, now: float, price_impact_pct: float | None) -> str | None:
+    """Reject entries that are no longer the trade the backtest models."""
+    lateness = now - (graduated_ts + cfg.entry_delay_seconds)
+    if lateness > cfg.max_entry_lateness_seconds:
+        return f"stale entry: {lateness:.0f}s past target"
+    if price_impact_pct is not None and price_impact_pct > cfg.max_price_impact_pct:
+        return f"price impact {price_impact_pct:.1f}% > {cfg.max_price_impact_pct:.1f}% (pool too thin for our size)"
+    return None
 
 
 def position_size_usd(cfg: Config, equity_usd: float, open_positions: int, daily_pnl: float) -> float:
@@ -314,10 +353,11 @@ class Executor:
             mints = candidate_mints(tx)
             if len(mints) != 1:
                 if mints:
-                    log(f"SKIP ambiguous graduation tx {signature[:16]}… ({len(mints)} candidate mints)")
+                    self.skip(",".join(mints), f"ambiguous graduation tx {signature[:16]}… ({len(mints)} candidate mints)")
                 continue
             age = now_ts() - int(timestamp)
             if age > self.cfg.max_entry_age_seconds:
+                self.skip(mints[0], f"graduation too old at detection ({age:.0f}s)")
                 continue
             enter_at = int(timestamp) + self.cfg.entry_delay_seconds
             self.pending.append({"mint": mints[0], "graduated_ts": int(timestamp), "enter_at": enter_at})
@@ -332,18 +372,33 @@ class Executor:
             raise RuntimeError(f"transaction {signature} not confirmed within timeout")
         return signature
 
+    def skip(self, mint: str, reason: str) -> None:
+        record_skip(mint, reason)
+        log(f"SKIP {mint}: {reason}")
+
     def try_enter(self, item: dict[str, Any], sol_price: float) -> None:
         mint = item["mint"]
         daily_pnl = float(self.state["daily"]["realized_pnl_usd"])
         size_usd = position_size_usd(self.cfg, self.equity_usd(sol_price), len(self.state["positions"]), daily_pnl)
         if size_usd <= 0:
-            log(f"SKIP {mint}: sizing guards (open={len(self.state['positions'])}, daily_pnl={daily_pnl:.2f})")
+            self.skip(mint, f"sizing guards (open={len(self.state['positions'])}, daily_pnl={daily_pnl:.2f})")
             return
         lamports = int(size_usd / sol_price * LAMPORTS)
         quote = self.jup.quote(WSOL, mint, lamports)
         tokens = int(quote["outAmount"])
         if tokens <= 0:
             raise RuntimeError("zero-token quote")
+        impact = quote_price_impact_pct(quote)
+        guard = entry_guard_reason(self.cfg, item["graduated_ts"], now_ts(), impact)
+        if guard:
+            self.skip(mint, guard)
+            return
+        # Honeypot guard: a token you can buy but not sell has no reverse route.
+        try:
+            self.jup.quote(mint, WSOL, tokens)
+        except Exception as exc:
+            self.skip(mint, f"no sell route (possible honeypot): {exc}")
+            return
         buy_sig = ""
         if self.cfg.mode == "live":
             buy_sig = self.execute_swap(quote)
@@ -359,6 +414,7 @@ class Executor:
                 "opened_at": utc_iso(),
                 "graduated_at": utc_iso(item["graduated_ts"]),
                 "buy_signature": buy_sig,
+                "entry_price_impact_pct": impact,
             }
         )
         save_state(self.state)
@@ -397,6 +453,7 @@ class Executor:
                 "exit_reason": reason,
                 "buy_signature": pos.get("buy_signature", ""),
                 "sell_signature": sell_sig,
+                "entry_price_impact_pct": pos.get("entry_price_impact_pct"),
             }
         )
         log(f"EXIT {mint} {reason} ${exit_usd:.2f} ({net:+.1%})")
