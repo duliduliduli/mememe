@@ -65,6 +65,28 @@ def now_ts() -> float:
     return time.time()
 
 
+RATE_LIMIT_BACKOFF = (0.5, 1.0, 2.0, 4.0)
+
+
+def is_rate_limited(exc: BaseException) -> bool:
+    resp = getattr(exc, "response", None)
+    return getattr(resp, "status_code", None) == 429 or " 429 " in f" {exc} "
+
+
+def with_backoff(fn, what: str):
+    """Call fn(); on HTTP 429 wait and retry a few times. Helius and Jupiter's free tiers both
+    answer bursts with 429, and a burst is exactly what startup reconciliation and a busy
+    position loop produce. Anything other than 429 is raised immediately."""
+    for i, delay in enumerate(RATE_LIMIT_BACKOFF):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 - classified below
+            if not is_rate_limited(exc):
+                raise
+            time.sleep(delay)
+    return fn()
+
+
 def utc_iso(epoch: float | None = None) -> str:
     return datetime.fromtimestamp(epoch or now_ts(), tz=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
@@ -327,6 +349,9 @@ class Rpc:
         self.session = requests.Session()
 
     def call(self, method: str, params: list[Any]) -> Any:
+        return with_backoff(lambda: self._call(method, params), method)
+
+    def _call(self, method: str, params: list[Any]) -> Any:
         resp = self.session.post(
             self.cfg.rpc_url,
             json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
@@ -461,6 +486,11 @@ class Jupiter:
     def quote(
         self, input_mint: str, output_mint: str, amount: int, slippage_bps: int | None = None
     ) -> dict[str, Any]:
+        return with_backoff(lambda: self._quote(input_mint, output_mint, amount, slippage_bps), "quote")
+
+    def _quote(
+        self, input_mint: str, output_mint: str, amount: int, slippage_bps: int | None = None
+    ) -> dict[str, Any]:
         resp = self.session.get(
             f"{self.cfg.jupiter_base}/quote",
             params={
@@ -478,6 +508,9 @@ class Jupiter:
         return body
 
     def swap_transaction(self, quote: dict[str, Any], pubkey: str) -> bytes:
+        return with_backoff(lambda: self._swap_transaction(quote, pubkey), "swap")
+
+    def _swap_transaction(self, quote: dict[str, Any], pubkey: str) -> bytes:
         resp = self.session.post(
             f"{self.cfg.jupiter_base}/swap",
             json={
@@ -531,8 +564,15 @@ class Executor:
 
     # ---- pricing helpers -------------------------------------------------
     def sol_price_usd(self) -> float:
+        """SOL/USD from a 1 SOL -> USDC quote, cached for 30s: it only converts position sizes and
+        P&L, and re-quoting it every 5s loop was a third of our Jupiter request budget."""
+        cached = getattr(self, "_sol_price", None)
+        if cached and now_ts() - cached[0] < 30:
+            return cached[1]
         quote = self.jup.quote(WSOL, USDC, LAMPORTS)  # 1 SOL -> USDC (6 decimals)
-        return int(quote["outAmount"]) / 1e6
+        price = int(quote["outAmount"]) / 1e6
+        self._sol_price = (now_ts(), price)
+        return price
 
     def equity_usd(self, sol_price: float) -> float:
         if self.cfg.mode == "paper":
@@ -572,9 +612,21 @@ class Executor:
 
     # ---- trading ---------------------------------------------------------
     def execute_swap(self, quote: dict[str, Any]) -> str:
-        raw = self.jup.swap_transaction(quote, self.wallet.pubkey)
-        signed = self.wallet.sign(raw)
-        signature = self.rpc.send_raw(signed)
+        signature = None
+        for attempt in range(2):
+            raw = self.jup.swap_transaction(quote, self.wallet.pubkey)
+            signed = self.wallet.sign(raw)
+            try:
+                signature = self.rpc.send_raw(signed)
+                break
+            except Exception as exc:
+                # The RPC node had not seen the blockhash Jupiter built the transaction on
+                # (it lags, or the hash expired while we were rate-limited). A fresh build
+                # on the same quote is the fix; anything else is a real failure.
+                if attempt == 0 and "BlockhashNotFound" in str(exc):
+                    time.sleep(1)
+                    continue
+                raise
         if not self.rpc.confirmed(signature):
             raise RuntimeError(f"transaction {signature} not confirmed within timeout")
         return signature
@@ -620,9 +672,12 @@ class Executor:
     def try_enter(self, item: dict[str, Any], sol_price: float) -> None:
         mint = item["mint"]
         daily_pnl = float(self.state["daily"]["realized_pnl_usd"])
-        size_usd = position_size_usd(self.cfg, self.equity_usd(sol_price), len(self.state["positions"]), daily_pnl)
+        # Adopted bags are money already in the market, not a choice we are making now, so they
+        # do not take an entry slot: three $2 leftovers must not block every new graduation.
+        open_slots = sum(1 for p in self.state["positions"] if not p.get("adopted"))
+        size_usd = position_size_usd(self.cfg, self.equity_usd(sol_price), open_slots, daily_pnl)
         if size_usd <= 0:
-            self.skip(mint, f"sizing guards (open={len(self.state['positions'])}, daily_pnl={daily_pnl:.2f})")
+            self.skip(mint, f"sizing guards (open={open_slots}, daily_pnl={daily_pnl:.2f})")
             return
         lamports = int(size_usd / sol_price * LAMPORTS)
         quote = self.jup.quote(WSOL, mint, lamports)
@@ -784,7 +839,7 @@ class Executor:
                     try:
                         self.close_token_account(acct["pubkey"], acct["program"], mint)
                         closed += 1
-                        time.sleep(0.2)
+                        time.sleep(1.0)  # each close is two RPC calls; stay under the rate limit
                     except Exception as exc:
                         log(f"WARN could not close empty account {acct['pubkey'][:8]}…: {describe_error(exc)}")
                 continue
