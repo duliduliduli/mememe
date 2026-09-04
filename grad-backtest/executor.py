@@ -131,7 +131,7 @@ class Config:
         self.account_fraction = float(os.getenv("ACCOUNT_FRACTION", "0.10"))
         self.max_position_usd = float(os.getenv("MAX_POSITION_USD", "20"))
         self.min_position_usd = float(os.getenv("MIN_POSITION_USD", "5"))
-        self.max_concurrent = int(os.getenv("MAX_CONCURRENT_POSITIONS", "2"))
+        self.max_concurrent = int(os.getenv("MAX_CONCURRENT_POSITIONS", "5"))
         self.daily_loss_limit_usd = float(os.getenv("DAILY_LOSS_LIMIT_USD", "30"))
         self.take_profit = float(os.getenv("TAKE_PROFIT", "0.75"))
         self.stop_loss = float(os.getenv("STOP_LOSS", "0.30"))
@@ -1432,7 +1432,7 @@ class Executor:
 
     def run(self) -> None:
         log(f"executor starting: mode={self.cfg.mode} fraction={self.cfg.account_fraction} "
-            f"max_pos=${self.cfg.max_position_usd} tp=+{self.cfg.take_profit:.0%} sl=-{self.cfg.stop_loss:.0%} "
+            f"max_pos=${self.cfg.max_position_usd} slots={self.cfg.max_concurrent} tp=+{self.cfg.take_profit:.0%} sl=-{self.cfg.stop_loss:.0%} "
             f"time_stop={self.cfg.time_stop_minutes:.0f}m trail={self.cfg.trailing_stop:.0%} "
             f"scale_out={self.cfg.scale_out_at:.0%}x{self.cfg.scale_out_fraction:.0%} moon_bag={self.cfg.moon_bag:.0%}"
             f"{'(winners only)' if self.cfg.moon_bag_winners_only else ''}"
