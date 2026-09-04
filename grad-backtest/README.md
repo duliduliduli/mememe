@@ -367,7 +367,7 @@ entry can land.
    - token supply → implied market cap = supply × (USD in ÷ tokens out), i.e. the price we would actually pay;
    - mint creation time via `getSignaturesForAddress` with early stop → curve age = graduation − creation;
    - largest plain-wallet holder via `getTokenLargestAccounts` plus two `getMultipleAccounts` calls, ignoring program-owned accounts (the pool, the bonding curve, the Mayhem vault) and our own wallet.
-   - a mandatory bundle snapshot over the largest plain-wallet holders: same-slot purchases, first-three-slot purchases, top-ten concentration, common non-CEX funders, and the creator-linked cluster. Holder histories are fetched concurrently from Helius. With `BUNDLE_FAIL_CLOSED=1`, missing supply, creation history, purchase history, or insufficient funder coverage skips the entry.
+   - a mandatory bundle snapshot over the largest plain-wallet holders: same-slot purchases, first-three-slot purchases, top-ten concentration, common non-CEX funders, and the creator-linked cluster. Holder histories are fetched concurrently from Helius. With `BUNDLE_FAIL_CLOSED=1`, missing supply, creation history, purchase history, or funder coverage below `MIN_FUNDER_COVERAGE_PCT` (30% by default) skips the entry.
 4. **`entry_guard_reason`**, first hit wins:
    1. lateness > `MAX_ENTRY_LATENESS_SECONDS` → `stale entry: Ns past target`
    2. price impact > `MAX_PRICE_IMPACT_PCT` → `price impact X% > 5.0% (pool too thin for our size)`
