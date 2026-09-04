@@ -1,0 +1,146 @@
+# Graduation Backtest Starter
+
+Research pipeline for Pump.fun tokens after migration to PumpSwap or Raydium:
+
+1. Collect graduation candidates from a verified migration address with Helius.
+2. Discover each token's migration pool and fetch historical OHLCV from GeckoTerminal.
+3. Estimate entry at migration +30 seconds, then simulate +75% TP / -30% SL / 30-minute time stop.
+4. Charge configurable costs on **both** entry and exit and write an audit-friendly summary.
+
+This is research software, not investment advice or a production trading executor.
+
+## Install
+
+```bash
+cd grad-backtest
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+Set the credentials without putting secrets in the code:
+
+```bash
+export HELIUS_API_KEY='your_key'
+export MIGRATION_ADDRESS='current_verified_migration_authority'
+```
+
+The migration address is deliberately not hard-coded because Pump.fun has changed its migration path over time. Verify the address for the exact venue and week you are testing.
+
+## Step 2: collect graduations
+
+```bash
+python grad_backtest.py collect \
+  --count 500 \
+  --start-time 2026-08-01T00:00:00Z \
+  --end-time 2026-08-08T00:00:00Z
+```
+
+This writes `data/graduations.csv`. Transactions containing exactly one unknown non-quote mint are marked `confirmed`; transactions with multiple candidate mints are marked `needs_review`. Review those signatures by hand. The pricing command skips them unless `--include-needs-review` is supplied.
+
+If you obtain a cleaner graduation list from Bitquery or another source, skip collection and provide a CSV containing:
+
+```csv
+mint_address,graduation_timestamp
+TOKEN_MINT,2026-08-01T12:00:00Z
+```
+
+## Steps 3-4: prices and trade simulation
+
+Start with five rows to validate the setup:
+
+```bash
+python grad_backtest.py run --limit 5
+```
+
+Then run the full file:
+
+```bash
+python grad_backtest.py run
+```
+
+Defaults:
+
+- entry delay: 30 seconds
+- take profit: +75%
+- stop loss: -30%
+- time stop: 30 minutes
+- friction: 3% on entry and 3% on exit (5.83% loss if price is flat)
+- API pace: 9 requests/minute for GeckoTerminal's keyless endpoint
+
+Example sensitivity runs:
+
+```bash
+python grad_backtest.py run --output-dir data/cost_2pct --side-cost 0.02
+python grad_backtest.py run --output-dir data/cost_4pct --side-cost 0.04
+```
+
+## Outputs
+
+- `trade_results.csv`: strategy result per token
+- `hold_30m_results.csv`: simple 30-minute hold comparison
+- `price_snapshots.csv`: migration, +1m, +5m, +30m, +2h, +24h
+- `summary.json`: median, mean, win rate, top-five concentration, top-five removal, and TP/SL vs hold
+- `errors.csv`: skipped tokens and reasons
+- `cache/`: resumable raw normalized candles per mint
+
+## Methodology caveats
+
+- GeckoTerminal OHLCV is aggregated market data, not executable quotes for your order size. The cost setting is only a coarse slippage/fee model.
+- Entry uses the open of the first available 30-second candle at or after the +30-second target. It records that candle timestamp so latency can be audited.
+- A one-minute candle does not reveal whether its high or low occurred first. When both TP and SL are crossed in the same candle, the backtest assumes the stop loss happened first and flags the row.
+- Empty intervals are filled from the previous close by the API. Tokens with missing early candles fail instead of silently using a distant price.
+- Pool discovery only accepts Pump/Raydium pools created within six hours of the migration timestamp.
+- Survivorship and data-availability bias remain possible. Check failed/missing tokens, not just successful rows.
+- At the public keyless limit, 500 tokens can take hours. The cache lets you stop and resume safely.
+
+## Test
+
+```bash
+python -m unittest -v
+```
+
+## Running in the cloud
+
+### GitHub Actions (no infrastructure needed)
+
+The repo ships a manual workflow at `.github/workflows/backtest.yml`.
+
+1. In the GitHub repo, go to **Settings → Secrets and variables → Actions** and add
+   `HELIUS_API_KEY` and `MIGRATION_ADDRESS` as repository secrets.
+2. Go to **Actions → "Run backtest in the cloud" → Run workflow**.
+3. Pick a stage (`collect`, `run`, or `collect-then-run`) and optionally pass extra
+   flags such as `--limit 5 --side-cost 0.02`.
+4. When the job finishes, download `backtest-results-*` from the run's **Artifacts**
+   section — it contains `trade_results.csv`, `summary.json`, and the rest.
+
+The OHLCV cache and the collected `graduations.csv` are persisted between workflow
+runs via the Actions cache, so you can `collect` once and then do several `run`
+sensitivity passes. GitHub-hosted jobs are capped at 6 hours; at the keyless
+GeckoTerminal rate a full 500-token run fits, but use `--limit` first to validate.
+
+### Railway
+
+The folder includes a `Dockerfile` and `railway.json` (Dockerfile build, no restart
+on exit — this is a batch job, not a server).
+
+1. Create a new Railway project → **Deploy from GitHub repo** and pick this repo.
+2. In the service settings, set **Root Directory** to `grad-backtest`.
+3. Add environment variables:
+   - `HELIUS_API_KEY`
+   - `MIGRATION_ADDRESS`
+   - `BACKTEST_COMMAND` — the subcommand and flags to execute, e.g.
+     `run --limit 5` or `collect --count 500`. Defaults to `run`.
+4. (Recommended) Attach a **Volume** mounted at `/app/data` so collected CSVs,
+   the OHLCV cache, and results survive between deploys.
+5. Deploy. Each deploy executes the command once and exits; check the deploy logs
+   for the printed summary, and read result files from the volume (e.g. via
+   `railway run` / `railway ssh`, or by setting `BACKTEST_COMMAND` to a follow-up run).
+
+The same image works on any container host (Fly.io, Cloud Run jobs, a plain VPS):
+
+```bash
+docker build -t grad-backtest grad-backtest/
+docker run --rm -e HELIUS_API_KEY=... -e MIGRATION_ADDRESS=... \
+  -e BACKTEST_COMMAND="run --limit 5" -v "$PWD/data:/app/data" grad-backtest
+```
