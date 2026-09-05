@@ -35,6 +35,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -632,9 +633,26 @@ def normalize_rpc_transaction(tx: dict[str, Any], signature: str = "") -> dict[s
     }
 
 
-def entry_market_cap_usd(size_usd: float, out_amount_raw: int, supply_ui: float, decimals: int) -> float | None:
-    """Market cap implied by the executable buy quote: the USD we put in divided by the tokens
-    we actually receive is the price we are really paying, times circulating supply."""
+def entry_market_cap_usd(
+    size_usd: float,
+    out_amount_raw: int,
+    supply_ui: float,
+    decimals: int,
+    supply_raw: int | None = None,
+) -> float | None:
+    """Fully-diluted value implied by the executable buy quote.
+
+    When raw supply is available, decimals cancel because both the Jupiter output and
+    mint supply use the token's base units.  Keeping this path integer-based prevents a
+    bad decimal conversion or a rounded ``uiAmount`` from manufacturing a huge value.
+    The UI-unit path remains for backtests and older callers.
+    """
+    if out_amount_raw <= 0:
+        return None
+    if supply_raw is not None:
+        if supply_raw <= 0:
+            return None
+        return float(Decimal(str(size_usd)) * Decimal(supply_raw) / Decimal(out_amount_raw))
     tokens_ui = out_amount_raw / (10 ** decimals)
     if tokens_ui <= 0 or supply_ui <= 0:
         return None
@@ -922,10 +940,27 @@ class Rpc:
                 )
         return out
 
-    def token_supply(self, mint: str) -> tuple[float, int]:
-        """(circulating supply in UI units, decimals) for a mint."""
+    def token_supply_details(self, mint: str) -> tuple[float, int, int]:
+        """Validated ``(UI supply, decimals, raw supply)`` for a mint."""
         value = self.call("getTokenSupply", [mint])["value"]
-        return float(value["uiAmountString"]), int(value["decimals"])
+        raw = int(value["amount"])
+        decimals = int(value["decimals"])
+        ui_text = str(value["uiAmountString"])
+        try:
+            ui_decimal = Decimal(ui_text)
+        except InvalidOperation as exc:
+            raise RuntimeError("invalid token supply UI amount") from exc
+        expected_ui = Decimal(raw).scaleb(-decimals)
+        if ui_decimal != expected_ui:
+            raise RuntimeError(
+                f"inconsistent token supply: raw={raw} decimals={decimals} ui={ui_text}"
+            )
+        return float(ui_decimal), decimals, raw
+
+    def token_supply(self, mint: str) -> tuple[float, int]:
+        """Compatibility view: ``(supply in UI units, decimals)``."""
+        supply_ui, decimals, _ = self.token_supply_details(mint)
+        return supply_ui, decimals
 
     def mint_first_seen(self, mint: str, stop_before_ts: float, max_pages: int = 3) -> float | None:
         """Return verified creation only; never reuse a lower-bound activity timestamp.
@@ -1876,14 +1911,18 @@ class Executor:
         cfg = self.cfg
         market_cap = curve_age = top_holder_pct = None
         top_holder = None
-        supply_ui = decimals = None
+        supply_ui = decimals = supply_raw = None
         not_analyzed = {"complete": False, "error": "earlier entry guard rejected; bundle not analyzed"}
         if cfg.max_entry_market_cap_usd > 0 or cfg.min_entry_market_cap_usd > 0 or cfg.max_top_holder_pct > 0:
             try:
-                supply_ui, decimals = self.rpc.token_supply(mint)
-                market_cap = entry_market_cap_usd(size_usd, tokens, supply_ui, decimals)
-                log(f"VALUATION mint={mint} basis=buy_quote_total_supply size_usd={size_usd:.8g} "
-                    f"out_amount_raw={tokens} supply_ui={supply_ui:.16g} decimals={decimals} value_usd={market_cap}")
+                supply_ui, decimals, supply_raw = self.rpc.token_supply_details(mint)
+                market_cap = entry_market_cap_usd(
+                    size_usd, tokens, supply_ui, decimals, supply_raw=supply_raw
+                )
+                tokens_ui = Decimal(tokens).scaleb(-decimals)
+                log(f"VALUATION mint={mint} basis=buy_quote_raw_supply size_usd={size_usd:.8g} "
+                    f"out_amount_raw={tokens} out_amount_ui={tokens_ui} supply_raw={supply_raw} "
+                    f"supply_ui={supply_ui:.16g} decimals={decimals} value_usd={market_cap}")
             except Exception as exc:
                 log(f"WARN {mint}: market cap check unavailable ({describe_error(exc)})")
         if entry_guard_reason(cfg, graduated_ts, now_ts(), None, market_cap):
@@ -1903,7 +1942,8 @@ class Executor:
                 holder = self.rpc.top_wallet_holder(mint, exclude)
                 if holder:
                     top_holder, amount = holder
-                    top_holder_pct = amount / (10 ** decimals) / supply_ui * 100
+                    # Raw/raw is exact and cannot be skewed by token decimals.
+                    top_holder_pct = amount / supply_raw * 100
             except Exception as exc:
                 log(f"WARN {mint}: holder concentration check unavailable ({describe_error(exc)})")
         if entry_guard_reason(cfg, graduated_ts, now_ts(), None, market_cap, curve_age, top_holder_pct):
