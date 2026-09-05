@@ -1029,7 +1029,12 @@ class Rpc:
         # and could never reach the curve window on an active launch.
         page_size = 1000 if gte else 100
         options["limit"] = page_size
-        body_limit = 500 if gte else limit
+        # A healthy, busy launch can exceed 500 successful curve transactions in the
+        # roughly two-minute observation window. Rejecting it solely because activity
+        # was high starves the bundle gate of exactly the launches it should analyze.
+        # One full RPC signature page remains a hard upper bound so this work cannot
+        # grow without limit.
+        body_limit = 1000 if gte else limit
         started = time.monotonic()
         deadline = started + 5.0
         signatures = []
@@ -1097,7 +1102,10 @@ class Rpc:
         # A covered curve window must be decoded in full, never truncated into an
         # apparently clean snapshot. Bound work between batches to protect exits.
         bodies = []
-        decode_deadline = time.monotonic() + 8.0
+        # Keep the old eight-second budget for ordinary launches, while allowing a
+        # full 1,000-row window enough time to finish its bounded RPC batches.
+        batch_count = (len(calls) + self.cfg.rpc_batch_size - 1) // self.cfg.rpc_batch_size
+        decode_deadline = time.monotonic() + min(20.0, max(8.0, batch_count * 0.5))
         for start in range(0, len(calls), self.cfg.rpc_batch_size):
             remaining = decode_deadline - time.monotonic()
             if remaining <= 0:
