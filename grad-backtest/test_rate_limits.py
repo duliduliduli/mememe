@@ -624,7 +624,10 @@ class AdoptedSlotTests(unittest.TestCase):
         ex.jup.quote = lambda a, b, amt, **kw: {"outAmount": "150000000000", "priceImpactPct": "0.01"}
         ex.rpc.mint_first_seen = lambda mint, cutoff: 800.0
         ex.rpc.call = lambda m, params: {
-            "getTokenSupply": {"value": {"uiAmountString": "1000000000", "decimals": 6}},
+            "getTokenSupply": {"value": {
+                "amount": "1000000000000000",
+                "uiAmountString": "1000000000", "decimals": 6,
+            }},
             "getSignaturesForAddress": [{"signature": "s", "blockTime": 1}],
             "getTokenLargestAccounts": {"value": []},
         }[m]
