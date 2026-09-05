@@ -23,6 +23,67 @@ GRAD = 1000.0
 ENTRY = GRAD + 30
 
 
+class MetadataOrderingTests(unittest.TestCase):
+    def setUp(self):
+        self.ex, patcher = fresh()
+        self.addCleanup(patcher.stop)
+        clock = mock.patch.object(self.ex, "now_ts", return_value=ENTRY)
+        clock.start()
+        self.addCleanup(clock.stop)
+        self.bot = self.ex.Executor(self.ex.Config())
+        self.bot.rpc = mock.Mock()
+        self.bot.rpc.token_supply.return_value = (1_000_000, 0)
+        self.bot.rpc.mint_first_seen.return_value = GRAD - 120
+        self.bot.rpc.top_wallet_holder.return_value = ("holder", 100_000)
+        self.bot.rpc.bundle_snapshot.return_value = {"complete": True}
+
+    def metadata(self, tokens=100):
+        return self.bot.entry_metadata("mint", GRAD, 5, tokens)
+
+    def test_market_cap_rejection_skips_all_later_metadata(self):
+        result = self.metadata(tokens=1)
+        self.assertEqual(result[0], 5_000_000)
+        self.bot.rpc.mint_first_seen.assert_not_called()
+        self.bot.rpc.top_wallet_holder.assert_not_called()
+        self.bot.rpc.bundle_snapshot.assert_not_called()
+
+    def test_short_curve_skips_holder_and_funding_work(self):
+        for age in (0, 1, 119):
+            with self.subTest(age=age):
+                self.bot.rpc.mint_first_seen.return_value = GRAD - age
+                result = self.metadata()
+                self.assertEqual(result[1], age)
+                self.assertFalse(result[4]["complete"])
+        self.bot.rpc.top_wallet_holder.assert_not_called()
+        self.bot.rpc.bundle_snapshot.assert_not_called()
+
+    def test_concentrated_holder_skips_bundle(self):
+        self.bot.rpc.top_wallet_holder.return_value = ("whale", 300_000)
+        result = self.metadata()
+        self.assertEqual(result[2:4], (30, "whale"))
+        self.bot.rpc.bundle_snapshot.assert_not_called()
+
+    def test_eligible_candidate_still_gets_mandatory_bundle(self):
+        result = self.metadata()
+        self.assertTrue(result[4]["complete"])
+        self.bot.rpc.bundle_snapshot.assert_called_once()
+        self.assertEqual([c[0] for c in self.bot.rpc.method_calls],
+                         ["token_supply", "mint_first_seen", "top_wallet_holder", "bundle_snapshot"])
+
+    def test_unknown_curve_stays_incomplete(self):
+        self.bot.rpc.mint_first_seen.return_value = None
+        result = self.metadata()
+        self.assertFalse(result[4]["complete"])
+        self.assertEqual(result[4]["error"], "creation time unavailable")
+        self.bot.rpc.bundle_snapshot.assert_not_called()
+
+    def test_stale_during_curve_lookup_skips_bundle(self):
+        with mock.patch.object(self.ex, "now_ts", side_effect=[ENTRY, ENTRY + 61]):
+            self.metadata()
+        self.bot.rpc.top_wallet_holder.assert_not_called()
+        self.bot.rpc.bundle_snapshot.assert_not_called()
+
+
 class FloorGuardTests(unittest.TestCase):
     def test_defaults(self):
         executor, p = fresh()
