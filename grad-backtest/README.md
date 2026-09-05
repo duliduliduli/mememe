@@ -272,6 +272,25 @@ variables taking precedence. Use provider-issued endpoints for sustained operati
 
 ### 4.5 Swaps, slippage, retries
 
+Operational logs are enabled without additional environment variables:
+
+- `HEARTBEAT` every 30 seconds while the main loop advances: subscription status,
+  cumulative notifications/errors/dropped hints, queue depth, last notification and
+  successful HTTP scan ages, pending entries, tracked bags, draining and cooldown status.
+- `SCAN start`, `SCAN fetched`, `SCAN complete` for each HTTP catch-up, including empty
+  results, already-seen signatures, failed transactions, newest transaction age, host,
+  and elapsed time. A fetch start without completion localizes a stalled operation.
+- `STREAM` summarizes queued WebSocket signatures drained by the executor.
+- `DECODE fetching` and `DECODE result` identify missing transaction data/timestamps,
+  no candidate mint, ambiguous candidates, duplicate holdings, old events, or queued entries.
+- `ENTRY checking` records evaluation start; existing `SKIP`/`BUNDLE`/trade logs record decisions.
+- `POSITION` every 30 seconds per managed holding reports its existing executable sell
+  quote, remaining basis, take-profit/stop-loss values, peak, scale-out state, and age.
+
+These messages add no network calls and do not change entry or exit decisions.
+Heartbeat silence can mean the main loop is blocked; a connected WebSocket alone does
+not establish that graduations are being detected. Counters reset on process restart.
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `SLIPPAGE_BPS` | `1000` | Buy slippage tolerance (10%). Also used for position valuation quotes. |
