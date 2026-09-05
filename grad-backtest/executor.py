@@ -439,7 +439,12 @@ def describe_error(exc: BaseException) -> str:
 
 
 def rpc_account_keys(tx: dict[str, Any]) -> list[str]:
-    message = ((tx.get("transaction") or {}).get("message") or {})
+    transaction = tx.get("transaction")
+    if not isinstance(transaction, dict):
+        return []
+    message = transaction.get("message")
+    if not isinstance(message, dict):
+        return []
     keys: list[str] = []
     for item in message.get("accountKeys") or []:
         keys.append(str(item.get("pubkey")) if isinstance(item, dict) else str(item))
@@ -447,10 +452,18 @@ def rpc_account_keys(tx: dict[str, Any]) -> list[str]:
 
 
 def rpc_instructions(tx: dict[str, Any]) -> list[dict[str, Any]]:
-    message = ((tx.get("transaction") or {}).get("message") or {})
+    transaction = tx.get("transaction")
+    if not isinstance(transaction, dict):
+        return []
+    message = transaction.get("message")
+    if not isinstance(message, dict):
+        return []
     instructions = list(message.get("instructions") or [])
-    for group in (tx.get("meta") or {}).get("innerInstructions") or []:
-        instructions.extend(group.get("instructions") or [])
+    meta = tx.get("meta")
+    if isinstance(meta, dict):
+        for group in meta.get("innerInstructions") or []:
+            if isinstance(group, dict):
+                instructions.extend(group.get("instructions") or [])
     return [item for item in instructions if isinstance(item, dict)]
 
 
@@ -553,12 +566,18 @@ def normalize_rpc_transaction(tx: dict[str, Any], signature: str = "") -> dict[s
     """Convert standard jsonParsed transaction data into the small normalized shape used by
     the bundle detector. This intentionally reconstructs only evidence we consume."""
     keys = rpc_account_keys(tx)
-    meta = tx.get("meta") or {}
+    meta = tx.get("meta")
+    if not isinstance(meta, dict):
+        meta = {}
     fee_payer = keys[0] if keys else None
     native_transfers: list[dict[str, Any]] = []
     for instruction in rpc_instructions(tx):
-        parsed = instruction.get("parsed") or {}
-        info = parsed.get("info") or {}
+        parsed = instruction.get("parsed")
+        if not isinstance(parsed, dict):
+            continue
+        info = parsed.get("info")
+        if not isinstance(info, dict):
+            continue
         if instruction.get("program") != "system" or parsed.get("type") not in ("transfer", "transferWithSeed"):
             continue
         source = info.get("source")
@@ -572,9 +591,13 @@ def normalize_rpc_transaction(tx: dict[str, Any], signature: str = "") -> dict[s
     def token_balances(rows: list[dict[str, Any]]) -> dict[tuple[int, str], dict[str, Any]]:
         out: dict[tuple[int, str], dict[str, Any]] = {}
         for row in rows:
+            if not isinstance(row, dict):
+                continue
             mint = row.get("mint")
             index = row.get("accountIndex")
-            token = row.get("uiTokenAmount") or {}
+            token = row.get("uiTokenAmount")
+            if not isinstance(token, dict):
+                continue
             if mint is None or index is None:
                 continue
             out[(int(index), mint)] = {
@@ -1322,14 +1345,21 @@ class Rpc:
         wallet_amounts = {wallet: raw / (10 ** decimals) for wallet, raw in holders}
         holder_set = set(wallet_amounts)
         history_address = bonding_curve_address(mint) if self.cfg.transaction_history_mode == 'raw' else mint
+        history_params: dict[str, Any] = {
+            "sort-order": "asc",
+            "gte-time": int(created_ts) - 2,
+            "lte-time": int(graduated_ts + self.cfg.entry_delay_seconds) + 2,
+            "limit": 100,
+        }
+        if self.cfg.transaction_history_mode == 'raw':
+            # Creation lookup already searches this deeply. Bundle analysis must cover
+            # the same curve lifetime instead of reintroducing the old 3,000-signature
+            # ceiling after creation was found. raw_transactions retains its five-second
+            # signature-search deadline and bounded transaction decode budget.
+            history_params["max-pages"] = 30
         transactions = self.enhanced_transactions(
             history_address,
-            **{
-                "sort-order": "asc",
-                "gte-time": int(created_ts) - 2,
-                "lte-time": int(graduated_ts + self.cfg.entry_delay_seconds) + 2,
-                "limit": 100,
-            },
+            **history_params,
         )
         buys: list[dict[str, Any]] = []
         transfer_edges: list[tuple[str, str]] = []

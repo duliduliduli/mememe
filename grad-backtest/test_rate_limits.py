@@ -417,6 +417,25 @@ class MigrationRegressionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "batch missing"):
             rpc.batch_call([("getTransaction", ["sig"])])
 
+    def test_string_parsed_instruction_does_not_crash_normalization(self):
+        rpc = self.ex.Rpc(self.ex.Config())
+        rpc.call = mock.Mock(return_value=[{"signature": "sig", "blockTime": 100}])
+        rpc.batch_call = mock.Mock(return_value=[{
+            "slot": 1,
+            "blockTime": 100,
+            "meta": {"err": None, "preTokenBalances": [], "postTokenBalances": []},
+            "transaction": {"message": {
+                "accountKeys": ["payer"],
+                "instructions": [{"program": "unknown", "parsed": "unavailable"}],
+            }},
+        }])
+
+        result = rpc.raw_transactions("curve", **{"gte-time": 90, "lte-time": 110})
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["signature"], "sig")
+        self.assertEqual(result[0]["nativeTransfers"], [])
+
     def test_history_pages_to_requested_time_window(self):
         rpc = self.ex.Rpc(self.ex.Config())
         page = [{"signature": str(i), "blockTime": 200} for i in range(1000)]
