@@ -1325,6 +1325,11 @@ class MigrationStream:
         self.thread: threading.Thread | None = None
         self.connected = False
 
+        self.notifications = 0
+        self.failed_notifications = 0
+        self.dropped_signatures = 0
+        self.last_notification_ts = 0.0
+
     def start(self) -> None:
         if self.thread and self.thread.is_alive():
             return
@@ -1385,11 +1390,17 @@ class MigrationStream:
                         continue
                     value = (((body.get("params") or {}).get("result") or {}).get("value") or {})
                     signature = value.get("signature")
+                    if signature:
+                        self.notifications += 1
+                        self.last_notification_ts = now_ts()
+                        if value.get("err"):
+                            self.failed_notifications += 1
                     if not signature or value.get("err"):
                         continue
                     try:
                         self.signatures.put_nowait(signature)
                     except queue.Full:
+                        self.dropped_signatures += 1
                         # Catch-up polling is authoritative; dropping the oldest live hint is safe.
                         try:
                             self.signatures.get_nowait()
@@ -1457,6 +1468,10 @@ class Executor:
         self.state["mode"] = cfg.mode
         self.migration_stream: MigrationStream | None = None
         self._next_discovery_catchup = 0.0
+        self._next_heartbeat = 0.0
+        self._last_scan_ts = 0.0
+        self._discovery_counts: dict[str, int] = {}
+        self._next_position_log: dict[str, float] = {}
         # Keep pending entries in the persisted state.  A deploy should not silently forget the
         # queue and then rediscover/process an unbounded burst before checking open positions.
         self.pending: list[dict[str, Any]] = self.state.setdefault("pending", [])
@@ -1498,18 +1513,50 @@ class Executor:
     # Compatibility for callers/tests deployed during the Helius-only rollout.
     note_helius_rate_limit = note_provider_rate_limit
 
+    def discovery_result(self, signature: str, outcome: str) -> None:
+        self._discovery_counts[outcome] = self._discovery_counts.get(outcome, 0) + 1
+        log(f"DECODE signature={signature} result={outcome}")
+
+    def log_heartbeat(self) -> None:
+        now = now_ts()
+        if now < self._next_heartbeat:
+            return
+        self._next_heartbeat = now + 30.0
+        stream = self.migration_stream
+        ws = "off" if stream is None else ("connected" if stream.connected else "disconnected")
+        scan_age = f"{now - self._last_scan_ts:.0f}s" if self._last_scan_ts else "never"
+        event_ts = getattr(stream, "last_notification_ts", 0)
+        event_age = f"{now - event_ts:.0f}s" if event_ts else "never"
+        cooldown = max(0.0, float(getattr(self, "_provider_cooldown_until", 0)) - now)
+        log(
+            f"HEARTBEAT ws={ws} notifications={getattr(stream, 'notifications', 0)} "
+            f"failed_notifications={getattr(stream, 'failed_notifications', 0)} "
+            f"ws_queue={stream.signatures.qsize() if stream else 0} "
+            f"dropped={getattr(stream, 'dropped_signatures', 0)} last_event={event_age} "
+            f"last_scan={scan_age} pending={len(self.pending)} "
+            f"positions={len(self.state['positions'])} stuck={len(self.state.get('stuck', []))} "
+            f"moon_bags={len(self.state.get('moon_bags', []))} "
+            f"draining={self.state.get('draining', False)} cooldown={cooldown:.0f}s "
+            f"reconcile_pending={getattr(self, '_reconcile_pending', False)} "
+            f"decode_totals={json.dumps(self._discovery_counts, sort_keys=True)}"
+        )
+
     def _queue_graduation(self, signature: str, timestamp_hint: float | None = None) -> None:
         if not signature or signature in self.state["seen_signatures"]:
             return
+        log(f"DECODE fetching signature={signature}")
         tx = self.rpc.transaction(signature)
         if not tx:
+            self.discovery_result(signature, "transaction_unavailable_retry_on_catchup")
             return  # confirmed data may lag briefly; periodic catch-up will retry it
         timestamp = tx.get("blockTime") or timestamp_hint
         if not timestamp:
+            self.discovery_result(signature, "timestamp_unavailable_retry_on_catchup")
             return
         self.state["seen_signatures"].append(signature)
         mints = candidate_mints_from_rpc_transaction(tx)
         if len(mints) != 1:
+            self.discovery_result(signature, "no_candidate_mint" if not mints else "ambiguous_mints")
             if mints:
                 self.skip(
                     ",".join(mints),
@@ -1520,13 +1567,16 @@ class Executor:
         already_queued = any(p.get("mint") == mint for p in self.pending)
         already_owned = any(p.get("mint") == mint for p in self.state.get("positions", []))
         if already_queued or already_owned:
+            self.discovery_result(signature, "mint_already_pending_or_owned")
             return
         age = now_ts() - int(timestamp)
         if age > self.cfg.max_entry_age_seconds:
+            self.discovery_result(signature, "too_old")
             self.skip(mint, f"graduation too old at detection ({age:.0f}s)")
             return
         enter_at = int(timestamp) + self.cfg.entry_delay_seconds
         self.pending.append({"mint": mint, "graduated_ts": int(timestamp), "enter_at": enter_at})
+        self.discovery_result(signature, "queued")
         log(
             f"DETECTED graduation {mint} (age {age:.0f}s, "
             f"entering at +{self.cfg.entry_delay_seconds:.0f}s)"
@@ -1537,11 +1587,15 @@ class Executor:
             return
         signatures = self.migration_stream.drain() if self.migration_stream else []
         try:
+            if signatures:
+                log(f"STREAM drained={len(signatures)} unseen={sum(s not in self.state['seen_signatures'] for s in signatures)}")
             for signature in signatures:
                 self._queue_graduation(signature)
             if now_ts() < self._next_discovery_catchup:
                 return
             self._next_discovery_catchup = now_ts() + self.cfg.discovery_catchup_seconds
+            started = time.monotonic()
+            log(f"SCAN start address={self.cfg.migration_address} limit={self.cfg.discovery_poll_limit}")
             rows = self.rpc.call(
                 "getSignaturesForAddress",
                 [
@@ -1550,9 +1604,19 @@ class Executor:
                 ],
                 timeout=self.cfg.discovery_timeout_seconds,
             ) or []
+            self._last_scan_ts = now_ts()
+            newest = max((r.get('blockTime') or 0 for r in rows), default=0)
+            newest_age = f"{now_ts() - newest:.0f}s" if newest else "unknown"
+            log(
+                f"SCAN fetched={len(rows)} unseen={sum(bool(r.get('signature')) and r['signature'] not in self.state['seen_signatures'] for r in rows)} "
+                f"failed_txs={sum(bool(r.get('err')) for r in rows)} newest_age={newest_age} "
+                f"provider={redact_endpoint(self.cfg.rpc_urls[self.rpc._active_endpoint])} "
+                f"fetch_seconds={time.monotonic() - started:.2f}"
+            )
             for row in reversed(rows):
                 if not row.get("err"):
                     self._queue_graduation(row.get("signature") or "", row.get("blockTime"))
+            log(f"SCAN complete pending={len(self.pending)} total_seconds={time.monotonic() - started:.2f}")
         except Exception as exc:
             if is_provider_unavailable(exc):
                 delay = self.note_provider_rate_limit()
@@ -1988,6 +2052,16 @@ class Executor:
                 current_usd = int(quote["outAmount"]) / LAMPORTS * sol_price
                 pos["peak_usd"] = max(float(pos.get("peak_usd", pos["position_usd"])), current_usd)
                 pos["last_value_usd"] = current_usd
+                if now_ts() >= self._next_position_log.get(pos['mint'], 0):
+                    self._next_position_log[pos['mint']] = now_ts() + 30.0
+                    basis = float(pos['position_usd'])
+                    log(
+                        f"POSITION {pos['mint']} sell_quote=${current_usd:.2f} basis=${basis:.2f} "
+                        f"tp_value=${basis * (1 + self.cfg.take_profit):.2f} "
+                        f"sl_value=${basis * (1 - self.cfg.stop_loss):.2f} "
+                        f"peak_quote=${pos['peak_usd']:.2f} scaled_out={bool(pos.get('scaled_out'))} "
+                        f"age={(now_ts() - pos['opened_ts']) / 60:.1f}m"
+                    )
                 if (
                     not panic
                     and self.cfg.scale_out_at > 0
@@ -2214,6 +2288,7 @@ class Executor:
         panic = PANIC_FLAG.exists()
         draining = STOP_FLAG.exists() or panic
         self.state["draining"] = draining
+        self.log_heartbeat()
         sol_price = None
 
         # Capital already at risk always goes first.  The old loop analyzed every due entry before
@@ -2239,6 +2314,7 @@ class Executor:
                 sol_price = sol_price or self.sol_price_usd()
                 for item in due[: self.cfg.max_entries_per_cycle]:
                     self.pending.remove(item)
+                    log(f"ENTRY checking mint={item['mint']} lateness={now_ts() - item['enter_at']:.0f}s")
                     self.enter_with_retry(item, sol_price)
         save_state(self.state)
 
@@ -2312,7 +2388,7 @@ class Executor:
             try:
                 self.run_cycle()
             except Exception as exc:
-                log(f"ERROR loop: {exc}")
+                log(f"ERROR loop: {describe_error(exc)}")
             time.sleep(self.cfg.poll_seconds)
 
 
