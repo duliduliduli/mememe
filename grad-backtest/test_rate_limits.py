@@ -141,6 +141,17 @@ class ProviderDiscoveryProtectionTests(unittest.TestCase):
         self.assertEqual(call.call_count, 1)
         self.assertEqual(ex._provider_cooldown_until, 1030.0)
 
+    def test_exhausted_provider_starts_the_same_cooldown(self):
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        ex = executor.Executor(executor.Config())
+        call = mock.Mock(side_effect=http_error(403))
+        with mock.patch.object(ex.rpc, "call", call), mock.patch.object(executor, "now_ts", return_value=1000.0):
+            ex.poll_graduations()
+            ex.poll_graduations()
+        self.assertEqual(call.call_count, 1)
+        self.assertEqual(ex._provider_cooldown_until, 1030.0)
+
     def test_same_mint_is_not_queued_twice(self):
         executor, p = fresh()
         self.addCleanup(p.stop)
@@ -181,6 +192,20 @@ class ProviderDiscoveryProtectionTests(unittest.TestCase):
         self.assertEqual(rpc.call("getBalance", ["wallet"]), {"value": 7})
         self.assertEqual(calls, ["https://one.example", "https://two.example"])
         self.assertEqual(rpc._active_endpoint, 1)
+
+    def test_rpc_fails_over_from_malformed_primary_response(self):
+        executor, p = fresh(HELIUS_API_KEY="", RPC_URLS="https://one.example,https://two.example")
+        self.addCleanup(p.stop)
+        rpc = executor.Rpc(executor.Config())
+
+        def post(url, **kwargs):
+            response = mock.Mock()
+            response.raise_for_status.return_value = None
+            response.json.return_value = None if url == "https://one.example" else {"result": {"value": 8}}
+            return response
+
+        rpc.session.post = post
+        self.assertEqual(rpc.call("getBalance", ["wallet"]), {"value": 8})
 
     def test_rpc_batch_fails_over_from_json_rate_limit(self):
         executor, p = fresh(HELIUS_API_KEY="", RPC_URLS="https://one.example,https://two.example")
