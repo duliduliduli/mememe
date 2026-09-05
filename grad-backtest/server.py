@@ -14,19 +14,21 @@ burner-wallet key plus standard Solana RPC endpoint variables.
 from __future__ import annotations
 
 import hmac
+import base64
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 STATIC_DIR = Path(__file__).parent / "static"
@@ -39,6 +41,30 @@ ALLOWED_STAGES = {"collect", "run", "sizing", "optimize"}
 EXECUTOR_STATE = DATA_DIR / "executor_state.json"
 EXECUTOR_STOP = DATA_DIR / "executor.stop"
 EXECUTOR_PANIC = DATA_DIR / "executor.panic"
+EXECUTOR_LOG = DATA_DIR / "executor.log"
+LOG_TIMESTAMP = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\s")
+
+LOG_VIEWER_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>mememe logs</title><style>
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#090b0a;color:#e9f4ed;font:16px system-ui,-apple-system,sans-serif}
+main{max-width:920px;margin:auto;padding:18px}.top{position:sticky;top:0;background:#090b0af2;padding:4px 0 14px;z-index:2}
+h1{font-size:24px;margin:4px 0 14px;color:#5cff91}.controls{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+select,input,button{min-height:48px;border:1px solid #35423a;border-radius:12px;background:#151a17;color:#fff;padding:10px;font-size:16px}
+input{grid-column:1/-1}button{background:#20bd61;border-color:#20bd61;font-weight:750}.secondary{background:#202622;border-color:#35423a}
+.meta{color:#a9b8ae;font-size:13px;margin:10px 2px 0;min-height:18px}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#101412;border:1px solid #263029;border-radius:12px;padding:14px;line-height:1.45;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;min-height:55vh;margin:0}
+@media(min-width:650px){.controls{grid-template-columns:140px 180px 1fr 130px 130px}.controls input{grid-column:auto}}
+</style></head><body><main><div class="top"><h1>mememe runtime logs</h1><div class="controls">
+<select id="hours"><option value="1">Last 1 hour</option><option value="6" selected>Last 6 hours</option><option value="24">Last 24 hours</option><option value="168">Last 7 days</option></select>
+<select id="kind"><option value="">Everything</option><option>ENTRY</option><option>DETECTED</option><option>SKIP</option><option>BUNDLE</option><option>CURVE</option><option>VALUATION</option><option>WARN</option><option>ERROR</option><option>HEARTBEAT</option><option>SCAN</option></select>
+<input id="query" placeholder="Optional text, mint, or phrase"><button id="load">Refresh</button><button id="copy" class="secondary">Copy All</button>
+</div><div class="meta" id="meta">Loading…</div></div><pre id="logs"></pre></main><script>
+const $=id=>document.getElementById(id);async function load(){ $('meta').textContent='Loading…';
+ const q=[$('kind').value,$('query').value.trim()].filter(Boolean).join(' ');const p=new URLSearchParams({hours:$('hours').value,q,limit:'20000'});
+ try{const r=await fetch('/api/runtime-logs?'+p,{credentials:'same-origin'});if(!r.ok)throw new Error(await r.text());const d=await r.json();$('logs').textContent=d.log||'No matching logs.';$('meta').textContent=`${d.returned} lines · ${d.hours}h${d.truncated?' · file tail truncated':''}`}
+ catch(e){$('meta').textContent='Could not load logs';$('logs').textContent=String(e)}}
+$('load').onclick=load;$('copy').onclick=async()=>{const text=$('logs').textContent;try{await navigator.clipboard.writeText(text)}catch{const r=document.createRange();r.selectNodeContents($('logs'));const s=getSelection();s.removeAllRanges();s.addRange(r);document.execCommand('copy');s.removeAllRanges()}$('meta').textContent='Copied to clipboard'};
+load();</script></body></html>"""
 
 app = FastAPI(title="grad-backtest dashboard", docs_url=None, redoc_url=None)
 
@@ -114,6 +140,82 @@ def healthz() -> dict[str, str]:
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
+
+
+def _require_log_viewer(request: Request) -> None:
+    """HTTP Basic keeps the secret out of URLs and works in mobile Safari."""
+    token = os.getenv("LOG_VIEWER_TOKEN") or os.getenv("ADMIN_TOKEN", "")
+    if not token:
+        raise HTTPException(503, "LOG_VIEWER_TOKEN or ADMIN_TOKEN is not configured")
+    authorization = request.headers.get("authorization", "")
+    try:
+        scheme, encoded = authorization.split(" ", 1)
+        decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+        username, password = decoded.split(":", 1)
+    except (ValueError, UnicodeDecodeError):
+        username = password = ""
+        scheme = ""
+    if scheme.lower() != "basic" or username != "admin" or not hmac.compare_digest(password, token):
+        raise HTTPException(
+            401,
+            "authentication required",
+            headers={"WWW-Authenticate": 'Basic realm="mememe logs"', "Cache-Control": "no-store"},
+        )
+
+
+def _log_response_headers() -> dict[str, str]:
+    return {
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Content-Security-Policy": "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'",
+    }
+
+
+@app.get("/logs")
+def log_viewer(request: Request) -> HTMLResponse:
+    _require_log_viewer(request)
+    return HTMLResponse(LOG_VIEWER_HTML, headers=_log_response_headers())
+
+
+@app.get("/api/runtime-logs")
+def runtime_logs(request: Request, hours: float = 6, q: str = "", limit: int = 20_000) -> JSONResponse:
+    _require_log_viewer(request)
+    hours = max(0.25, min(float(hours), 24 * 7))
+    limit = max(1, min(int(limit), 20_000))
+    max_bytes = max(1_000_000, min(int(os.getenv("LOG_VIEWER_MAX_BYTES", "12000000")), 50_000_000))
+    raw = b""
+    truncated = False
+    if EXECUTOR_LOG.exists():
+        size = EXECUTOR_LOG.stat().st_size
+        with EXECUTOR_LOG.open("rb") as handle:
+            if size > max_bytes:
+                handle.seek(-max_bytes, os.SEEK_END)
+                handle.readline()
+                truncated = True
+            raw = handle.read()
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    terms = [term.casefold() for term in q.split() if term]
+    selected: list[str] = []
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        match = LOG_TIMESTAMP.match(line)
+        if match:
+            try:
+                if datetime.fromisoformat(match.group(1).replace("Z", "+00:00")) < cutoff:
+                    continue
+            except ValueError:
+                continue
+        elif line:
+            continue
+        folded = line.casefold()
+        if terms and not all(term in folded for term in terms):
+            continue
+        selected.append(line)
+    selected = selected[-limit:]
+    return JSONResponse(
+        {"hours": hours, "query": q, "returned": len(selected), "truncated": truncated, "log": "\n".join(selected)},
+        headers=_log_response_headers(),
+    )
 
 
 @app.get("/api/overview")

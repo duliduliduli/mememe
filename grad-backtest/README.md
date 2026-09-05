@@ -184,6 +184,8 @@ prints the important ones.
 | `JUPITER_BASE_URL` | `https://lite-api.jup.ag/swap/v1` | executor | Jupiter quote/swap base. |
 | `WALLET_PRIVATE_KEY` | (none; required in live mode) | executor | Base58 private key of a burner wallet. Never a seed phrase, never a main wallet. |
 | `ADMIN_TOKEN` | (none) | server | Password for `POST /api/run` and `POST /api/executor/*`, sent as header `x-admin-token`. Unset means those endpoints return 503. |
+| `LOG_VIEWER_TOKEN` | `ADMIN_TOKEN` | server | Optional separate password for the protected phone log viewer. HTTP Basic username is `admin`; the password never appears in the URL. |
+| `LOG_VIEWER_MAX_BYTES` | `12000000` | server | Maximum tail of `executor.log` loaded by one viewer request (clamped to 1–50 MB). |
 | `DATA_DIR` | `data` (`/data` in the container) | everything | Where all files live. |
 | `PORT` | `8000` | server | Listen port. |
 | `GECKO_REQUESTS_PER_MINUTE` | `9` | backtester | GeckoTerminal pacing for the keyless API. |
@@ -695,6 +697,8 @@ endpoints are for `curl` and the like.
 |---|---|---|
 | `GET /healthz` | none | `{"status":"ok"}` (Railway healthcheck) |
 | `GET /` | none | the dashboard |
+| `GET /logs` | HTTP Basic | phone-friendly runtime-log viewer with 1h/6h/24h/7d ranges, common bot filters, free-text search, refresh, and Copy All |
+| `GET /api/runtime-logs?hours=6&q=BUNDLE&limit=20000` | HTTP Basic | timestamp-filtered JSON/text from `DATA_DIR/executor.log`; limited to 7 days and 20,000 returned lines |
 | `GET /api/overview` | none | backtest stats, exit-reason counts, every net return, simulated equity curve, `summary.json`, `sizing_summary.json`, job status |
 | `GET /api/trades?limit=200` | none | rows of `trade_results.csv`, newest first |
 | `GET /api/errors?limit=200` | none | last rows of `errors.csv` |
@@ -731,7 +735,13 @@ curl -X POST $URL/api/executor/panic -H "x-admin-token: $TOK"
 
 The page follows the viewer's light/dark preference and an explicit
 `data-theme` override. Everyone who can reach the URL sees the numbers; the
-dashboard exposes no credentials.
+dashboard exposes no credentials. The log viewer uses HTTP Basic so mobile
+Safari can remember the login: username `admin`, password `LOG_VIEWER_TOKEN`
+(or `ADMIN_TOKEN` when no separate viewer token is configured). Responses are
+marked `no-store`, the secret is never accepted in the URL, and the page is
+read-only. Historical availability follows `executor.log`: mount `DATA_DIR` at
+`/data` to keep it across redeploys. It intentionally shows bot runtime lines,
+not Railway build logs or Uvicorn's own stdout.
 
 ---
 
