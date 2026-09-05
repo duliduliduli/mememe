@@ -271,8 +271,8 @@ def token_account(owner):
 
 
 class TopWalletHolderTests(unittest.TestCase):
-    def test_helius_das_expands_holder_sample_beyond_twenty(self):
-        executor, p = fresh()
+    def test_optional_das_expands_holder_sample_beyond_twenty(self):
+        executor, p = fresh(RPC_DAS_ENABLED="1")
         self.addCleanup(p.stop)
         rows = [{"owner": f"w{i}", "amount": str(100 - i)} for i in range(50)]
         owners = {"value": [{"owner": executor.SYSTEM_PROGRAM} for _ in rows]}
