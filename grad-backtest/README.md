@@ -184,6 +184,8 @@ prints the important ones.
 | `JUPITER_BASE_URL` | `https://lite-api.jup.ag/swap/v1` | executor | Jupiter quote/swap base. |
 | `WALLET_PRIVATE_KEY` | (none; required in live mode) | executor | Base58 private key of a burner wallet. Never a seed phrase, never a main wallet. |
 | `ADMIN_TOKEN` | (none) | server | Password for `POST /api/run` and `POST /api/executor/*`, sent as header `x-admin-token`. Unset means those endpoints return 503. |
+| `LOG_VIEWER_TOKEN` | `ADMIN_TOKEN` | server | Optional separate password for the protected phone log viewer. HTTP Basic username is `admin`; the password never appears in the URL. |
+| `LOG_VIEWER_MAX_BYTES` | `12000000` | server | Maximum tail of `executor.log` loaded by one viewer request (clamped to 1–50 MB). |
 | `DATA_DIR` | `data` (`/data` in the container) | everything | Where all files live. |
 | `PORT` | `8000` | server | Listen port. |
 | `GECKO_REQUESTS_PER_MINUTE` | `9` | backtester | GeckoTerminal pacing for the keyless API. |
@@ -311,8 +313,12 @@ Funding ancestry remains a bounded sample, not a complete wallet history.
 `holder_target` is a requested maximum. With DAS disabled, standard RPC returns
 the largest 20 token accounts, potentially representing fewer wallets. `HOLDERS`
 reports the observed wallet count; this is not equivalent to a 50-wallet DAS sample.
-`VALUATION` logs the quote amount, total supply and decimals used by the existing
-market-cap estimate so unusual values can be checked without relaxing thresholds.
+`VALUATION` logs the raw quote output, raw total supply, UI values, and decimals.
+The guard computes executable quote-implied fully diluted valuation directly as
+`USD in × raw supply ÷ raw tokens out`; token decimals cancel, and inconsistent
+RPC raw/UI supply fields are rejected. This is FDV from total minted supply, not
+circulating market cap, so deliberately oversized supply can still produce a
+genuinely large value without indicating a decimal-conversion bug.
 
 Validation includes a saved on-chain create_v2 instruction and deterministic
 oldest-history/cache regression tests. Full replay equivalence with earlier accepted
@@ -489,7 +495,7 @@ entry can land.
 1. **Sizing guards** (`position_size_usd`): open bot-opened positions must be below `MAX_CONCURRENT_POSITIONS` (adopted holdings don't count); daily realized P&L must be above −`DAILY_LOSS_LIMIT_USD`; size = `min(equity × ACCOUNT_FRACTION, MAX_POSITION_USD)` must be at least `MIN_POSITION_USD` and at most equity. Failure: `SKIP …: sizing guards (open=N, daily_pnl=X)`.
 2. **Buy quote** WSOL → token for the sized amount at `SLIPPAGE_BPS`. A zero-token quote raises and is retried.
 3. **Metadata lookups** (`entry_metadata`):
-   - token supply → implied market cap = supply × (USD in ÷ tokens out), i.e. the price we would actually pay;
+   - raw token supply → executable quote-implied FDV = USD in × raw supply ÷ raw tokens out; raw units cancel so decimals cannot skew the result;
    - mint creation time via `getSignaturesForAddress` with early stop → curve age = graduation − creation;
    - largest plain-wallet holder via `getTokenLargestAccounts` plus two `getMultipleAccounts` calls, ignoring program-owned accounts (the pool, the bonding curve, the Mayhem vault) and our own wallet.
    - a mandatory bundle graph over up to 50 plain-wallet holders. It combines same-slot and short-window purchases, first-three-slot purchases, top-ten concentration, direct and two-hop non-CEX funding ancestry, unpaid wallet-to-wallet token distributions, creator linkage, and wallet cohorts previously seen together. The broad 50-holder sample feeds transfer, coordination, repeat-cohort and concentration checks; funding ancestry is traced over the largest 20 holders so adding small holders does not dilute coverage. Lookup completion is measured separately from identifiable-funder coverage. With `BUNDLE_FAIL_CLOSED=1`, missing supply, creation history, purchase history, less than 80% lookup completion, or less than 30% funder coverage skips the entry; 30–60% coverage applies stricter thresholds.
@@ -713,6 +719,8 @@ endpoints are for `curl` and the like.
 |---|---|---|
 | `GET /healthz` | none | `{"status":"ok"}` (Railway healthcheck) |
 | `GET /` | none | the dashboard |
+| `GET /logs` | HTTP Basic | phone-friendly runtime-log viewer with 1h/6h/24h/7d ranges, common bot filters, free-text search, refresh, and Copy All |
+| `GET /api/runtime-logs?hours=6&q=BUNDLE&limit=20000` | HTTP Basic | timestamp-filtered JSON/text from `DATA_DIR/executor.log`; limited to 7 days and 20,000 returned lines |
 | `GET /api/overview` | none | backtest stats, exit-reason counts, every net return, simulated equity curve, `summary.json`, `sizing_summary.json`, job status |
 | `GET /api/trades?limit=200` | none | rows of `trade_results.csv`, newest first |
 | `GET /api/errors?limit=200` | none | last rows of `errors.csv` |
@@ -749,7 +757,13 @@ curl -X POST $URL/api/executor/panic -H "x-admin-token: $TOK"
 
 The page follows the viewer's light/dark preference and an explicit
 `data-theme` override. Everyone who can reach the URL sees the numbers; the
-dashboard exposes no credentials.
+dashboard exposes no credentials. The log viewer uses HTTP Basic so mobile
+Safari can remember the login: username `admin`, password `LOG_VIEWER_TOKEN`
+(or `ADMIN_TOKEN` when no separate viewer token is configured). Responses are
+marked `no-store`, the secret is never accepted in the URL, and the page is
+read-only. Historical availability follows `executor.log`: mount `DATA_DIR` at
+`/data` to keep it across redeploys. It intentionally shows bot runtime lines,
+not Railway build logs or Uvicorn's own stdout.
 
 ---
 
@@ -944,7 +958,7 @@ Module functions:
 - `record_skip(mint, reason)` — append to `skips.csv`.
 - `quote_price_impact_pct(quote)` — Jupiter's fraction as a percent.
 - `describe_error(exc)` — redact API keys, name Jupiter 6001/6000, truncate.
-- `entry_market_cap_usd(size_usd, out_amount_raw, supply_ui, decimals)` — implied cap from the executable quote.
+- `entry_market_cap_usd(size_usd, out_amount_raw, supply_ui, decimals, supply_raw=...)` — executable quote-implied FDV; production uses raw supply so decimals cancel.
 - `entry_guard_reason(cfg, graduated_ts, now, impact, market_cap, curve_age, top_holder_pct)` — the six ordered guards; `None` inputs never block.
 - `position_size_usd(cfg, equity_usd, open_positions, daily_pnl)` — sizing with concurrency, daily-loss, min, max, and equity checks.
 - `decide_exit(entry_usd, current_usd, opened_ts, now, cfg, peak_usd)` — take-profit, stop-loss, trailing, time stop.
