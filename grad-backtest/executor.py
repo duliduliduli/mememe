@@ -112,13 +112,26 @@ def is_rate_limited(exc: BaseException) -> bool:
 
 def is_provider_unavailable(exc: BaseException) -> bool:
     """Errors for which trying a second RPC endpoint is safe and useful."""
-    if is_rate_limited(exc) or isinstance(exc, (requests.Timeout, requests.ConnectionError)):
+    if is_rate_limited(exc) or isinstance(
+        exc, (requests.Timeout, requests.ConnectionError, json.JSONDecodeError)
+    ):
         return True
     resp = getattr(exc, "response", None)
-    if getattr(resp, "status_code", 0) >= 500:
+    status = getattr(resp, "status_code", 0)
+    if status in {401, 403, 408, 425} or status >= 500:
         return True
     text = str(exc).lower()
-    return any(marker in text for marker in ("node is unhealthy", "service unavailable", "too many requests"))
+    return any(
+        marker in text
+        for marker in (
+            "node is unhealthy",
+            "service unavailable",
+            "too many requests",
+            "expecting value",
+            "malformed rpc response",
+            "rpc batch returned",
+        )
+    )
 
 
 def split_urls(value: str) -> list[str]:
@@ -695,6 +708,8 @@ class Rpc:
                     {"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
                     timeout,
                 )
+                if not isinstance(body, dict):
+                    raise RuntimeError(f"malformed RPC response for {method}: {str(body)[:120]}")
                 if "error" in body:
                     error = RuntimeError(f"RPC {method}: {body['error']}")
                     if is_provider_unavailable(error):
@@ -1516,9 +1531,9 @@ class Executor:
                 if not row.get("err"):
                     self._queue_graduation(row.get("signature") or "", row.get("blockTime"))
         except Exception as exc:
-            if is_rate_limited(exc):
+            if is_provider_unavailable(exc):
                 delay = self.note_provider_rate_limit()
-                log(f"WARN RPC discovery rate limited; pausing new-entry work for {delay:.0f}s")
+                log(f"WARN RPC discovery providers unavailable; pausing new-entry work for {delay:.0f}s")
             else:
                 log(f"WARN RPC discovery failed: {describe_error(exc)}")
             return
@@ -2167,9 +2182,9 @@ class Executor:
                 self.reconcile_wallet(self.sol_price_usd())
                 self._reconcile_pending = False
             except Exception as exc:
-                if is_rate_limited(exc):
+                if is_provider_unavailable(exc):
                     delay = self.note_provider_rate_limit(minimum_seconds=300)
-                    log(f"WARN wallet reconciliation still rate limited; retrying in {delay:.0f}s")
+                    log(f"WARN wallet reconciliation provider unavailable; retrying in {delay:.0f}s")
                 else:
                     log(f"WARN deferred wallet reconciliation failed: {describe_error(exc)}")
                     self._reconcile_pending = False
