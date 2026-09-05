@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Live/paper executor for the Pump.fun graduation strategy.
 
-Watches the migration address for new graduations via Helius, enters
+Watches the migration address for new graduations through standard Solana RPC/WSS, enters
 ENTRY_DELAY_SECONDS after migration through Jupiter, then manages each
 position against take-profit / stop-loss / time-stop using executable
 Jupiter sell quotes (not candle prices).
@@ -28,8 +28,10 @@ import base64
 import csv
 import json
 import os
+import queue
 import re
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -37,6 +39,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
+import websocket
 
 from bundle_analysis import (
     CEX_FUNDERS,
@@ -51,7 +54,7 @@ from bundle_analysis import (
     transfer_clusters,
     wallets_supply_pct,
 )
-from grad_backtest import KNOWN_QUOTES, WSOL, candidate_mints
+from grad_backtest import KNOWN_QUOTES, WSOL
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 STATE_FILE = DATA_DIR / "executor_state.json"
@@ -67,6 +70,11 @@ TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 TOKEN_ACCOUNT_RENT_SOL = 0.00203928
 SYSTEM_PROGRAM = "11111111111111111111111111111111"
+DEX_PROGRAMS = {
+    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",  # Pump.fun
+    "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",  # PumpSwap
+    "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",  # Jupiter v6
+}
 
 SKIPS_FILE = DATA_DIR / "skips.csv"
 
@@ -102,8 +110,43 @@ def is_rate_limited(exc: BaseException) -> bool:
     return getattr(resp, "status_code", None) == 429 or " 429 " in f" {exc} "
 
 
+def is_provider_unavailable(exc: BaseException) -> bool:
+    """Errors for which trying a second RPC endpoint is safe and useful."""
+    if is_rate_limited(exc) or isinstance(exc, (requests.Timeout, requests.ConnectionError)):
+        return True
+    resp = getattr(exc, "response", None)
+    if getattr(resp, "status_code", 0) >= 500:
+        return True
+    text = str(exc).lower()
+    return any(marker in text for marker in ("node is unhealthy", "service unavailable", "too many requests"))
+
+
+def split_urls(value: str) -> list[str]:
+    """Comma/newline-separated endpoint list with stable de-duplication."""
+    urls: list[str] = []
+    for item in re.split(r"[,\n]", value or ""):
+        url = item.strip().rstrip("/")
+        if url and url not in urls:
+            urls.append(url)
+    return urls
+
+
+def websocket_url(http_url: str) -> str:
+    if http_url.startswith("https://"):
+        return "wss://" + http_url[len("https://"):]
+    if http_url.startswith("http://"):
+        return "ws://" + http_url[len("http://"):]
+    return http_url
+
+
+def redact_endpoint(url: str) -> str:
+    """Show only a provider host; API keys commonly live in either path or query."""
+    match = re.match(r"^(https?://[^/\s?]+)", url or "")
+    return f"{match.group(1)}/…" if match else "configured"
+
+
 def with_backoff(fn, what: str):
-    """Call fn(); on HTTP 429 wait and retry a few times. Helius and Jupiter's free tiers both
+    """Call fn(); on HTTP 429 wait and retry a few times. Free RPC and Jupiter tiers often
     answer bursts with 429, and a burst is exactly what startup reconciliation and a busy
     position loop produce. Anything other than 429 is raised immediately."""
     for i, delay in enumerate(RATE_LIMIT_BACKOFF):
@@ -135,7 +178,39 @@ class Config:
             raise SystemExit("EXECUTOR_MODE must be 'paper' or 'live'")
         self.helius_api_key = os.getenv("HELIUS_API_KEY") or ""
         self.migration_address = os.getenv("MIGRATION_ADDRESS") or ""
-        self.rpc_url = os.getenv("RPC_URL") or f"https://mainnet.helius-rpc.com/?api-key={self.helius_api_key}"
+        legacy_rpc = os.getenv("RPC_URL") or ""
+        if not legacy_rpc and self.helius_api_key:
+            legacy_rpc = f"https://mainnet.helius-rpc.com/?api-key={self.helius_api_key}"
+        self.rpc_urls = split_urls(os.getenv("RPC_URLS") or legacy_rpc)
+        self.rpc_url = self.rpc_urls[0] if self.rpc_urls else ""
+        explicit_ws = split_urls(os.getenv("RPC_WS_URLS") or os.getenv("RPC_WS_URL") or "")
+        self.rpc_ws_urls = explicit_ws or [websocket_url(url) for url in self.rpc_urls]
+        self.rpc_ws_url = self.rpc_ws_urls[0] if self.rpc_ws_urls else ""
+        self.rpc_timeout_seconds = max(1.0, float(os.getenv("RPC_TIMEOUT_SECONDS", "8")))
+        self.rpc_batch_size = min(50, max(1, int(os.getenv("RPC_BATCH_SIZE", "20"))))
+        self.discovery_mode = os.getenv("DISCOVERY_MODE", "websocket").lower()
+        self.discovery_catchup_seconds = max(5.0, float(os.getenv("DISCOVERY_CATCHUP_SECONDS", "30")))
+        self.discovery_poll_limit = min(100, max(1, int(os.getenv("DISCOVERY_POLL_LIMIT", "10"))))
+        self.discovery_timeout_seconds = max(
+            1.0,
+            float(os.getenv("DISCOVERY_TIMEOUT_SECONDS", os.getenv("HELIUS_POLL_TIMEOUT_SECONDS", "5"))),
+        )
+        self.provider_backoff_max_seconds = max(
+            30.0,
+            float(os.getenv("RPC_BACKOFF_MAX_SECONDS", os.getenv("HELIUS_POLL_BACKOFF_MAX_SECONDS", "900"))),
+        )
+        # Raw is portable across standard Solana providers. Helius parsing remains an explicit
+        # opt-in compatibility mode for historical users, not a runtime requirement.
+        self.transaction_history_mode = os.getenv("TRANSACTION_HISTORY_MODE", "raw").lower()
+        self.raw_history_signature_limit = min(
+            100, max(5, int(os.getenv("RAW_HISTORY_SIGNATURE_LIMIT", "40")))
+        )
+        self.raw_funder_signature_limit = min(
+            self.raw_history_signature_limit,
+            max(3, int(os.getenv("RAW_FUNDER_SIGNATURE_LIMIT", "10"))),
+        )
+        self.rpc_das_enabled = os.getenv("RPC_DAS_ENABLED", "0") == "1"
+        self.das_mint_param = os.getenv("DAS_MINT_PARAM", "mint")
         self.jupiter_base = os.getenv("JUPITER_BASE_URL", "https://lite-api.jup.ag/swap/v1").rstrip("/")
         self.account_fraction = float(os.getenv("ACCOUNT_FRACTION", "0.10"))
         self.max_position_usd = float(os.getenv("MAX_POSITION_USD", "20"))
@@ -176,10 +251,6 @@ class Config:
         # Entry discovery and bundle analysis are best-effort; protecting money already in the
         # market is not.  Bound both sources of entry work so an active position is never starved
         # behind a burst of graduations.
-        self.helius_poll_timeout_seconds = max(1.0, float(os.getenv("HELIUS_POLL_TIMEOUT_SECONDS", "5")))
-        self.helius_poll_backoff_max_seconds = max(
-            30.0, float(os.getenv("HELIUS_POLL_BACKOFF_MAX_SECONDS", "900"))
-        )
         self.max_entries_per_cycle = max(1, int(os.getenv("MAX_ENTRIES_PER_CYCLE", "1")))
         self.max_price_impact_pct = float(os.getenv("MAX_PRICE_IMPACT_PCT", "5"))
         # A route existing is not enough: require that the just-quoted tokens can immediately
@@ -211,8 +282,8 @@ class Config:
         self.max_top10_wallet_pct = percent_env("MAX_TOP10_WALLET_PCT", 50)
         self.max_early_buy_pct = percent_env("MAX_EARLY_BUY_PCT", 30)
         self.min_funder_coverage_pct = percent_env("MIN_FUNDER_COVERAGE_PCT", 30)
-        # Live free-tier Helius evidence showed 20 concurrent address-history calls complete
-        # only 20-50% before throttling. Keep lookup health visible, but do not demand a higher
+        # Live free-provider evidence showed 20 concurrent address-history calls complete only
+        # 20-50% before throttling. Keep lookup health visible, but do not demand a higher
         # completion percentage than the evidence threshold itself.
         self.min_funder_lookup_pct = percent_env("MIN_FUNDER_LOOKUP_PCT", 30)
         self.high_confidence_funder_coverage_pct = percent_env("HIGH_CONFIDENCE_FUNDER_COVERAGE_PCT", 60)
@@ -249,8 +320,16 @@ class Config:
         self.wallet_key = os.getenv("WALLET_PRIVATE_KEY") or ""
 
     def validate(self) -> None:
-        if not self.helius_api_key or not self.migration_address:
-            raise SystemExit("HELIUS_API_KEY and MIGRATION_ADDRESS are required")
+        if not self.migration_address:
+            raise SystemExit("MIGRATION_ADDRESS is required")
+        if not self.rpc_urls:
+            raise SystemExit("Set RPC_URL or RPC_URLS (HELIUS_API_KEY is optional)")
+        if self.discovery_mode not in ("websocket", "poll"):
+            raise SystemExit("DISCOVERY_MODE must be 'websocket' or 'poll'")
+        if self.transaction_history_mode not in ("raw", "helius"):
+            raise SystemExit("TRANSACTION_HISTORY_MODE must be 'raw' or 'helius'")
+        if self.transaction_history_mode == "helius" and not self.helius_api_key:
+            raise SystemExit("TRANSACTION_HISTORY_MODE=helius requires HELIUS_API_KEY")
         if self.mode == "live" and not self.wallet_key:
             raise SystemExit("EXECUTOR_MODE=live requires WALLET_PRIVATE_KEY (burner wallet only)")
 
@@ -327,11 +406,130 @@ def describe_error(exc: BaseException) -> str:
     """Compact, human-readable form of swap/RPC failures for the log. The raw RPC error
     carries the whole simulation log (thousands of characters); the code is what matters."""
     text = re.sub(r"api-key=[^&\s]+", "api-key=…", str(exc))
+    # Most non-Helius providers put the credential in the URL path. Never let an exception
+    # copy that private endpoint into Railway logs.
+    text = re.sub(r"(https?://[^/\s?]+)(?:/[^\s?]*)?(?:\?[^\s]*)?", r"\1/…", text)
     if "0x1771" in text or "'Custom': 6001" in text or '"Custom": 6001' in text or '"Custom":6001' in text:
         return "Jupiter 6001: slippage tolerance exceeded (price moved past tolerance between quote and execution)"
     if "0x1770" in text or "'Custom': 6000" in text or '"Custom": 6000' in text:
         return "Jupiter 6000: route no longer valid"
     return text[:240] + "…" if len(text) > 240 else text
+
+
+def rpc_account_keys(tx: dict[str, Any]) -> list[str]:
+    message = ((tx.get("transaction") or {}).get("message") or {})
+    keys: list[str] = []
+    for item in message.get("accountKeys") or []:
+        keys.append(str(item.get("pubkey")) if isinstance(item, dict) else str(item))
+    return keys
+
+
+def rpc_instructions(tx: dict[str, Any]) -> list[dict[str, Any]]:
+    message = ((tx.get("transaction") or {}).get("message") or {})
+    instructions = list(message.get("instructions") or [])
+    for group in (tx.get("meta") or {}).get("innerInstructions") or []:
+        instructions.extend(group.get("instructions") or [])
+    return [item for item in instructions if isinstance(item, dict)]
+
+
+def candidate_mints_from_rpc_transaction(tx: dict[str, Any]) -> list[str]:
+    """Extract the launched mint from a standard jsonParsed getTransaction response."""
+    found: set[str] = set()
+    meta = tx.get("meta") or {}
+    for balance in [*(meta.get("preTokenBalances") or []), *(meta.get("postTokenBalances") or [])]:
+        mint = balance.get("mint")
+        if mint and mint not in KNOWN_QUOTES:
+            found.add(mint)
+    for instruction in rpc_instructions(tx):
+        parsed = instruction.get("parsed") or {}
+        info = parsed.get("info") or {}
+        mint = info.get("mint")
+        if mint and mint not in KNOWN_QUOTES:
+            found.add(mint)
+    return sorted(found)
+
+
+def normalize_rpc_transaction(tx: dict[str, Any], signature: str = "") -> dict[str, Any]:
+    """Convert standard jsonParsed transaction data into the small normalized shape used by
+    the bundle detector. This intentionally reconstructs only evidence we consume."""
+    keys = rpc_account_keys(tx)
+    meta = tx.get("meta") or {}
+    fee_payer = keys[0] if keys else None
+    native_transfers: list[dict[str, Any]] = []
+    for instruction in rpc_instructions(tx):
+        parsed = instruction.get("parsed") or {}
+        info = parsed.get("info") or {}
+        if instruction.get("program") != "system" or parsed.get("type") not in ("transfer", "transferWithSeed"):
+            continue
+        source = info.get("source")
+        destination = info.get("destination")
+        lamports = info.get("lamports")
+        if source and destination and lamports is not None:
+            native_transfers.append(
+                {"fromUserAccount": source, "toUserAccount": destination, "amount": int(lamports)}
+            )
+
+    def token_balances(rows: list[dict[str, Any]]) -> dict[tuple[int, str], dict[str, Any]]:
+        out: dict[tuple[int, str], dict[str, Any]] = {}
+        for row in rows:
+            mint = row.get("mint")
+            index = row.get("accountIndex")
+            token = row.get("uiTokenAmount") or {}
+            if mint is None or index is None:
+                continue
+            out[(int(index), mint)] = {
+                "amount": int(token.get("amount") or 0),
+                "decimals": int(token.get("decimals") or 0),
+                "owner": row.get("owner"),
+            }
+        return out
+
+    before = token_balances(meta.get("preTokenBalances") or [])
+    after = token_balances(meta.get("postTokenBalances") or [])
+    changes: list[dict[str, Any]] = []
+    for key in set(before) | set(after):
+        pre = before.get(key) or {"amount": 0, "decimals": 0, "owner": None}
+        post = after.get(key) or {"amount": 0, "decimals": pre["decimals"], "owner": pre["owner"]}
+        delta = int(post["amount"]) - int(pre["amount"])
+        if delta:
+            changes.append(
+                {
+                    "mint": key[1],
+                    "delta": delta,
+                    "decimals": int(post.get("decimals") or pre.get("decimals") or 0),
+                    "owner": post.get("owner") or pre.get("owner"),
+                }
+            )
+    negative_owners: dict[str, list[str]] = {}
+    for change in changes:
+        if change["delta"] < 0 and change.get("owner"):
+            negative_owners.setdefault(change["mint"], []).append(change["owner"])
+    token_transfers: list[dict[str, Any]] = []
+    for change in changes:
+        if change["delta"] <= 0 or not change.get("owner"):
+            continue
+        senders = list(dict.fromkeys(negative_owners.get(change["mint"], [])))
+        token_transfers.append(
+            {
+                "mint": change["mint"],
+                "fromUserAccount": senders[0] if len(senders) == 1 else None,
+                "toUserAccount": change["owner"],
+                "rawTokenAmount": {
+                    "tokenAmount": str(change["delta"]),
+                    "decimals": change["decimals"],
+                },
+            }
+        )
+    return {
+        "signature": signature,
+        "timestamp": tx.get("blockTime"),
+        "blockTime": tx.get("blockTime"),
+        "slot": tx.get("slot"),
+        "feePayer": fee_payer,
+        "type": "SWAP" if set(keys) & DEX_PROGRAMS else "TRANSFER",
+        "nativeTransfers": native_transfers,
+        "tokenTransfers": token_transfers,
+    }
 
 
 def entry_market_cap_usd(size_usd: float, out_amount_raw: int, supply_ui: float, decimals: int) -> float | None:
@@ -461,6 +659,7 @@ class Rpc:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.session = requests.Session()
+        self._active_endpoint = 0
         self.wallet_graph_cache: dict[str, Any] = {"version": 1, "funders": {}, "appearances": {}}
         try:
             loaded = json.loads(WALLET_GRAPH_CACHE_FILE.read_text())
@@ -470,20 +669,92 @@ class Rpc:
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             pass
 
-    def call(self, method: str, params: Any) -> Any:
-        return with_backoff(lambda: self._call(method, params), method)
+    def call(self, method: str, params: Any, timeout: float | None = None) -> Any:
+        return with_backoff(lambda: self._call(method, params, timeout), method)
 
-    def _call(self, method: str, params: Any) -> Any:
+    def _endpoint_order(self) -> list[tuple[int, str]]:
+        total = len(self.cfg.rpc_urls)
+        return [((self._active_endpoint + offset) % total, self.cfg.rpc_urls[(self._active_endpoint + offset) % total])
+                for offset in range(total)]
+
+    def _post(self, endpoint: str, payload: Any, timeout: float | None = None) -> Any:
         resp = self.session.post(
-            self.cfg.rpc_url,
-            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
-            timeout=30,
+            endpoint,
+            json=payload,
+            timeout=timeout or self.cfg.rpc_timeout_seconds,
         )
         resp.raise_for_status()
-        body = resp.json()
-        if "error" in body:
-            raise RuntimeError(f"RPC {method}: {body['error']}")
-        return body["result"]
+        return resp.json()
+
+    def _call(self, method: str, params: Any, timeout: float | None = None) -> Any:
+        last_error: BaseException | None = None
+        for index, endpoint in self._endpoint_order():
+            try:
+                body = self._post(
+                    endpoint,
+                    {"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+                    timeout,
+                )
+                if "error" in body:
+                    error = RuntimeError(f"RPC {method}: {body['error']}")
+                    if is_provider_unavailable(error):
+                        raise error
+                    raise error
+                self._active_endpoint = index
+                return body["result"]
+            except Exception as exc:
+                last_error = exc
+                if not is_provider_unavailable(exc):
+                    raise
+        assert last_error is not None
+        raise last_error
+
+    def batch_call(self, calls: list[tuple[str, Any]], timeout: float | None = None) -> list[Any]:
+        """Execute standard JSON-RPC batches while preserving input order and provider failover."""
+        if not calls:
+            return []
+        results: list[Any] = []
+        for start in range(0, len(calls), self.cfg.rpc_batch_size):
+            chunk = calls[start : start + self.cfg.rpc_batch_size]
+            payload = [
+                {"jsonrpc": "2.0", "id": offset + 1, "method": method, "params": params}
+                for offset, (method, params) in enumerate(chunk)
+            ]
+            body = with_backoff(lambda: self._batch_post(payload, timeout), "RPC batch")
+            by_id = {int(item.get("id", 0)): item for item in body if isinstance(item, dict)}
+            for offset, (method, _params) in enumerate(chunk):
+                item = by_id.get(offset + 1) or {}
+                if "error" in item:
+                    raise RuntimeError(f"RPC {method}: {item['error']}")
+                results.append(item.get("result"))
+        return results
+
+    def _batch_post(self, payload: list[dict[str, Any]], timeout: float | None = None) -> list[dict[str, Any]]:
+        last_error: BaseException | None = None
+        for index, endpoint in self._endpoint_order():
+            try:
+                body = self._post(endpoint, payload, timeout)
+                if not isinstance(body, list):
+                    raise RuntimeError(f"RPC batch returned {str(body)[:120]}")
+                provider_errors = [
+                    RuntimeError(f"RPC batch: {item['error']}")
+                    for item in body
+                    if isinstance(item, dict)
+                    and "error" in item
+                    and is_provider_unavailable(RuntimeError(f"RPC batch: {item['error']}"))
+                ]
+                if provider_errors:
+                    # Providers sometimes return HTTP 200 while the JSON-RPC batch says it is
+                    # throttled or unhealthy. Treat that exactly like an HTTP 429 and fail over.
+                    raise provider_errors[0]
+                self._active_endpoint = index
+                return body
+            except Exception as exc:
+                last_error = exc
+                if not is_provider_unavailable(exc):
+                    raise
+        assert last_error is not None
+        raise last_error
 
     def sol_balance(self, pubkey: str) -> float:
         return self.call("getBalance", [pubkey])["value"] / LAMPORTS
@@ -561,14 +832,20 @@ class Rpc:
     ) -> list[tuple[str, int]]:
         """Largest plain-wallet holders, combining multiple token accounts per owner.
 
-        Helius DAS is used first because Solana's standard getTokenLargestAccounts is
-        hard-capped at 20. The standard method remains a compatibility fallback.
+        Optional Metaplex DAS is used first because standard getTokenLargestAccounts is
+        hard-capped at 20. DAS is disabled by default so unsupported extension calls do not
+        burn free-provider quota; the portable top-20 path remains the default.
         """
         exclude = exclude or set()
         try:
+            if not self.cfg.rpc_das_enabled:
+                raise RuntimeError("DAS disabled")
             # DAS does not promise balance ordering, so inspect the full first page and sort
             # locally rather than asking it for only N arbitrary accounts.
-            das = self.call("getTokenAccounts", {"mint": mint, "page": 1, "limit": 1000}) or {}
+            das = self.call(
+                "getTokenAccounts",
+                {self.cfg.das_mint_param: mint, "page": 1, "limit": 1000},
+            ) or {}
             rows = das.get("token_accounts") or das.get("tokenAccounts") or []
             totals: dict[str, int] = {}
             for row in rows:
@@ -589,7 +866,7 @@ class Rpc:
                 if wallets:
                     return wallets
         except Exception:
-            # DAS availability varies by Helius plan; retain the proven 20-account path.
+            # DAS availability varies by provider/plan; retain the standard 20-account path.
             pass
         largest = self.call("getTokenLargestAccounts", [mint]).get("value") or []
         if not largest:
@@ -623,8 +900,61 @@ class Rpc:
         holders = self.plain_wallet_holders(mint, exclude, 1)
         return holders[0] if holders else None
 
+    def transaction(self, signature: str) -> dict[str, Any] | None:
+        return self.call(
+            "getTransaction",
+            [
+                signature,
+                {
+                    "encoding": "jsonParsed",
+                    "commitment": "confirmed",
+                    "maxSupportedTransactionVersion": 0,
+                },
+            ],
+        )
+
+    def raw_transactions(self, address: str, **params: Any) -> list[dict[str, Any]]:
+        """Portable address history built from standard signatures + batched transactions."""
+        requested = int(params.get("limit") or self.cfg.raw_history_signature_limit)
+        limit = min(self.cfg.raw_history_signature_limit, max(1, requested))
+        options: dict[str, Any] = {"limit": limit, "commitment": "confirmed"}
+        if params.get("before-signature"):
+            options["before"] = params["before-signature"]
+        signatures = self.call("getSignaturesForAddress", [address, options]) or []
+        gte = int(params.get("gte-time") or 0)
+        lte = int(params.get("lte-time") or 2**63 - 1)
+        rows = [
+            row for row in signatures
+            if row.get("signature") and not row.get("err") and gte <= int(row.get("blockTime") or 0) <= lte
+        ]
+        calls = [
+            (
+                "getTransaction",
+                [
+                    row["signature"],
+                    {
+                        "encoding": "jsonParsed",
+                        "commitment": "confirmed",
+                        "maxSupportedTransactionVersion": 0,
+                    },
+                ],
+            )
+            for row in rows
+        ]
+        bodies = self.batch_call(calls, timeout=self.cfg.bundle_lookup_timeout_ms / 1000)
+        normalized = [
+            normalize_rpc_transaction(body, row["signature"])
+            for row, body in zip(rows, bodies)
+            if isinstance(body, dict)
+        ]
+        if params.get("sort-order") == "asc":
+            normalized.reverse()
+        return normalized
+
     def enhanced_transactions(self, address: str, **params: Any) -> list[dict[str, Any]]:
-        """Low-latency parsed Helius history used only by the entry bundle gate."""
+        """Normalized history for the bundle gate; raw RPC by default, Helius only by opt-in."""
+        if self.cfg.transaction_history_mode == "raw":
+            return self.raw_transactions(address, **params)
         url = f"https://api-mainnet.helius-rpc.com/v0/addresses/{address}/transactions"
         query = {"api-key": self.cfg.helius_api_key, "commitment": "confirmed", **params}
         timeout = self.cfg.bundle_lookup_timeout_ms / 1000
@@ -636,10 +966,16 @@ class Rpc:
         return body
 
     def origin_funder(self, wallet: str, before_ts: float) -> str | None:
-        """Earliest meaningful inbound SOL sender visible before graduation."""
+        """Oldest meaningful inbound SOL sender visible in the bounded pre-graduation sample."""
         transactions = self.enhanced_transactions(
             wallet,
-            **{"sort-order": "asc", "lte-time": int(before_ts), "limit": 25},
+            **{
+                "sort-order": "asc",
+                "lte-time": int(before_ts),
+                "limit": self.cfg.raw_funder_signature_limit
+                if self.cfg.transaction_history_mode == "raw"
+                else 25,
+            },
         )
         for tx in transactions:
             for transfer in tx.get("nativeTransfers") or []:
@@ -952,6 +1288,101 @@ class Jupiter:
         return base64.b64decode(resp.json()["swapTransaction"])
 
 
+class MigrationStream:
+    """Background standard-RPC logsSubscribe client.
+
+    It only queues signatures; transaction decoding stays in the executor's entry phase so the
+    exit-first ordering remains intact. Periodic HTTP catch-up covers disconnect gaps.
+    """
+
+    def __init__(self, cfg: Config) -> None:
+        self.cfg = cfg
+        self.signatures: queue.Queue[str] = queue.Queue(maxsize=500)
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.connected = False
+
+    def start(self) -> None:
+        if self.thread and self.thread.is_alive():
+            return
+        self.thread = threading.Thread(target=self._run, name="migration-stream", daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    def _run(self) -> None:
+        backoff = 1.0
+        endpoint_index = 0
+        while not self.stop_event.is_set():
+            endpoint = self.cfg.rpc_ws_urls[endpoint_index % len(self.cfg.rpc_ws_urls)]
+            endpoint_index += 1
+            conn = None
+            try:
+                conn = websocket.create_connection(
+                    endpoint,
+                    timeout=self.cfg.discovery_timeout_seconds,
+                    enable_multithread=True,
+                )
+                conn.send(
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "logsSubscribe",
+                            "params": [
+                                {"mentions": [self.cfg.migration_address]},
+                                {"commitment": "confirmed"},
+                            ],
+                        }
+                    )
+                )
+                response = json.loads(conn.recv())
+                if "error" in response:
+                    raise RuntimeError(f"logsSubscribe: {response['error']}")
+                self.connected = True
+                backoff = 1.0
+                while not self.stop_event.is_set():
+                    try:
+                        body = json.loads(conn.recv())
+                    except websocket.WebSocketTimeoutException:
+                        continue
+                    value = (((body.get("params") or {}).get("result") or {}).get("value") or {})
+                    signature = value.get("signature")
+                    if not signature or value.get("err"):
+                        continue
+                    try:
+                        self.signatures.put_nowait(signature)
+                    except queue.Full:
+                        # Catch-up polling is authoritative; dropping the oldest live hint is safe.
+                        try:
+                            self.signatures.get_nowait()
+                        except queue.Empty:
+                            pass
+                        self.signatures.put_nowait(signature)
+            except Exception as exc:
+                self.connected = False
+                log(f"WARN migration WebSocket disconnected: {describe_error(exc)}; retrying in {backoff:.0f}s")
+                self.stop_event.wait(backoff)
+                backoff = min(30.0, backoff * 2)
+            finally:
+                self.connected = False
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+    def drain(self, limit: int = 50) -> list[str]:
+        out: list[str] = []
+        while len(out) < limit:
+            try:
+                out.append(self.signatures.get_nowait())
+            except queue.Empty:
+                break
+        return out
+
+
 class Wallet:
     """Live-mode signer. Only constructed when EXECUTOR_MODE=live."""
 
@@ -986,6 +1417,8 @@ class Executor:
         self.wallet = Wallet(cfg) if cfg.mode == "live" else None
         self.state = load_state(cfg)
         self.state["mode"] = cfg.mode
+        self.migration_stream: MigrationStream | None = None
+        self._next_discovery_catchup = 0.0
         # Keep pending entries in the persisted state.  A deploy should not silently forget the
         # queue and then rediscover/process an unbounded burst before checking open positions.
         self.pending: list[dict[str, Any]] = self.state.setdefault("pending", [])
@@ -1010,70 +1443,86 @@ class Executor:
         return spendable * sol_price
 
     # ---- detection -------------------------------------------------------
-    def note_helius_rate_limit(self, minimum_seconds: float = 30.0) -> float:
-        """Open an exponentially increasing circuit breaker for shared Helius quota.
+    def note_provider_rate_limit(self, minimum_seconds: float = 30.0) -> float:
+        """Open an exponentially increasing circuit breaker for entry/discovery provider work.
 
-        RPC and Enhanced Transactions use the same account budget. Retrying a hard 429 every
-        30 seconds can prolong throttling and also wastes the few requests needed for exits.
+        Position monitoring and exits deliberately ignore this breaker and can fail over across
+        RPC_URLS. Only new-entry work is paused when every provider is unavailable.
         """
-        current = float(getattr(self, "_helius_poll_backoff_seconds", 30.0))
-        delay = min(self.cfg.helius_poll_backoff_max_seconds, max(minimum_seconds, current))
-        self._helius_poll_cooldown_until = max(
-            float(getattr(self, "_helius_poll_cooldown_until", 0.0)), now_ts() + delay
+        current = float(getattr(self, "_provider_backoff_seconds", 30.0))
+        delay = min(self.cfg.provider_backoff_max_seconds, max(minimum_seconds, current))
+        self._provider_cooldown_until = max(
+            float(getattr(self, "_provider_cooldown_until", 0.0)), now_ts() + delay
         )
-        self._helius_poll_backoff_seconds = min(
-            self.cfg.helius_poll_backoff_max_seconds, delay * 2
-        )
+        self._provider_backoff_seconds = min(self.cfg.provider_backoff_max_seconds, delay * 2)
         return delay
 
-    def poll_graduations(self) -> None:
-        if now_ts() < float(getattr(self, "_helius_poll_cooldown_until", 0.0)):
+    # Compatibility for callers/tests deployed during the Helius-only rollout.
+    note_helius_rate_limit = note_provider_rate_limit
+
+    def _queue_graduation(self, signature: str, timestamp_hint: float | None = None) -> None:
+        if not signature or signature in self.state["seen_signatures"]:
             return
-        url = f"https://api-mainnet.helius-rpc.com/v0/addresses/{self.cfg.migration_address}/transactions"
+        tx = self.rpc.transaction(signature)
+        if not tx:
+            return  # confirmed data may lag briefly; periodic catch-up will retry it
+        timestamp = tx.get("blockTime") or timestamp_hint
+        if not timestamp:
+            return
+        self.state["seen_signatures"].append(signature)
+        mints = candidate_mints_from_rpc_transaction(tx)
+        if len(mints) != 1:
+            if mints:
+                self.skip(
+                    ",".join(mints),
+                    f"ambiguous graduation tx {signature[:16]}… ({len(mints)} candidate mints)",
+                )
+            return
+        mint = mints[0]
+        already_queued = any(p.get("mint") == mint for p in self.pending)
+        already_owned = any(p.get("mint") == mint for p in self.state.get("positions", []))
+        if already_queued or already_owned:
+            return
+        age = now_ts() - int(timestamp)
+        if age > self.cfg.max_entry_age_seconds:
+            self.skip(mint, f"graduation too old at detection ({age:.0f}s)")
+            return
+        enter_at = int(timestamp) + self.cfg.entry_delay_seconds
+        self.pending.append({"mint": mint, "graduated_ts": int(timestamp), "enter_at": enter_at})
+        log(
+            f"DETECTED graduation {mint} (age {age:.0f}s, "
+            f"entering at +{self.cfg.entry_delay_seconds:.0f}s)"
+        )
+
+    def poll_graduations(self) -> None:
+        if now_ts() < float(getattr(self, "_provider_cooldown_until", 0.0)):
+            return
+        signatures = self.migration_stream.drain() if self.migration_stream else []
         try:
-            response = requests.get(
-                url,
-                params={"api-key": self.cfg.helius_api_key, "limit": 10},
-                timeout=self.cfg.helius_poll_timeout_seconds,
-            )
-            response.raise_for_status()
-            batch = response.json()
+            for signature in signatures:
+                self._queue_graduation(signature)
+            if now_ts() < self._next_discovery_catchup:
+                return
+            self._next_discovery_catchup = now_ts() + self.cfg.discovery_catchup_seconds
+            rows = self.rpc.call(
+                "getSignaturesForAddress",
+                [
+                    self.cfg.migration_address,
+                    {"limit": self.cfg.discovery_poll_limit, "commitment": "confirmed"},
+                ],
+                timeout=self.cfg.discovery_timeout_seconds,
+            ) or []
+            for row in reversed(rows):
+                if not row.get("err"):
+                    self._queue_graduation(row.get("signature") or "", row.get("blockTime"))
         except Exception as exc:
             if is_rate_limited(exc):
-                delay = self.note_helius_rate_limit()
-                log(f"WARN helius poll rate limited; pausing detection polls for {delay:.0f}s")
+                delay = self.note_provider_rate_limit()
+                log(f"WARN RPC discovery rate limited; pausing new-entry work for {delay:.0f}s")
             else:
-                log(f"WARN helius poll failed: {describe_error(exc)}")
+                log(f"WARN RPC discovery failed: {describe_error(exc)}")
             return
-        self._helius_poll_backoff_seconds = 30.0
-        if not isinstance(batch, list):
-            log(f"WARN helius poll unexpected response: {str(batch)[:200]}")
-            return
-        for tx in batch:
-            signature = tx.get("signature") or ""
-            timestamp = tx.get("timestamp") or tx.get("blockTime")
-            if not signature or not timestamp or signature in self.state["seen_signatures"]:
-                continue
-            self.state["seen_signatures"].append(signature)
-            mints = candidate_mints(tx)
-            if len(mints) != 1:
-                if mints:
-                    self.skip(",".join(mints), f"ambiguous graduation tx {signature[:16]}… ({len(mints)} candidate mints)")
-                continue
-            mint = mints[0]
-            # One mint can appear in more than one migration-address transaction. Do not queue
-            # duplicate analysis/buys or spend twice the Helius budget on the same launch.
-            already_queued = any(p.get("mint") == mint for p in self.pending)
-            already_owned = any(p.get("mint") == mint for p in self.state.get("positions", []))
-            if already_queued or already_owned:
-                continue
-            age = now_ts() - int(timestamp)
-            if age > self.cfg.max_entry_age_seconds:
-                self.skip(mint, f"graduation too old at detection ({age:.0f}s)")
-                continue
-            enter_at = int(timestamp) + self.cfg.entry_delay_seconds
-            self.pending.append({"mint": mint, "graduated_ts": int(timestamp), "enter_at": enter_at})
-            log(f"DETECTED graduation {mint} (age {age:.0f}s, entering at +{self.cfg.entry_delay_seconds:.0f}s)")
+        self._provider_backoff_seconds = 30.0
 
     def _prune_stale_pending(self) -> None:
         """Drop entry work that became unsafe while the process was stopped."""
@@ -1712,14 +2161,14 @@ class Executor:
         if (
             self.cfg.mode == "live"
             and getattr(self, "_reconcile_pending", False)
-            and now_ts() >= float(getattr(self, "_helius_poll_cooldown_until", 0.0))
+            and now_ts() >= float(getattr(self, "_provider_cooldown_until", 0.0))
         ):
             try:
                 self.reconcile_wallet(self.sol_price_usd())
                 self._reconcile_pending = False
             except Exception as exc:
                 if is_rate_limited(exc):
-                    delay = self.note_helius_rate_limit(minimum_seconds=300)
+                    delay = self.note_provider_rate_limit(minimum_seconds=300)
                     log(f"WARN wallet reconciliation still rate limited; retrying in {delay:.0f}s")
                 else:
                     log(f"WARN deferred wallet reconciliation failed: {describe_error(exc)}")
@@ -1777,41 +2226,49 @@ class Executor:
             f"high_confidence>={self.cfg.high_confidence_funder_coverage_pct:.0f}% "
             f"holders={self.cfg.bundle_max_wallets} funders={self.cfg.bundle_funder_max_wallets} "
             f"funder_workers={self.cfg.bundle_lookup_workers} "
+            f"providers={len(self.cfg.rpc_urls)} discovery={self.cfg.discovery_mode} "
+            f"history={self.cfg.transaction_history_mode} das={'on' if self.cfg.rpc_das_enabled else 'off'} "
             f"bundle_mode={'log' if self.cfg.bundle_log_only else 'block'} "
             f"adopt>=${self.cfg.min_adopt_usd} "
             f"stuck_after={self.cfg.stuck_after_minutes:.0f}m "
             f"retries={self.cfg.entry_retries} daily_loss_limit=${self.cfg.daily_loss_limit_usd}")
         if self.cfg.mode == "live":
             log(f"live wallet: {self.wallet.pubkey} (burner only!)")
-            startup_rate_limited = False
+            startup_provider_limited = False
             try:
                 balance = self.rpc.sol_balance(self.wallet.pubkey)
                 log(f"wallet balance: {balance:.4f} SOL ({self.cfg.min_sol_reserve} SOL reserved for fees)")
                 if balance <= self.cfg.min_sol_reserve:
                     log("WARNING: balance at or below the fee reserve — no entries will be taken until funded")
             except Exception as exc:
-                startup_rate_limited = is_rate_limited(exc)
-                if startup_rate_limited:
-                    delay = self.note_helius_rate_limit(minimum_seconds=300)
-                    log(f"WARN could not read wallet balance: Helius rate limited; pausing provider calls for {delay:.0f}s")
+                startup_provider_limited = is_provider_unavailable(exc)
+                if startup_provider_limited:
+                    delay = self.note_provider_rate_limit(minimum_seconds=300)
+                    log(f"WARN could not read wallet balance: RPC providers unavailable; pausing new-entry work for {delay:.0f}s")
                 else:
                     log(f"WARN could not read wallet balance: {describe_error(exc)}")
         if self.state["positions"]:
             log(f"resuming {len(self.state['positions'])} open position(s) from state file")
         if self.cfg.mode == "live":
-            if startup_rate_limited:
+            if startup_provider_limited:
                 self._reconcile_pending = True
-                log("WARN wallet reconciliation deferred until the Helius cooldown expires")
+                log("WARN wallet reconciliation deferred until the provider cooldown expires")
             else:
                 try:
                     self.reconcile_wallet(self.sol_price_usd())
                 except Exception as exc:
-                    if is_rate_limited(exc):
-                        delay = self.note_helius_rate_limit(minimum_seconds=300)
+                    if is_provider_unavailable(exc):
+                        delay = self.note_provider_rate_limit(minimum_seconds=300)
                         self._reconcile_pending = True
-                        log(f"WARN wallet reconciliation rate limited; deferred for {delay:.0f}s")
+                        log(f"WARN wallet reconciliation provider unavailable; deferred for {delay:.0f}s")
                     else:
                         log(f"WARN wallet reconciliation failed: {describe_error(exc)}")
+        if self.cfg.discovery_mode == "websocket":
+            self.migration_stream = MigrationStream(self.cfg)
+            self.migration_stream.start()
+            log(f"graduation discovery: WebSocket stream + {self.cfg.discovery_catchup_seconds:.0f}s RPC catch-up")
+        else:
+            log(f"graduation discovery: RPC polling every {self.cfg.discovery_catchup_seconds:.0f}s")
         while True:
             try:
                 self.run_cycle()
@@ -1823,7 +2280,26 @@ class Executor:
 def main() -> None:
     cfg = Config()
     if "--print-config" in sys.argv:
-        safe = {k: v for k, v in vars(cfg).items() if k != "wallet_key"}
+        safe = {
+            key: value
+            for key, value in vars(cfg).items()
+            if key
+            not in {
+                "wallet_key",
+                "helius_api_key",
+                "rpc_url",
+                "rpc_urls",
+                "rpc_ws_url",
+                "rpc_ws_urls",
+                "jupiter_base",
+            }
+        }
+        safe["rpc_urls"] = [redact_endpoint(url) for url in cfg.rpc_urls]
+        safe["rpc_ws_urls"] = [
+            redact_endpoint(url.replace("wss://", "https://", 1).replace("ws://", "http://", 1))
+            for url in cfg.rpc_ws_urls
+        ]
+        safe["jupiter_base"] = redact_endpoint(cfg.jupiter_base)
         print(json.dumps(safe, indent=2))
         return
     Executor(cfg).run()
