@@ -174,9 +174,9 @@ prints the important ones.
 
 | Variable | Default | Read by | Meaning |
 |---|---|---|---|
-| `HELIUS_API_KEY` | (none) | collector; optional executor fallback | Required by `grad_backtest.py collect`. For the executor only, it can still construct the legacy Helius RPC URL when `RPC_URL(S)` is absent or enable `TRANSACTION_HISTORY_MODE=helius`. |
+| `HELIUS_API_KEY` | (none) | collector; optional enhanced history | Required by `grad_backtest.py collect` or `TRANSACTION_HISTORY_MODE=helius`. Does not select the executor RPC endpoint. |
 | `MIGRATION_ADDRESS` | (none, required) | collector, executor | Pump.fun's migration authority. Public, not a secret; deliberately not hard-coded because it has changed over time. |
-| `RPC_URL` | Helius URL only when `HELIUS_API_KEY` exists | executor | Primary standard Solana JSON-RPC HTTPS endpoint. Required unless `RPC_URLS` or the legacy Helius fallback is configured. |
+| `RPC_URL` | PublicNode + Solana public mainnet | executor | Optional explicit standard Solana JSON-RPC endpoint. With no RPC variables, uses `https://solana-rpc.publicnode.com` then `https://api.mainnet.solana.com`, without API keys. |
 | `RPC_URLS` | `RPC_URL` | executor | Comma/newline-separated standard RPC endpoints. Calls automatically fail over on rate limits, timeouts, connection failures, 5xx responses, or unhealthy-node errors. |
 | `RPC_WS_URL`, `RPC_WS_URLS` | derived from RPC HTTPS URL(s) | executor | Optional provider WebSocket endpoint(s), in the same order as `RPC_URLS`. |
 | `TRANSACTION_HISTORY_MODE` | `raw` | executor | `raw` reconstructs the bundle detector's inputs from standard RPC. `helius` retains the enhanced-history compatibility path and requires `HELIUS_API_KEY`. |
@@ -256,6 +256,19 @@ seconds, then 60/120/240 seconds, capped by `RPC_BACKOFF_MAX_SECONDS`, default
 900). Exit monitoring remains first in the loop and continues attempting RPC
 failover. If startup is already provider-limited, wallet reconciliation is deferred
 and retried after a minimum five-minute cooldown.
+
+With no endpoint variables set, the executor uses the keyless mainnet endpoints
+published by [PublicNode](https://solana.publicnode.com/) and
+[Solana](https://solana.com/docs/references/clusters), in that order. An existing
+`HELIUS_API_KEY` does not override these defaults. HTTP endpoints and successful
+WebSocket connections are logged by hostname with credentials removed.
+WebSocket failures put each endpoint on its own 30/60/120-second cooldown, capped
+at `RPC_BACKOFF_MAX_SECONDS`; another available endpoint is tried immediately.
+When all are unavailable, the thread waits interruptibly until one cooldown ends.
+These shared services can throttle or restrict history and have no guaranteed
+capacity for this bot. Incomplete bundle data still blocks entries. Explicit
+`RPC_URLS`/`RPC_URL` and `RPC_WS_URLS`/`RPC_WS_URL` override the defaults, with plural
+variables taking precedence. Use provider-issued endpoints for sustained operation.
 
 ### 4.5 Swaps, slippage, retries
 
@@ -775,7 +788,7 @@ size. Trade half the recommendation live at first.
 ### Railway (dashboard + executor, recommended)
 
 1. New project → Deploy from GitHub repo → this repo. The root `Dockerfile` builds `grad-backtest/` with no Root Directory setting.
-2. **Variables**: `MIGRATION_ADDRESS`, `RPC_URL` (or `RPC_URLS`), `ADMIN_TOKEN`, then the executor variables you want to change from their defaults (section 4). For live trading: `EXECUTOR_MODE=live`, `EXECUTOR_AUTOSTART=1`, `WALLET_PRIVATE_KEY` (mark it sealed). `HELIUS_API_KEY` is only needed for historical collection or the optional Helius compatibility mode.
+2. **Variables**: `MIGRATION_ADDRESS`, `ADMIN_TOKEN` (RPC endpoints are built in; optionally override with `RPC_URL` or `RPC_URLS`), then the executor variables you want to change from their defaults (section 4). For live trading: `EXECUTOR_MODE=live`, `EXECUTOR_AUTOSTART=1`, `WALLET_PRIVATE_KEY` (mark it sealed). `HELIUS_API_KEY` is only needed for historical collection or the optional Helius compatibility mode.
 3. **Volume** mounted at `/data`. Without it every deploy starts with an empty filesystem: the OHLCV cache, results, trade history, and the executor's state (open positions' entry prices and peaks, moon bags) are lost, and the restart has to adopt whatever is in the wallet at current value.
 4. **Networking → Generate Domain** for the public dashboard.
 5. Every push to `main` redeploys, which restarts the executor. Each restart costs several minutes of not trading plus the state loss above. Set **Settings → Watch Paths** to something like `/grad-backtest/**/*.py`, `/grad-backtest/static/**`, `/Dockerfile` so documentation-only commits do not redeploy.
