@@ -962,7 +962,7 @@ class Rpc:
         supply_ui, decimals, _ = self.token_supply_details(mint)
         return supply_ui, decimals
 
-    def mint_first_seen(self, mint: str, stop_before_ts: float, max_pages: int = 3) -> float | None:
+    def mint_first_seen(self, mint: str, stop_before_ts: float, max_pages: int = 30) -> float | None:
         """Return verified creation only; never reuse a lower-bound activity timestamp.
 
         Retains the public method name for callers. Signature work uses the same bounded
@@ -1113,7 +1113,7 @@ class Rpc:
         # Read backwards to the requested window instead of filtering only the latest
         # page (which silently returned an empty early-buy/funding history).
         reached_window = False
-        for page_number in range(1, min(3, max(1, int(params.get('max-pages', 3)))) + 1):
+        for page_number in range(1, min(30, max(1, int(params.get('max-pages', 3)))) + 1):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise RuntimeError('history window unavailable: signature search time budget exhausted')
