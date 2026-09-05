@@ -1,7 +1,8 @@
-"""Operational fixes from the first live session after the guards shipped: 429s from Helius and
-Jupiter during startup reconciliation, adopted dust bags occupying every entry slot, and a sell
-that needed three attempts because the RPC node had not seen Jupiter's blockhash."""
+"""Operational fixes from live sessions: provider/Jupiter 429s, dust bags occupying entry
+slots, and swaps that need rebuilding when an RPC node has not seen Jupiter's blockhash."""
 import os
+import io
+import json
 import tempfile
 import unittest
 from unittest import mock
@@ -117,46 +118,155 @@ class SolPriceCacheTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
 
 
-class HeliusPollProtectionTests(unittest.TestCase):
+class ProviderDiscoveryProtectionTests(unittest.TestCase):
     def test_rate_limit_circuit_breaker_grows_exponentially(self):
         executor, p = fresh()
         self.addCleanup(p.stop)
         ex = executor.Executor(executor.Config())
         with mock.patch.object(executor, "now_ts", return_value=1000.0):
-            self.assertEqual(ex.note_helius_rate_limit(), 30.0)
-        self.assertEqual(ex._helius_poll_cooldown_until, 1030.0)
+            self.assertEqual(ex.note_provider_rate_limit(), 30.0)
+        self.assertEqual(ex._provider_cooldown_until, 1030.0)
         with mock.patch.object(executor, "now_ts", return_value=1030.0):
-            self.assertEqual(ex.note_helius_rate_limit(), 60.0)
-        self.assertEqual(ex._helius_poll_cooldown_until, 1090.0)
+            self.assertEqual(ex.note_provider_rate_limit(), 60.0)
+        self.assertEqual(ex._provider_cooldown_until, 1090.0)
 
     def test_rate_limit_starts_cooldown_instead_of_hammering_every_cycle(self):
         executor, p = fresh()
         self.addCleanup(p.stop)
         ex = executor.Executor(executor.Config())
-        response = mock.Mock()
-        response.raise_for_status.side_effect = http_error(429)
-        get = mock.Mock(return_value=response)
-        with mock.patch.object(executor.requests, "get", get), mock.patch.object(
-            executor, "now_ts", return_value=1000.0
-        ):
+        call = mock.Mock(side_effect=http_error(429))
+        with mock.patch.object(ex.rpc, "call", call), mock.patch.object(executor, "now_ts", return_value=1000.0):
             ex.poll_graduations()
             ex.poll_graduations()
-        self.assertEqual(get.call_count, 1)
-        self.assertEqual(ex._helius_poll_cooldown_until, 1030.0)
+        self.assertEqual(call.call_count, 1)
+        self.assertEqual(ex._provider_cooldown_until, 1030.0)
 
     def test_same_mint_is_not_queued_twice(self):
         executor, p = fresh()
         self.addCleanup(p.stop)
         ex = executor.Executor(executor.Config())
         ex.pending.append({"mint": "m", "graduated_ts": 990, "enter_at": 1020})
-        response = mock.Mock()
-        response.raise_for_status.return_value = None
-        response.json.return_value = [{"signature": "new-sig", "timestamp": 998}]
-        with mock.patch.object(executor.requests, "get", return_value=response), mock.patch.object(
-            executor, "candidate_mints", return_value=["m"]
-        ), mock.patch.object(executor, "now_ts", return_value=1000.0):
+        ex.rpc.call = mock.Mock(return_value=[{"signature": "new-sig", "blockTime": 998, "err": None}])
+        ex.rpc.transaction = mock.Mock(return_value={"transaction": {}})
+        with mock.patch.object(executor, "candidate_mints_from_rpc_transaction", return_value=["m"]), mock.patch.object(
+            executor, "now_ts", return_value=1000.0
+        ):
             ex.poll_graduations()
         self.assertEqual([item["mint"] for item in ex.pending], ["m"])
+
+    def test_config_accepts_standard_rpc_without_helius(self):
+        executor, p = fresh(HELIUS_API_KEY="", RPC_URL="https://rpc.example/key")
+        self.addCleanup(p.stop)
+        cfg = executor.Config()
+        cfg.validate()
+        self.assertEqual(cfg.rpc_urls, ["https://rpc.example/key"])
+        self.assertEqual(cfg.transaction_history_mode, "raw")
+
+    def test_rpc_fails_over_from_rate_limited_primary(self):
+        executor, p = fresh(HELIUS_API_KEY="", RPC_URLS="https://one.example,https://two.example")
+        self.addCleanup(p.stop)
+        rpc = executor.Rpc(executor.Config())
+        calls = []
+
+        def post(url, **kwargs):
+            calls.append(url)
+            if url == "https://one.example":
+                raise http_error(429)
+            response = mock.Mock()
+            response.raise_for_status.return_value = None
+            response.json.return_value = {"result": {"value": 7}}
+            return response
+
+        rpc.session.post = post
+        self.assertEqual(rpc.call("getBalance", ["wallet"]), {"value": 7})
+        self.assertEqual(calls, ["https://one.example", "https://two.example"])
+        self.assertEqual(rpc._active_endpoint, 1)
+
+    def test_rpc_batch_fails_over_from_json_rate_limit(self):
+        executor, p = fresh(HELIUS_API_KEY="", RPC_URLS="https://one.example,https://two.example")
+        self.addCleanup(p.stop)
+        rpc = executor.Rpc(executor.Config())
+        calls = []
+
+        def post(url, **kwargs):
+            calls.append(url)
+            response = mock.Mock()
+            response.raise_for_status.return_value = None
+            response.json.return_value = (
+                [{"jsonrpc": "2.0", "id": 1, "error": {"code": -32005, "message": "Too many requests"}}]
+                if url == "https://one.example"
+                else [{"jsonrpc": "2.0", "id": 1, "result": {"value": 9}}]
+            )
+            return response
+
+        rpc.session.post = post
+        self.assertEqual(rpc.batch_call([("getBalance", ["wallet"])]), [{"value": 9}])
+        self.assertEqual(calls, ["https://one.example", "https://two.example"])
+
+    def test_print_config_redacts_all_provider_credentials(self):
+        secret = "secret-path-key"
+        executor, p = fresh(
+            HELIUS_API_KEY="secret-helius-key",
+            RPC_URL=f"https://provider.example/{secret}?api-key=also-secret",
+        )
+        self.addCleanup(p.stop)
+        output = io.StringIO()
+        with mock.patch.object(executor.sys, "argv", ["executor.py", "--print-config"]), mock.patch(
+            "sys.stdout", output
+        ):
+            executor.main()
+        text = output.getvalue()
+        self.assertNotIn(secret, text)
+        self.assertNotIn("secret-helius-key", text)
+        parsed = json.loads(text)
+        self.assertEqual(parsed["rpc_urls"], ["https://provider.example/…"])
+
+    def test_raw_transaction_parser_finds_mint_and_transfers(self):
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        mint = "Mint111111111111111111111111111111111111111"
+        dex = next(iter(executor.DEX_PROGRAMS))
+        tx = {
+            "slot": 10,
+            "blockTime": 1000,
+            "transaction": {
+                "signatures": ["sig"],
+                "message": {
+                    "accountKeys": [
+                        {"pubkey": "buyer", "signer": True},
+                        {"pubkey": dex, "signer": False},
+                        {"pubkey": "vault", "signer": False},
+                        {"pubkey": "buyer-token", "signer": False},
+                    ],
+                    "instructions": [
+                        {
+                            "program": "system",
+                            "parsed": {
+                                "type": "transfer",
+                                "info": {"source": "funder", "destination": "buyer", "lamports": 200000},
+                            },
+                        },
+                        {"programId": dex, "accounts": [], "data": "x"},
+                    ],
+                },
+            },
+            "meta": {
+                "preTokenBalances": [
+                    {"accountIndex": 2, "mint": mint, "owner": "vault-owner", "uiTokenAmount": {"amount": "100", "decimals": 0}},
+                    {"accountIndex": 3, "mint": mint, "owner": "buyer", "uiTokenAmount": {"amount": "0", "decimals": 0}},
+                ],
+                "postTokenBalances": [
+                    {"accountIndex": 2, "mint": mint, "owner": "vault-owner", "uiTokenAmount": {"amount": "40", "decimals": 0}},
+                    {"accountIndex": 3, "mint": mint, "owner": "buyer", "uiTokenAmount": {"amount": "60", "decimals": 0}},
+                ],
+            },
+        }
+        self.assertEqual(executor.candidate_mints_from_rpc_transaction(tx), [mint])
+        normalized = executor.normalize_rpc_transaction(tx)
+        self.assertEqual(normalized["type"], "SWAP")
+        self.assertEqual(normalized["feePayer"], "buyer")
+        self.assertEqual(normalized["nativeTransfers"][0]["amount"], 200000)
+        self.assertTrue(any(t["mint"] == mint and t["toUserAccount"] == "buyer" for t in normalized["tokenTransfers"]))
 
 
 class AdoptedSlotTests(unittest.TestCase):
