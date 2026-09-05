@@ -184,6 +184,14 @@ def log(message: str) -> None:
         fh.write(line + "\n")
 
 
+# Public, keyless mainnet services. Explicit RPC_URL(S) still overrides this list.
+# Sources: https://solana.publicnode.com/ and https://solana.com/docs/references/clusters
+DEFAULT_RPC_URLS = (
+    "https://solana-rpc.publicnode.com",
+    "https://api.mainnet.solana.com",
+)
+
+
 class Config:
     def __init__(self) -> None:
         self.mode = os.getenv("EXECUTOR_MODE", "paper").lower()
@@ -191,10 +199,10 @@ class Config:
             raise SystemExit("EXECUTOR_MODE must be 'paper' or 'live'")
         self.helius_api_key = os.getenv("HELIUS_API_KEY") or ""
         self.migration_address = os.getenv("MIGRATION_ADDRESS") or ""
-        legacy_rpc = os.getenv("RPC_URL") or ""
-        if not legacy_rpc and self.helius_api_key:
-            legacy_rpc = f"https://mainnet.helius-rpc.com/?api-key={self.helius_api_key}"
-        self.rpc_urls = split_urls(os.getenv("RPC_URLS") or legacy_rpc)
+        self.rpc_urls = split_urls(os.getenv("RPC_URLS") or os.getenv("RPC_URL") or "")
+        if not self.rpc_urls:
+            # An existing, exhausted Helius key must not override the keyless defaults.
+            self.rpc_urls = list(DEFAULT_RPC_URLS)
         self.rpc_url = self.rpc_urls[0] if self.rpc_urls else ""
         explicit_ws = split_urls(os.getenv("RPC_WS_URLS") or os.getenv("RPC_WS_URL") or "")
         self.rpc_ws_urls = explicit_ws or [websocket_url(url) for url in self.rpc_urls]
@@ -1327,11 +1335,23 @@ class MigrationStream:
         self.stop_event.set()
 
     def _run(self) -> None:
-        backoff = 1.0
+        cooldowns: dict[str, float] = {}
+        failures: dict[str, int] = {}
         endpoint_index = 0
         while not self.stop_event.is_set():
-            endpoint = self.cfg.rpc_ws_urls[endpoint_index % len(self.cfg.rpc_ws_urls)]
-            endpoint_index += 1
+            endpoints = self.cfg.rpc_ws_urls
+            endpoint = None
+            for offset in range(len(endpoints)):
+                index = (endpoint_index + offset) % len(endpoints)
+                candidate = endpoints[index]
+                if cooldowns.get(candidate, 0) <= time.monotonic():
+                    endpoint = candidate
+                    endpoint_index = (index + 1) % len(endpoints)
+                    break
+            if endpoint is None:
+                delay = max(0.1, min(cooldowns.values()) - time.monotonic())
+                self.stop_event.wait(delay)
+                continue
             conn = None
             try:
                 conn = websocket.create_connection(
@@ -1353,10 +1373,11 @@ class MigrationStream:
                     )
                 )
                 response = json.loads(conn.recv())
-                if "error" in response:
-                    raise RuntimeError(f"logsSubscribe: {response['error']}")
+                if not isinstance(response, dict) or response.get("id") != 1 or not isinstance(response.get("result"), int):
+                    raise RuntimeError("logsSubscribe did not acknowledge the subscription")
                 self.connected = True
-                backoff = 1.0
+                failures[endpoint] = 0
+                log(f"migration WebSocket connected: {redact_endpoint(endpoint.replace('wss://', 'https://').replace('ws://', 'http://'))}")
                 while not self.stop_event.is_set():
                     try:
                         body = json.loads(conn.recv())
@@ -1377,9 +1398,11 @@ class MigrationStream:
                         self.signatures.put_nowait(signature)
             except Exception as exc:
                 self.connected = False
-                log(f"WARN migration WebSocket disconnected: {describe_error(exc)}; retrying in {backoff:.0f}s")
-                self.stop_event.wait(backoff)
-                backoff = min(30.0, backoff * 2)
+                failures[endpoint] = min(10, failures.get(endpoint, 0) + 1)
+                delay = min(self.cfg.provider_backoff_max_seconds, 30.0 * 2 ** (failures[endpoint] - 1))
+                cooldowns[endpoint] = time.monotonic() + delay
+                host = redact_endpoint(endpoint.replace('wss://', 'https://').replace('ws://', 'http://'))
+                log(f"WARN migration WebSocket {host} unavailable ({type(exc).__name__}); cooling down for {delay:.0f}s; trying another available endpoint")
             finally:
                 self.connected = False
                 if conn is not None:
@@ -2247,6 +2270,7 @@ class Executor:
             f"adopt>=${self.cfg.min_adopt_usd} "
             f"stuck_after={self.cfg.stuck_after_minutes:.0f}m "
             f"retries={self.cfg.entry_retries} daily_loss_limit=${self.cfg.daily_loss_limit_usd}")
+        log("RPC endpoints: " + ", ".join(redact_endpoint(url) for url in self.cfg.rpc_urls))
         if self.cfg.mode == "live":
             log(f"live wallet: {self.wallet.pubkey} (burner only!)")
             startup_provider_limited = False
