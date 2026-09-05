@@ -528,6 +528,89 @@ class MigrationRegressionTests(unittest.TestCase):
             bot.try_enter({"mint": "mint", "graduated_ts": 1000}, 100)
         bot.entry_metadata.assert_not_called()
 
+class DataEquivalenceTests(unittest.TestCase):
+    """Contract cases independent of live trade outcomes; no network or trade submission."""
+
+    def setUp(self):
+        self.ex, p = fresh()
+        self.addCleanup(p.stop)
+        self.rpc = self.ex.Rpc(self.ex.Config())
+
+    def test_origin_sample_matches_oldest_first_contract_across_pages(self):
+        # An old funding transaction is omitted by the former recent-ten shortcut.
+        pages = [[{'signature': str(i), 'blockTime': 3000 - i} for i in range(1000)],
+                 [{'signature': str(i), 'blockTime': 3000 - i} for i in range(1000, 1030)]]
+        self.rpc.call = mock.Mock(side_effect=pages)
+        self.rpc.batch_call = mock.Mock(side_effect=lambda calls, **kw: [
+            {'slot': 1, 'blockTime': 3000 - int(c[1][0]), 'meta': {'err': None}}
+            for c in calls])
+        result = self.rpc.raw_transactions('wallet', **{'sort-order': 'asc', 'limit': 25, 'lte-time': 3000})
+        expected = sorted([r for page in pages for r in page], key=lambda r: r['blockTime'])[:25]
+        self.assertEqual([r['signature'] for r in result], [r['signature'] for r in expected])
+        self.assertEqual(sum(len(c.args[0]) for c in self.rpc.batch_call.call_args_list), 25)
+
+    def test_origin_search_limit_cannot_return_recent_sample(self):
+        self.rpc.call = mock.Mock(side_effect=[
+            [{'signature': str(p * 1000 + i), 'blockTime': 5000 - p * 1000 - i}
+             for i in range(1000)] for p in range(3)])
+        self.rpc.batch_call = mock.Mock()
+        with self.assertRaisesRegex(RuntimeError, 'history window unavailable'):
+            self.rpc.raw_transactions('wallet', **{'sort-order': 'asc', 'limit': 25, 'lte-time': 6000})
+        self.rpc.batch_call.assert_not_called()
+
+    def test_funder_identity_matches_normalized_helius_contract(self):
+        early = {'slot': 1, 'blockTime': 10, 'meta': {'err': None}, 'transaction': {'message': {
+            'accountKeys': ['original'], 'instructions': [{'program': 'system', 'parsed': {
+                'type': 'transfer', 'info': {'source': 'original', 'destination': 'wallet', 'lamports': 1000000}}}]}}}
+        recent = {'slot': 2, 'blockTime': 20, 'meta': {'err': None}, 'transaction': {'message': {
+            'accountKeys': ['recent'], 'instructions': [{'program': 'system', 'parsed': {
+                'type': 'transfer', 'info': {'source': 'recent', 'destination': 'wallet', 'lamports': 1000000}}}]}}}
+        self.rpc.call = mock.Mock(return_value=[{'signature': 'recent', 'blockTime': 20},
+                                               {'signature': 'early', 'blockTime': 10}])
+        self.rpc.batch_call = mock.Mock(return_value=[recent, early])
+        self.assertEqual(self.rpc.origin_funder('wallet', 30), 'original')
+        self.assertEqual(self.ex.normalize_rpc_transaction(early)['nativeTransfers'], [
+            {'fromUserAccount': 'original', 'toUserAccount': 'wallet', 'amount': 1000000}])
+
+    def test_legacy_cache_and_different_cutoff_are_not_reused(self):
+        self.rpc.wallet_graph_cache['funders']['wallet'] = {'funder': 'wrong', 'checked_at': self.ex.now_ts()}
+        self.rpc.origin_funder = mock.Mock(side_effect=['original', 'later'])
+        self.assertEqual(self.rpc.cached_origin_funder('wallet', 30), 'original')
+        self.assertEqual(self.rpc.cached_origin_funder('wallet', 30), 'original')
+        self.assertEqual(self.rpc.cached_origin_funder('wallet', 40), 'later')
+        self.assertEqual(self.rpc.origin_funder.call_count, 2)
+
+    def creation_fixture(self):
+        # Reduced real successful CreateV2 from b9BDZime... at 2026-09-05 07:52:08 UTC.
+        # Preserves the instruction data and mint/curve positions used by the decoder.
+        mint = '6zbYeyBbr5hjkPrApW8QDBstMuxbRV8zMP9cYeUwpump'
+        accounts = [mint, 'TSLvdd1pWpHVjahSpsvCXUbgwsL3JAcvokwaKt1eokM',
+                    'B7oPP7e5XXHJRQkqexfMvjKeYFpCg8js2cCxDSDLXbRV'] + ['unused'] * 13
+        return {'slot': 444466647, 'blockTime': 1788594728, 'meta': {'err': None},
+                'transaction': {'message': {'accountKeys': ['different-fee-payer'], 'instructions': [{
+                    'programId': '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', 'accounts': accounts,
+                    'data': '9qREnYz48Foyukf2pDu6SAJz7PzXwvhEFTn9rVFKFPqgZgBrSJgf3VCiyAn3MTY1mTi3pSYvfHtopRg2BVvqpU3XKfAiJJmfBJk7zG3WgyyHAVEhF27YGfq3FkVX9BhCfabXB4FUqwGEyfujCJrZipG8tPaGG8DKWHjCMh1WTbv4zfRYTdNM7cyR6bGxbz7Xn4rH4d684B5nLqXm'}]}}}
+
+    def test_real_create_v2_replay_identifies_creator_and_timestamp(self):
+        tx = self.creation_fixture()
+        c = self.ex.pump_creations(tx)
+        self.assertEqual(len(c), 1)
+        self.assertEqual(c[0]['timestamp'], 1788594728)
+        self.assertEqual(c[0]['creator'], 'ukmKGsMABSWpTQ9UzWuJiZPBN8vi6xnJ16gvPimkwxQ')
+        self.rpc.call = mock.Mock(return_value=[{'signature': 'creation', 'blockTime': 1788594728}])
+        self.rpc.batch_call = mock.Mock(return_value=[tx])
+        self.assertEqual(self.rpc.mint_first_seen(c[0]['mint'], 1788594608), 1788594728)
+
+    def test_failed_wrong_curve_and_truncated_creations_are_unknown(self):
+        for variant in ('failed', 'curve', 'truncated', 'missing_meta'):
+            tx = self.creation_fixture()
+            if variant == 'failed': tx['meta']['err'] = {'InstructionError': [0, 1]}
+            if variant == 'missing_meta': del tx['meta']
+            if variant == 'curve': tx['transaction']['message']['instructions'][0]['accounts'][2] = 'wrong'
+            if variant == 'truncated': tx['transaction']['message']['instructions'][0]['data'] = '123'
+            with self.subTest(variant=variant): self.assertEqual(self.ex.pump_creations(tx), [])
+
+
 class AdoptedSlotTests(unittest.TestCase):
     def test_adopted_positions_do_not_take_entry_slots(self):
         executor, p = fresh(MAX_CONCURRENT_POSITIONS="3")
@@ -539,8 +622,12 @@ class AdoptedSlotTests(unittest.TestCase):
             for i in range(3)
         ]
         ex.jup.quote = lambda a, b, amt, **kw: {"outAmount": "150000000000", "priceImpactPct": "0.01"}
+        ex.rpc.mint_first_seen = lambda mint, cutoff: 800.0
         ex.rpc.call = lambda m, params: {
-            "getTokenSupply": {"value": {"uiAmountString": "1000000000", "decimals": 6}},
+            "getTokenSupply": {"value": {
+                "amount": "1000000000000000",
+                "uiAmountString": "1000000000", "decimals": 6,
+            }},
             "getSignaturesForAddress": [{"signature": "s", "blockTime": 1}],
             "getTokenLargestAccounts": {"value": []},
         }[m]

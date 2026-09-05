@@ -32,7 +32,7 @@ class MetadataOrderingTests(unittest.TestCase):
         self.addCleanup(clock.stop)
         self.bot = self.ex.Executor(self.ex.Config())
         self.bot.rpc = mock.Mock()
-        self.bot.rpc.token_supply.return_value = (1_000_000, 0)
+        self.bot.rpc.token_supply_details.return_value = (1_000_000, 0, 1_000_000)
         self.bot.rpc.mint_first_seen.return_value = GRAD - 120
         self.bot.rpc.top_wallet_holder.return_value = ("holder", 100_000)
         self.bot.rpc.bundle_snapshot.return_value = {"complete": True}
@@ -68,7 +68,7 @@ class MetadataOrderingTests(unittest.TestCase):
         self.assertTrue(result[4]["complete"])
         self.bot.rpc.bundle_snapshot.assert_called_once()
         self.assertEqual([c[0] for c in self.bot.rpc.method_calls],
-                         ["token_supply", "mint_first_seen", "top_wallet_holder", "bundle_snapshot"])
+                         ["token_supply_details", "mint_first_seen", "top_wallet_holder", "bundle_snapshot"])
 
     def test_unknown_curve_stays_incomplete(self):
         self.bot.rpc.mint_first_seen.return_value = None
@@ -291,40 +291,39 @@ def sigs(times, n=None):
 
 
 class MintFirstSeenTests(unittest.TestCase):
-    def test_short_history_returns_creation_time(self):
-        executor, p = fresh()
-        self.addCleanup(p.stop)
-        fake = FakeRpc(executor, {"getSignaturesForAddress": [sigs([1029, 1015, 1000])]})
-        self.assertEqual(fake.rpc.mint_first_seen("m", 880), 1000)
-        self.assertEqual(len(fake.calls), 1)
+    MINT = '6zbYeyBbr5hjkPrApW8QDBstMuxbRV8zMP9cYeUwpump'
 
-    def test_stops_early_once_old_enough(self):
+    def test_recent_activity_is_not_verified_creation(self):
         executor, p = fresh()
         self.addCleanup(p.stop)
-        # a full page whose oldest entry already predates the cutoff: one call, no paging
-        page = sigs([2000 - i for i in range(1000)])
-        fake = FakeRpc(executor, {"getSignaturesForAddress": [page]})
-        seen = fake.rpc.mint_first_seen("m", 1500)
-        self.assertEqual(seen, 1001)
-        self.assertEqual(len(fake.calls), 1)
+        rpc = executor.Rpc(executor.Config())
+        rpc.raw_transactions = mock.Mock(return_value=[{'timestamp': 1000}])
+        self.assertIsNone(rpc.mint_first_seen(self.MINT, 880))
 
-    def test_pages_then_gives_up_as_unknown(self):
+    def test_old_activity_is_not_reused_as_creation(self):
         executor, p = fresh()
         self.addCleanup(p.stop)
-        page = sigs([5000] * 1000)  # busy token, every page still newer than the cutoff
-        fake = FakeRpc(executor, {"getSignaturesForAddress": [page, page, page, page]})
-        self.assertIsNone(fake.rpc.mint_first_seen("m", 100))
-        self.assertEqual(len(fake.calls), 3)
-        self.assertEqual(fake.calls[1][1][1]["before"], "s999")
+        rpc = executor.Rpc(executor.Config())
+        rpc.raw_transactions = mock.Mock(return_value=[{'timestamp': 500}])
+        with mock.patch.object(executor, 'log') as output:
+            self.assertIsNone(rpc.mint_first_seen(self.MINT, 880))
+        self.assertIn('minimum_age_only', output.call_args.args[0])
 
-    def test_pages_to_the_end(self):
+    def test_incomplete_curve_history_cannot_be_short_age(self):
         executor, p = fresh()
         self.addCleanup(p.stop)
-        full = sigs([3000 - i for i in range(1000)])
-        tail = sigs([1900, 1850])
-        fake = FakeRpc(executor, {"getSignaturesForAddress": [full, tail]})
-        self.assertEqual(fake.rpc.mint_first_seen("m", 100), 1850)
-        self.assertEqual(len(fake.calls), 2)
+        rpc = executor.Rpc(executor.Config())
+        rpc.raw_transactions = mock.Mock(side_effect=RuntimeError('history unavailable'))
+        with self.assertRaisesRegex(RuntimeError, 'history unavailable'):
+            rpc.mint_first_seen(self.MINT, 880)
+
+    def test_verified_creation_returns_exact_timestamp(self):
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        rpc = executor.Rpc(executor.Config())
+        rpc.raw_transactions = mock.Mock(return_value=[{'creations': [
+            {'mint': self.MINT, 'timestamp': 1000, 'slot': 3, 'creator': 'creator'}]}])
+        self.assertEqual(rpc.mint_first_seen(self.MINT, 880), 1000)
 
 
 def token_account(owner):
@@ -423,6 +422,7 @@ class BundleSnapshotTests(unittest.TestCase):
         })
         rpc.call = fake.call
         rpc.enhanced_transactions = lambda address, **params: [{
+            'creations': [{'mint': '4nBz25Nk2J1M4JMjdjE6VQYi66yJBtducUQTNCzSpump', 'timestamp': 900, 'slot': 10, 'creator': 'dev'}],
             "slot": 10,
             "feePayer": "dev",
             "tokenTransfers": [
@@ -453,6 +453,7 @@ class BundleSnapshotTests(unittest.TestCase):
         holders = [(f"w{i}", 100 - i) for i in range(50)]
         rpc.plain_wallet_holders = lambda mint, exclude, limit: holders
         rpc.enhanced_transactions = lambda address, **params: [{
+            'creations': [{'mint': '4nBz25Nk2J1M4JMjdjE6VQYi66yJBtducUQTNCzSpump', 'timestamp': 900, 'slot': 10, 'creator': 'dev'}],
             "slot": 10,
             "feePayer": "dev",
             "tokenTransfers": [
@@ -476,6 +477,7 @@ class BundleSnapshotTests(unittest.TestCase):
         holders = [("w1", 60), ("w2", 40)]
         rpc.plain_wallet_holders = lambda mint, exclude, limit: holders
         rpc.enhanced_transactions = lambda address, **params: [{
+            'creations': [{'mint': '4nBz25Nk2J1M4JMjdjE6VQYi66yJBtducUQTNCzSpump', 'timestamp': 900, 'slot': 10, 'creator': 'dev'}],
             "slot": 10,
             "feePayer": "dev",
             "tokenTransfers": [
@@ -508,13 +510,19 @@ class EntryIntegrationTests(unittest.TestCase):
             "priceImpactPct": "0.01",
         }
         responses = {
-            "getTokenSupply": {"value": {"uiAmountString": str(supply_ui), "decimals": 6}},
+            "getTokenSupply": {"value": {
+                "amount": str(int(supply_ui * 10**6)),
+                "uiAmountString": str(supply_ui), "decimals": 6,
+            }},
             "getSignaturesForAddress": [sigs([GRAD, created])],
             "getTokenLargestAccounts": {"value": [{"address": "ta", "amount": str(holder_amount * 10**6)}]},
             "getMultipleAccounts": [{"value": [token_account("whale")]}, {"value": [{"owner": self.executor.SYSTEM_PROGRAM}]}],
         }
         FakeRpcLike = FakeRpc(self.executor, responses)
         ex.rpc.call = FakeRpcLike.call
+        ex.rpc.mint_first_seen = lambda mint, cutoff: (
+            float(ex.rpc.call('getSignaturesForAddress', [mint])[ -1]['blockTime'])
+        )
         ex.rpc.bundle_snapshot = lambda *args, **kwargs: {
             "complete": True,
             "bundle_slot_pct": 5.0,

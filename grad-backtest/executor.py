@@ -35,6 +35,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -228,7 +229,7 @@ class Config:
         )
         self.raw_funder_signature_limit = min(
             self.raw_history_signature_limit,
-            max(3, int(os.getenv("RAW_FUNDER_SIGNATURE_LIMIT", "10"))),
+            max(3, int(os.getenv("RAW_FUNDER_SIGNATURE_LIMIT", "25"))),
         )
         self.rpc_das_enabled = os.getenv("RPC_DAS_ENABLED", "0") == "1"
         self.das_mint_param = os.getenv("DAS_MINT_PARAM", "mint")
@@ -499,6 +500,55 @@ def candidate_mints_from_rpc_transaction(tx: dict[str, Any]) -> list[str]:
                    and (mint, quote, pool, lp) in pools})
 
 
+def pump_creations(tx: dict[str, Any]) -> list[dict[str, Any]]:
+    """Verified Pump Create/CreateV2 instructions, using the published Pump IDL.
+
+    The creator is an instruction argument, not necessarily the transaction fee payer.
+    Activity timestamps alone do not establish creation.
+    """
+    meta = tx.get("meta")
+    if not isinstance(meta, dict) or meta.get("err") is not None:
+        return []
+    if tx.get("blockTime") is None or tx.get("slot") is None:
+        return []
+    from solders.pubkey import Pubkey
+    keys = rpc_account_keys(tx)
+    alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+    creations = []
+    for ix in rpc_instructions(tx):
+        try:
+            program = ix.get('programId') or keys[ix['programIdIndex']]
+            if program != '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P':
+                continue
+            encoded = ix.get('data', '')
+            n = 0
+            for char in encoded:
+                n = n * 58 + alphabet.index(char)
+            data = b'\0' * (len(encoded) - len(encoded.lstrip('1'))) + n.to_bytes((n.bit_length() + 7) // 8, 'big')
+            required = {bytes([24,30,200,40,5,28,7,119]): 14,
+                        bytes([214,144,76,236,95,139,49,180]): 16}.get(data[:8])
+            accounts = [keys[a] if isinstance(a, int) else a for a in ix.get('accounts', [])]
+            if required is None or len(accounts) < required:
+                continue
+            mint = accounts[0]
+            if accounts[2] != bonding_curve_address(mint):
+                continue
+            offset = 8
+            for _ in range(3):  # name, symbol, URI: Borsh strings
+                if offset + 4 > len(data):
+                    raise ValueError('truncated create arguments')
+                length = int.from_bytes(data[offset:offset + 4], 'little')
+                offset += 4 + length
+                if offset > len(data):
+                    raise ValueError('truncated create string')
+            creator = str(Pubkey.from_bytes(data[offset:offset + 32]))
+            creations.append({'mint': mint, 'creator': creator,
+                              'timestamp': tx['blockTime'], 'slot': tx['slot']})
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+    return creations
+
+
 def normalize_rpc_transaction(tx: dict[str, Any], signature: str = "") -> dict[str, Any]:
     """Convert standard jsonParsed transaction data into the small normalized shape used by
     the bundle detector. This intentionally reconstructs only evidence we consume."""
@@ -576,15 +626,33 @@ def normalize_rpc_transaction(tx: dict[str, Any], signature: str = "") -> dict[s
         "blockTime": tx.get("blockTime"),
         "slot": tx.get("slot"),
         "feePayer": fee_payer,
+        "creations": pump_creations(tx),
         "type": "SWAP" if set(keys) & DEX_PROGRAMS else "TRANSFER",
         "nativeTransfers": native_transfers,
         "tokenTransfers": token_transfers,
     }
 
 
-def entry_market_cap_usd(size_usd: float, out_amount_raw: int, supply_ui: float, decimals: int) -> float | None:
-    """Market cap implied by the executable buy quote: the USD we put in divided by the tokens
-    we actually receive is the price we are really paying, times circulating supply."""
+def entry_market_cap_usd(
+    size_usd: float,
+    out_amount_raw: int,
+    supply_ui: float,
+    decimals: int,
+    supply_raw: int | None = None,
+) -> float | None:
+    """Fully-diluted value implied by the executable buy quote.
+
+    When raw supply is available, decimals cancel because both the Jupiter output and
+    mint supply use the token's base units.  Keeping this path integer-based prevents a
+    bad decimal conversion or a rounded ``uiAmount`` from manufacturing a huge value.
+    The UI-unit path remains for backtests and older callers.
+    """
+    if out_amount_raw <= 0:
+        return None
+    if supply_raw is not None:
+        if supply_raw <= 0:
+            return None
+        return float(Decimal(str(size_usd)) * Decimal(supply_raw) / Decimal(out_amount_raw))
     tokens_ui = out_amount_raw / (10 ** decimals)
     if tokens_ui <= 0 or supply_ui <= 0:
         return None
@@ -872,45 +940,48 @@ class Rpc:
                 )
         return out
 
-    def token_supply(self, mint: str) -> tuple[float, int]:
-        """(circulating supply in UI units, decimals) for a mint."""
+    def token_supply_details(self, mint: str) -> tuple[float, int, int]:
+        """Validated ``(UI supply, decimals, raw supply)`` for a mint."""
         value = self.call("getTokenSupply", [mint])["value"]
-        return float(value["uiAmountString"]), int(value["decimals"])
+        raw = int(value["amount"])
+        decimals = int(value["decimals"])
+        ui_text = str(value["uiAmountString"])
+        try:
+            ui_decimal = Decimal(ui_text)
+        except InvalidOperation as exc:
+            raise RuntimeError("invalid token supply UI amount") from exc
+        expected_ui = Decimal(raw).scaleb(-decimals)
+        if ui_decimal != expected_ui:
+            raise RuntimeError(
+                f"inconsistent token supply: raw={raw} decimals={decimals} ui={ui_text}"
+            )
+        return float(ui_decimal), decimals, raw
+
+    def token_supply(self, mint: str) -> tuple[float, int]:
+        """Compatibility view: ``(supply in UI units, decimals)``."""
+        supply_ui, decimals, _ = self.token_supply_details(mint)
+        return supply_ui, decimals
 
     def mint_first_seen(self, mint: str, stop_before_ts: float, max_pages: int = 3) -> float | None:
-        oldest = self._address_first_seen(mint, stop_before_ts, max_pages)
-        if oldest is None or oldest >= stop_before_ts:
-            try:
-                curve = bonding_curve_address(mint)
-            except ValueError:
-                return oldest
-            curve_oldest = self._address_first_seen(curve, stop_before_ts, max_pages)
-            if curve_oldest is not None:
-                oldest = curve_oldest if oldest is None else min(oldest, curve_oldest)
-        return oldest
+        """Return verified creation only; never reuse a lower-bound activity timestamp.
 
-    def _address_first_seen(self, mint: str, stop_before_ts: float, max_pages: int = 3) -> float | None:
-        """Block time of the mint's earliest transaction. Stops paging early once it has seen a
-        transaction older than stop_before_ts, since that already proves the token is at least
-        that old, and returns the oldest time seen. None when the history is too long to
-        conclude within max_pages (a busy, established token), which the caller treats as
-        unknown rather than as a rejection."""
-        before: str | None = None
-        oldest: float | None = None
-        for _ in range(max_pages):
-            opts: dict[str, Any] = {"limit": 1000}
-            if before:
-                opts["before"] = before
-            sigs = self.call("getSignaturesForAddress", [mint, opts]) or []
-            times = [s["blockTime"] for s in sigs if s.get("blockTime") and not s.get('err')]
-            if times:
-                page_oldest = min(times)
-                oldest = page_oldest if oldest is None else min(oldest, page_oldest)
-            if len(sigs) < 1000:
-                return oldest
-            if oldest is not None and oldest < stop_before_ts:
-                return oldest
-            before = sigs[-1]["signature"]
+        Retains the public method name for callers. Signature work uses the same bounded
+        oldest-first path as funding lookup, starting at the quieter curve PDA.
+        """
+        curve = bonding_curve_address(mint)
+        transactions = self.raw_transactions(curve, **{
+            'sort-order': 'asc', 'limit': 25, 'max-pages': max_pages,
+        })
+        creations = [c for tx in transactions for c in tx.get('creations', [])
+                     if c['mint'] == mint]
+        if creations:
+            created = min(creations, key=lambda c: c['timestamp'])
+            log(f"CURVE mint={mint} evidence=verified_creation created_ts={created['timestamp']} "
+                f"creation_slot={created['slot']}")
+            return float(created['timestamp'])
+        times = [tx['timestamp'] for tx in transactions if tx.get('timestamp') is not None]
+        evidence = 'minimum_age_only' if times and min(times) <= stop_before_ts else 'unknown'
+        log(f"CURVE mint={mint} evidence={evidence} creation_unverified=True")
         return None
 
     def plain_wallet_holders(
@@ -1027,7 +1098,8 @@ class Rpc:
         # Signature metadata is cheap compared with full transaction bodies. The old
         # 40-row page cap searched only 120 signatures, including failed transactions,
         # and could never reach the curve window on an active launch.
-        page_size = 1000 if gte else 100
+        oldest_first = params.get('sort-order') == 'asc' and not gte
+        page_size = 1000 if gte or oldest_first else 100
         options["limit"] = page_size
         # A healthy, busy launch can exceed 500 successful curve transactions in the
         # roughly two-minute observation window. Rejecting it solely because activity
@@ -1041,7 +1113,7 @@ class Rpc:
         # Read backwards to the requested window instead of filtering only the latest
         # page (which silently returned an empty early-buy/funding history).
         reached_window = False
-        for page_number in range(1, 4):
+        for page_number in range(1, min(3, max(1, int(params.get('max-pages', 3)))) + 1):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise RuntimeError('history window unavailable: signature search time budget exhausted')
@@ -1062,7 +1134,9 @@ class Rpc:
                 reached_window = len(page) < page_size or bool(times and min(times) < gte)
             else:
                 # Funding histories are bounded samples, not exhaustive wallet ancestry.
-                reached_window = len(page) < page_size or len(eligible) >= limit
+                # Oldest-first is meaningful only after reaching the history boundary.
+                # Reversing a recent sample cannot recover its original funder.
+                reached_window = len(page) < page_size or (not oldest_first and len(eligible) >= limit)
             if reached_window:
                 break
             if not page or not page[-1].get('signature'):
@@ -1081,9 +1155,9 @@ class Rpc:
         if gte and len(rows) > body_limit:
             raise RuntimeError(f'history window contains {len(rows)} successful transactions; decode budget is {body_limit}')
         if not gte:
-            rows = rows[:limit]  # newest eligible funding sample, then reverse for asc
+            rows = rows[-limit:] if oldest_first else rows[:limit]
         log(f"HISTORY address={address} pages={page_number} signatures={len(signatures)} "
-            f"selected={len(rows)} window={'covered' if gte else 'funding_sample'} "
+            f"selected={len(rows)} window={'covered' if gte else 'oldest_sample' if oldest_first else 'recent_sample'} "
             f"fetch_seconds={time.monotonic() - started:.2f}")
         calls = [
             (
@@ -1140,7 +1214,7 @@ class Rpc:
         return body
 
     def origin_funder(self, wallet: str, before_ts: float) -> str | None:
-        """Oldest meaningful inbound SOL sender visible in the bounded pre-graduation sample."""
+        """Earliest meaningful inbound SOL sender in an oldest-first pre-graduation sample."""
         transactions = self.enhanced_transactions(
             wallet,
             **{
@@ -1165,13 +1239,16 @@ class Rpc:
         entries = self.wallet_graph_cache.setdefault("funders", {})
         cached = entries.get(wallet)
         now = now_ts()
+        semantics = f"oldest-v2:{self.cfg.transaction_history_mode}:{self.cfg.raw_funder_signature_limit}"
         if isinstance(cached, dict):
             age = now - float(cached.get("checked_at") or 0)
             ttl = self.cfg.wallet_graph_cache_days * 86400 if cached.get("funder") else 3600
-            if age <= ttl:
+            if (age <= ttl and cached.get('semantics') == semantics
+                    and cached.get('before_ts') == before_ts):
                 return cached.get("funder")
         funder = self.origin_funder(wallet, before_ts)
-        entries[wallet] = {"funder": funder, "checked_at": now}
+        entries[wallet] = {"funder": funder, "checked_at": now,
+                           "semantics": semantics, "before_ts": before_ts}
         return funder
 
     def save_wallet_graph_cache(self) -> None:
@@ -1238,6 +1315,8 @@ class Rpc:
     ) -> dict[str, Any]:
         """Build the live equivalent of a Bubblemap from the largest plain-wallet holders."""
         holders = self.plain_wallet_holders(mint, exclude, self.cfg.bundle_max_wallets)
+        log(f"HOLDERS mint={mint} requested_wallets={self.cfg.bundle_max_wallets} "
+            f"observed_wallets={len(holders)} source={'das_or_standard_fallback' if self.cfg.rpc_das_enabled else 'standard_top20_accounts'}")
         if len(holders) < 2:
             return {"complete": False, "error": "fewer than two plain-wallet holders returned"}
         wallet_amounts = {wallet: raw / (10 ** decimals) for wallet, raw in holders}
@@ -1256,11 +1335,18 @@ class Rpc:
         transfer_edges: list[tuple[str, str]] = []
         creator = None
         create_slot = None
+        if self.cfg.transaction_history_mode == 'raw':
+            creations = [c for tx in transactions for c in tx.get('creations', [])
+                         if c['mint'] == mint and c['timestamp'] == created_ts]
+            if not creations:
+                return {'complete': False, 'error': 'verified creation missing from curve history'}
+            creator = creations[0]['creator']
+            create_slot = int(creations[0]['slot'])
         for tx in transactions:
             slot = tx.get("slot")
             if slot is None:
                 continue
-            if create_slot is None or int(slot) < create_slot:
+            if self.cfg.transaction_history_mode != 'raw' and (create_slot is None or int(slot) < create_slot):
                 create_slot = int(slot)
                 creator = tx.get("feePayer") or creator
             native_payers = {
@@ -1825,12 +1911,18 @@ class Executor:
         cfg = self.cfg
         market_cap = curve_age = top_holder_pct = None
         top_holder = None
-        supply_ui = decimals = None
+        supply_ui = decimals = supply_raw = None
         not_analyzed = {"complete": False, "error": "earlier entry guard rejected; bundle not analyzed"}
         if cfg.max_entry_market_cap_usd > 0 or cfg.min_entry_market_cap_usd > 0 or cfg.max_top_holder_pct > 0:
             try:
-                supply_ui, decimals = self.rpc.token_supply(mint)
-                market_cap = entry_market_cap_usd(size_usd, tokens, supply_ui, decimals)
+                supply_ui, decimals, supply_raw = self.rpc.token_supply_details(mint)
+                market_cap = entry_market_cap_usd(
+                    size_usd, tokens, supply_ui, decimals, supply_raw=supply_raw
+                )
+                tokens_ui = Decimal(tokens).scaleb(-decimals)
+                log(f"VALUATION mint={mint} basis=buy_quote_raw_supply size_usd={size_usd:.8g} "
+                    f"out_amount_raw={tokens} out_amount_ui={tokens_ui} supply_raw={supply_raw} "
+                    f"supply_ui={supply_ui:.16g} decimals={decimals} value_usd={market_cap}")
             except Exception as exc:
                 log(f"WARN {mint}: market cap check unavailable ({describe_error(exc)})")
         if entry_guard_reason(cfg, graduated_ts, now_ts(), None, market_cap):
@@ -1850,7 +1942,8 @@ class Executor:
                 holder = self.rpc.top_wallet_holder(mint, exclude)
                 if holder:
                     top_holder, amount = holder
-                    top_holder_pct = amount / (10 ** decimals) / supply_ui * 100
+                    # Raw/raw is exact and cannot be skewed by token decimals.
+                    top_holder_pct = amount / supply_raw * 100
             except Exception as exc:
                 log(f"WARN {mint}: holder concentration check unavailable ({describe_error(exc)})")
         if entry_guard_reason(cfg, graduated_ts, now_ts(), None, market_cap, curve_age, top_holder_pct):
@@ -2506,7 +2599,7 @@ class Executor:
             f"early_buy<={self.cfg.max_early_buy_pct:.0f}% funder_coverage>={self.cfg.min_funder_coverage_pct:.0f}% "
             f"funder_lookup>={self.cfg.min_funder_lookup_pct:.0f}% "
             f"high_confidence>={self.cfg.high_confidence_funder_coverage_pct:.0f}% "
-            f"holders={self.cfg.bundle_max_wallets} funders={self.cfg.bundle_funder_max_wallets} "
+            f"holder_target={self.cfg.bundle_max_wallets} funders={self.cfg.bundle_funder_max_wallets} "
             f"funder_workers={self.cfg.bundle_lookup_workers} "
             f"providers={len(self.cfg.rpc_urls)} discovery={self.cfg.discovery_mode} "
             f"history={self.cfg.transaction_history_mode} das={'on' if self.cfg.rpc_das_enabled else 'off'} "

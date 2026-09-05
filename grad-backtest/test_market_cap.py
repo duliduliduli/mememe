@@ -33,6 +33,41 @@ class MarketCapMathTests(unittest.TestCase):
         cap = executor.entry_market_cap_usd(5.0, 33 * 10**6, 1_000_000_000, 6)
         self.assertGreater(cap, 100_000_000)
 
+    def test_raw_supply_path_is_decimal_invariant(self):
+        executor, p = fresh_executor()
+        self.addCleanup(p.stop)
+        # The raw/raw calculation must give the same result regardless of a bogus UI
+        # supply or decimal count supplied by a caller.
+        expected = 100_000.0
+        for decimals, bogus_ui in ((0, 1.0), (6, 999.0), (12, 1e30)):
+            with self.subTest(decimals=decimals):
+                cap = executor.entry_market_cap_usd(
+                    5.0, 50_000 * 10**6, bogus_ui, decimals,
+                    supply_raw=1_000_000_000 * 10**6,
+                )
+                self.assertAlmostEqual(cap, expected)
+
+    def test_supply_details_rejects_inconsistent_rpc_fields(self):
+        executor, p = fresh_executor()
+        self.addCleanup(p.stop)
+        rpc = executor.Rpc(executor.Config())
+        rpc.call = mock.Mock(return_value={"value": {
+            "amount": "1000000000", "decimals": 6, "uiAmountString": "1000000000"
+        }})
+        with self.assertRaisesRegex(RuntimeError, "inconsistent token supply"):
+            rpc.token_supply_details("mint")
+
+    def test_supply_details_accepts_exact_rpc_fields(self):
+        executor, p = fresh_executor()
+        self.addCleanup(p.stop)
+        rpc = executor.Rpc(executor.Config())
+        rpc.call = mock.Mock(return_value={"value": {
+            "amount": "1000000000000000", "decimals": 6,
+            "uiAmountString": "1000000000"
+        }})
+        self.assertEqual(rpc.token_supply_details("mint"),
+                         (1_000_000_000.0, 6, 1_000_000_000_000_000))
+
     def test_degenerate_inputs_return_none(self):
         executor, p = fresh_executor()
         self.addCleanup(p.stop)

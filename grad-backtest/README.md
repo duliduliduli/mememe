@@ -226,7 +226,7 @@ prints the important ones.
 | `RPC_BATCH_SIZE` | `20` | Maximum standard JSON-RPC history requests per batch. |
 | `RPC_BACKOFF_MAX_SECONDS` | `900` | Maximum entry/discovery provider circuit-breaker delay. |
 | `RAW_HISTORY_SIGNATURE_LIMIT` | `40` | Maximum signatures reconstructed for a bundle-history query. |
-| `RAW_FUNDER_SIGNATURE_LIMIT` | `10` | Maximum early wallet transactions inspected when identifying its funder. |
+| `RAW_FUNDER_SIGNATURE_LIMIT` | `25` | Maximum oldest successful wallet transactions inspected when identifying its funder, bounded by the raw history sample limit. |
 | `MAX_ENTRIES_PER_CYCLE` | `1` | Maximum due graduations analyzed per loop, preventing entry bursts from starving exits. |
 
 ### 4.4 Entry guards
@@ -288,22 +288,44 @@ is tried, and blocked holder queries do not disable wallet reads on that endpoin
 Fresh holder snapshots are shared for 10 seconds between top-holder and bundle
 checks. Excessive quote impact/stale entries are rejected before expensive metadata.
 
-Raw bundle history follows the Pump bonding-curve PDA; mint age lookups fall back
-to that address when mint history alone cannot establish the minimum age. This is
-earliest observed activity, not proof of the exact creation time or one-buyer ownership.
+Raw bundle history follows the Pump bonding-curve PDA. Creation time requires a
+successful Pump create/create_v2 instruction with matching mint and curve accounts.
+Recent activity is never substituted for creation. Older activity alone establishes
+only a lower bound, and an unverified creation remains unknown. Creator attribution
+in raw bundle analysis uses the instruction's creator argument, not the fee payer.
 Raw curve history searches up to three 1,000-signature pages toward the requested
 window, independently of the small funding sample size. Failed transactions and
 out-of-window signatures do not consume the full-transaction decode budget.
 Up to 1,000 successful transactions in the window are decoded in batches; larger
 windows remain unknown rather than being silently sampled. Signature search has
-a five-second scheduling budget and decoding checks an eight-second budget between
+a five-second scheduling budget and decoding checks an adaptive 8–20 second budget between
 batches (an in-flight request/provider retry can overrun these budgets).
-Funding lookups search up to three 100-signature pages but decode only their
-configured sample. `HISTORY` logs report pages, signatures and selected transactions;
+Oldest-first funding lookups search up to three 1,000-signature pages and must reach
+the history boundary before decoding their configured oldest sample. A recent sample
+cannot stand in for the original funder. Cached results are scoped to the history
+semantics, sample size and exact cutoff; older cache entries are ignored.
+`HISTORY` logs report pages, signatures and selected transactions;
 `window=covered` confirms signature traversal, not completion of transaction decoding
 or the subsequent bundle/funder checks. Exhausted budgets, missing timestamps and
 missing responses remain incomplete data and block entry with fail-closed enabled.
 Funding ancestry remains a bounded sample, not a complete wallet history.
+
+`holder_target` is a requested maximum. With DAS disabled, standard RPC returns
+the largest 20 token accounts, potentially representing fewer wallets. `HOLDERS`
+reports the observed wallet count; this is not equivalent to a 50-wallet DAS sample.
+`VALUATION` logs the raw quote output, raw total supply, UI values, and decimals.
+The guard computes executable quote-implied fully diluted valuation directly as
+`USD in × raw supply ÷ raw tokens out`; token decimals cancel, and inconsistent
+RPC raw/UI supply fields are rejected. This is FDV from total minted supply, not
+circulating market cap, so deliberately oversized supply can still produce a
+genuinely large value without indicating a decimal-conversion bug.
+
+Validation includes a saved on-chain create_v2 instruction and deterministic
+oldest-history/cache regression tests. Full replay equivalence with earlier accepted
+Helius trades is not established: archived Helius responses and contemporaneous
+quotes are still required. Raw token balance changes also remain an approximation
+of individual transfers. These limitations must be resolved before claiming full
+provider equivalence; unit-test success alone does not establish trading performance.
 
 **Provider access remains required:** on September 5, 2026, a live PublicNode
 `getTokenLargestAccounts` request returned HTTP 403 stating that indexed requests
@@ -473,7 +495,7 @@ entry can land.
 1. **Sizing guards** (`position_size_usd`): open bot-opened positions must be below `MAX_CONCURRENT_POSITIONS` (adopted holdings don't count); daily realized P&L must be above −`DAILY_LOSS_LIMIT_USD`; size = `min(equity × ACCOUNT_FRACTION, MAX_POSITION_USD)` must be at least `MIN_POSITION_USD` and at most equity. Failure: `SKIP …: sizing guards (open=N, daily_pnl=X)`.
 2. **Buy quote** WSOL → token for the sized amount at `SLIPPAGE_BPS`. A zero-token quote raises and is retried.
 3. **Metadata lookups** (`entry_metadata`):
-   - token supply → implied market cap = supply × (USD in ÷ tokens out), i.e. the price we would actually pay;
+   - raw token supply → executable quote-implied FDV = USD in × raw supply ÷ raw tokens out; raw units cancel so decimals cannot skew the result;
    - mint creation time via `getSignaturesForAddress` with early stop → curve age = graduation − creation;
    - largest plain-wallet holder via `getTokenLargestAccounts` plus two `getMultipleAccounts` calls, ignoring program-owned accounts (the pool, the bonding curve, the Mayhem vault) and our own wallet.
    - a mandatory bundle graph over up to 50 plain-wallet holders. It combines same-slot and short-window purchases, first-three-slot purchases, top-ten concentration, direct and two-hop non-CEX funding ancestry, unpaid wallet-to-wallet token distributions, creator linkage, and wallet cohorts previously seen together. The broad 50-holder sample feeds transfer, coordination, repeat-cohort and concentration checks; funding ancestry is traced over the largest 20 holders so adding small holders does not dilute coverage. Lookup completion is measured separately from identifiable-funder coverage. With `BUNDLE_FAIL_CLOSED=1`, missing supply, creation history, purchase history, less than 80% lookup completion, or less than 30% funder coverage skips the entry; 30–60% coverage applies stricter thresholds.
@@ -936,7 +958,7 @@ Module functions:
 - `record_skip(mint, reason)` — append to `skips.csv`.
 - `quote_price_impact_pct(quote)` — Jupiter's fraction as a percent.
 - `describe_error(exc)` — redact API keys, name Jupiter 6001/6000, truncate.
-- `entry_market_cap_usd(size_usd, out_amount_raw, supply_ui, decimals)` — implied cap from the executable quote.
+- `entry_market_cap_usd(size_usd, out_amount_raw, supply_ui, decimals, supply_raw=...)` — executable quote-implied FDV; production uses raw supply so decimals cancel.
 - `entry_guard_reason(cfg, graduated_ts, now, impact, market_cap, curve_age, top_holder_pct)` — the six ordered guards; `None` inputs never block.
 - `position_size_usd(cfg, equity_usd, open_positions, daily_pnl)` — sizing with concurrency, daily-loss, min, max, and equity checks.
 - `decide_exit(entry_usd, current_usd, opened_ts, now, cfg, peak_usd)` — take-profit, stop-loss, trailing, time stop.
