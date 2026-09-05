@@ -177,6 +177,9 @@ class Config:
         # market is not.  Bound both sources of entry work so an active position is never starved
         # behind a burst of graduations.
         self.helius_poll_timeout_seconds = max(1.0, float(os.getenv("HELIUS_POLL_TIMEOUT_SECONDS", "5")))
+        self.helius_poll_backoff_max_seconds = max(
+            30.0, float(os.getenv("HELIUS_POLL_BACKOFF_MAX_SECONDS", "900"))
+        )
         self.max_entries_per_cycle = max(1, int(os.getenv("MAX_ENTRIES_PER_CYCLE", "1")))
         self.max_price_impact_pct = float(os.getenv("MAX_PRICE_IMPACT_PCT", "5"))
         # A route existing is not enough: require that the just-quoted tokens can immediately
@@ -1007,6 +1010,22 @@ class Executor:
         return spendable * sol_price
 
     # ---- detection -------------------------------------------------------
+    def note_helius_rate_limit(self, minimum_seconds: float = 30.0) -> float:
+        """Open an exponentially increasing circuit breaker for shared Helius quota.
+
+        RPC and Enhanced Transactions use the same account budget. Retrying a hard 429 every
+        30 seconds can prolong throttling and also wastes the few requests needed for exits.
+        """
+        current = float(getattr(self, "_helius_poll_backoff_seconds", 30.0))
+        delay = min(self.cfg.helius_poll_backoff_max_seconds, max(minimum_seconds, current))
+        self._helius_poll_cooldown_until = max(
+            float(getattr(self, "_helius_poll_cooldown_until", 0.0)), now_ts() + delay
+        )
+        self._helius_poll_backoff_seconds = min(
+            self.cfg.helius_poll_backoff_max_seconds, delay * 2
+        )
+        return delay
+
     def poll_graduations(self) -> None:
         if now_ts() < float(getattr(self, "_helius_poll_cooldown_until", 0.0)):
             return
@@ -1021,11 +1040,12 @@ class Executor:
             batch = response.json()
         except Exception as exc:
             if is_rate_limited(exc):
-                self._helius_poll_cooldown_until = now_ts() + 30
-                log("WARN helius poll rate limited; pausing detection polls for 30s")
+                delay = self.note_helius_rate_limit()
+                log(f"WARN helius poll rate limited; pausing detection polls for {delay:.0f}s")
             else:
-                log(f"WARN helius poll failed: {exc}")
+                log(f"WARN helius poll failed: {describe_error(exc)}")
             return
+        self._helius_poll_backoff_seconds = 30.0
         if not isinstance(batch, list):
             log(f"WARN helius poll unexpected response: {str(batch)[:200]}")
             return
@@ -1689,6 +1709,21 @@ class Executor:
     def run_cycle(self) -> None:
         """Run one executor iteration with exits strictly ahead of new-entry work."""
         roll_daily(self.state)
+        if (
+            self.cfg.mode == "live"
+            and getattr(self, "_reconcile_pending", False)
+            and now_ts() >= float(getattr(self, "_helius_poll_cooldown_until", 0.0))
+        ):
+            try:
+                self.reconcile_wallet(self.sol_price_usd())
+                self._reconcile_pending = False
+            except Exception as exc:
+                if is_rate_limited(exc):
+                    delay = self.note_helius_rate_limit(minimum_seconds=300)
+                    log(f"WARN wallet reconciliation still rate limited; retrying in {delay:.0f}s")
+                else:
+                    log(f"WARN deferred wallet reconciliation failed: {describe_error(exc)}")
+                    self._reconcile_pending = False
         panic = PANIC_FLAG.exists()
         draining = STOP_FLAG.exists() or panic
         self.state["draining"] = draining
@@ -1748,20 +1783,35 @@ class Executor:
             f"retries={self.cfg.entry_retries} daily_loss_limit=${self.cfg.daily_loss_limit_usd}")
         if self.cfg.mode == "live":
             log(f"live wallet: {self.wallet.pubkey} (burner only!)")
+            startup_rate_limited = False
             try:
                 balance = self.rpc.sol_balance(self.wallet.pubkey)
                 log(f"wallet balance: {balance:.4f} SOL ({self.cfg.min_sol_reserve} SOL reserved for fees)")
                 if balance <= self.cfg.min_sol_reserve:
                     log("WARNING: balance at or below the fee reserve — no entries will be taken until funded")
             except Exception as exc:
-                log(f"WARN could not read wallet balance: {exc}")
+                startup_rate_limited = is_rate_limited(exc)
+                if startup_rate_limited:
+                    delay = self.note_helius_rate_limit(minimum_seconds=300)
+                    log(f"WARN could not read wallet balance: Helius rate limited; pausing provider calls for {delay:.0f}s")
+                else:
+                    log(f"WARN could not read wallet balance: {describe_error(exc)}")
         if self.state["positions"]:
             log(f"resuming {len(self.state['positions'])} open position(s) from state file")
         if self.cfg.mode == "live":
-            try:
-                self.reconcile_wallet(self.sol_price_usd())
-            except Exception as exc:
-                log(f"WARN wallet reconciliation failed: {describe_error(exc)}")
+            if startup_rate_limited:
+                self._reconcile_pending = True
+                log("WARN wallet reconciliation deferred until the Helius cooldown expires")
+            else:
+                try:
+                    self.reconcile_wallet(self.sol_price_usd())
+                except Exception as exc:
+                    if is_rate_limited(exc):
+                        delay = self.note_helius_rate_limit(minimum_seconds=300)
+                        self._reconcile_pending = True
+                        log(f"WARN wallet reconciliation rate limited; deferred for {delay:.0f}s")
+                    else:
+                        log(f"WARN wallet reconciliation failed: {describe_error(exc)}")
         while True:
             try:
                 self.run_cycle()
