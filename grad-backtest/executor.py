@@ -453,21 +453,50 @@ def rpc_instructions(tx: dict[str, Any]) -> list[dict[str, Any]]:
     return [item for item in instructions if isinstance(item, dict)]
 
 
+def bonding_curve_address(mint: str) -> str:
+    from solders.pubkey import Pubkey
+    return str(Pubkey.find_program_address(
+        [b'bonding-curve', bytes(Pubkey.from_string(mint))],
+        Pubkey.from_string('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'),
+    )[0])
+
+
 def candidate_mints_from_rpc_transaction(tx: dict[str, Any]) -> list[str]:
-    """Extract the launched mint from a standard jsonParsed getTransaction response."""
-    found: set[str] = set()
-    meta = tx.get("meta") or {}
-    for balance in [*(meta.get("preTokenBalances") or []), *(meta.get("postTokenBalances") or [])]:
-        mint = balance.get("mint")
-        if mint and mint not in KNOWN_QUOTES:
-            found.add(mint)
-    for instruction in rpc_instructions(tx):
-        parsed = instruction.get("parsed") or {}
-        info = parsed.get("info") or {}
-        mint = info.get("mint")
-        if mint and mint not in KNOWN_QUOTES:
-            found.add(mint)
-    return sorted(found)
+    """Recognize an actual Pump migration + matching PumpSwap pool creation.
+
+    Account positions/discriminators are pinned to pump-fun/pump-public-docs IDLs.
+    Token balance and initializeMint scans confuse the LP mint with the launched mint;
+    ordinary transfers and repeat (idempotent) migrate calls are not new graduations.
+    """
+    if (tx.get('meta') or {}).get('err') is not None:
+        return []
+    migrations = []
+    pools = set()
+    keys = rpc_account_keys(tx)
+    alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+    for ix in rpc_instructions(tx):
+        try:
+            program = ix.get('programId') or keys[ix['programIdIndex']]
+            accounts = [keys[a] if isinstance(a, int) else a for a in ix.get('accounts', [])]
+            encoded = ix.get('data', '')
+            n = 0
+            for char in encoded:
+                n = n * 58 + alphabet.index(char)
+            data = b'\0' * (len(encoded) - len(encoded.lstrip('1'))) + n.to_bytes((n.bit_length() + 7) // 8, 'big')
+            tag = data[:8]
+            if program == '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P':
+                if tag == bytes([155,234,231,146,236,158,162,30]) and len(accounts) >= 25:
+                    migrations.append((accounts[2], accounts[14], accounts[9], accounts[15]))
+                elif tag == bytes([187,203,18,31,206,237,254,41]) and len(accounts) >= 27:
+                    migrations.append((accounts[2], accounts[3], accounts[10], accounts[15]))
+            elif program == 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA':
+                if tag == bytes([233,146,209,142,207,104,64,188]) and len(accounts) >= 18:
+                    pools.add((accounts[3], accounts[4], accounts[0], accounts[5]))
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+    return sorted({mint for mint, quote, pool, lp in migrations
+                   if mint not in KNOWN_QUOTES and quote in KNOWN_QUOTES
+                   and (mint, quote, pool, lp) in pools})
 
 
 def normalize_rpc_transaction(tx: dict[str, Any], signature: str = "") -> dict[str, Any]:
@@ -605,7 +634,7 @@ def entry_guard_reason(
     ):
         return (
             f"graduated {curve_age_seconds:.0f}s after creation < {cfg.min_curve_age_seconds:.0f}s "
-            "(curve filled by one buyer: bundle)"
+            "(observed history does not meet minimum curve age)"
         )
     if (
         top_holder_pct is not None
@@ -681,6 +710,9 @@ class Rpc:
         self.cfg = cfg
         self.session = requests.Session()
         self._active_endpoint = 0
+        self._method_cooldowns: dict[tuple[str, str], float] = {}
+        self._provider_lock = threading.Lock()
+        self._holder_cache: dict[tuple, tuple[float, list[tuple[str, int]]]] = {}
         self.wallet_graph_cache: dict[str, Any] = {"version": 1, "funders": {}, "appearances": {}}
         try:
             loaded = json.loads(WALLET_GRAPH_CACHE_FILE.read_text())
@@ -693,10 +725,21 @@ class Rpc:
     def call(self, method: str, params: Any, timeout: float | None = None) -> Any:
         return with_backoff(lambda: self._call(method, params, timeout), method)
 
-    def _endpoint_order(self) -> list[tuple[int, str]]:
+    def _endpoint_order(self, methods: tuple[str, ...] = ()) -> list[tuple[int, str]]:
         total = len(self.cfg.rpc_urls)
-        return [((self._active_endpoint + offset) % total, self.cfg.rpc_urls[(self._active_endpoint + offset) % total])
-                for offset in range(total)]
+        with self._provider_lock:
+            return [(index, self.cfg.rpc_urls[index])
+                    for index in [(self._active_endpoint + offset) % total for offset in range(total)]
+                    if all(self._method_cooldowns.get((self.cfg.rpc_urls[index], method), 0) <= time.monotonic()
+                           for method in methods)]
+
+    def _cool_method(self, endpoint: str, method: str, exc: BaseException) -> None:
+        status = getattr(getattr(exc, 'response', None), 'status_code', 0)
+        delay = 900.0 if status in {401, 403} else 30.0
+        with self._provider_lock:
+            self._method_cooldowns[endpoint, method] = time.monotonic() + delay
+        log(f"WARN RPC method={method} provider={redact_endpoint(endpoint)} "
+            f"error={status or type(exc).__name__} cooldown={delay:.0f}s")
 
     def _post(self, endpoint: str, payload: Any, timeout: float | None = None) -> Any:
         resp = self.session.post(
@@ -709,7 +752,7 @@ class Rpc:
 
     def _call(self, method: str, params: Any, timeout: float | None = None) -> Any:
         last_error: BaseException | None = None
-        for index, endpoint in self._endpoint_order():
+        for index, endpoint in self._endpoint_order((method,)):
             try:
                 body = self._post(
                     endpoint,
@@ -729,7 +772,9 @@ class Rpc:
                 last_error = exc
                 if not is_provider_unavailable(exc):
                     raise
-        assert last_error is not None
+                self._cool_method(endpoint, method, exc)
+        if last_error is None:
+            raise RuntimeError(f"service unavailable: all providers cooling down for {method}")
         raise last_error
 
     def batch_call(self, calls: list[tuple[str, Any]], timeout: float | None = None) -> list[Any]:
@@ -747,6 +792,8 @@ class Rpc:
             by_id = {int(item.get("id", 0)): item for item in body if isinstance(item, dict)}
             for offset, (method, _params) in enumerate(chunk):
                 item = by_id.get(offset + 1) or {}
+                if 'result' not in item and 'error' not in item:
+                    raise RuntimeError(f"malformed RPC response: batch missing {method} result")
                 if "error" in item:
                     raise RuntimeError(f"RPC {method}: {item['error']}")
                 results.append(item.get("result"))
@@ -754,7 +801,8 @@ class Rpc:
 
     def _batch_post(self, payload: list[dict[str, Any]], timeout: float | None = None) -> list[dict[str, Any]]:
         last_error: BaseException | None = None
-        for index, endpoint in self._endpoint_order():
+        methods = tuple(sorted({item['method'] for item in payload}))
+        for index, endpoint in self._endpoint_order(methods):
             try:
                 body = self._post(endpoint, payload, timeout)
                 if not isinstance(body, list):
@@ -776,7 +824,10 @@ class Rpc:
                 last_error = exc
                 if not is_provider_unavailable(exc):
                     raise
-        assert last_error is not None
+                for method in methods:
+                    self._cool_method(endpoint, method, exc)
+        if last_error is None:
+            raise RuntimeError("service unavailable: all providers cooling down for batch")
         raise last_error
 
     def sol_balance(self, pubkey: str) -> float:
@@ -827,6 +878,18 @@ class Rpc:
         return float(value["uiAmountString"]), int(value["decimals"])
 
     def mint_first_seen(self, mint: str, stop_before_ts: float, max_pages: int = 3) -> float | None:
+        oldest = self._address_first_seen(mint, stop_before_ts, max_pages)
+        if oldest is None or oldest >= stop_before_ts:
+            try:
+                curve = bonding_curve_address(mint)
+            except ValueError:
+                return oldest
+            curve_oldest = self._address_first_seen(curve, stop_before_ts, max_pages)
+            if curve_oldest is not None:
+                oldest = curve_oldest if oldest is None else min(oldest, curve_oldest)
+        return oldest
+
+    def _address_first_seen(self, mint: str, stop_before_ts: float, max_pages: int = 3) -> float | None:
         """Block time of the mint's earliest transaction. Stops paging early once it has seen a
         transaction older than stop_before_ts, since that already proves the token is at least
         that old, and returns the oldest time seen. None when the history is too long to
@@ -839,7 +902,7 @@ class Rpc:
             if before:
                 opts["before"] = before
             sigs = self.call("getSignaturesForAddress", [mint, opts]) or []
-            times = [s["blockTime"] for s in sigs if s.get("blockTime")]
+            times = [s["blockTime"] for s in sigs if s.get("blockTime") and not s.get('err')]
             if times:
                 page_oldest = min(times)
                 oldest = page_oldest if oldest is None else min(oldest, page_oldest)
@@ -851,6 +914,18 @@ class Rpc:
         return None
 
     def plain_wallet_holders(
+        self, mint: str, exclude: set[str] | None = None, limit: int = 20
+    ) -> list[tuple[str, int]]:
+        key = (mint, tuple(sorted(exclude or set())))
+        cached = self._holder_cache.get(key)
+        if cached is None or time.monotonic() - cached[0] >= 10:
+            rows = self._plain_wallet_holders_uncached(mint, exclude, max(limit, self.cfg.bundle_max_wallets))
+            # Share the fresh snapshot between top-holder and bundle checks in this entry.
+            self._holder_cache = {k: v for k, v in self._holder_cache.items() if time.monotonic() - v[0] < 10}
+            self._holder_cache[key] = (time.monotonic(), rows)
+        return self._holder_cache[key][1][:limit]
+
+    def _plain_wallet_holders_uncached(
         self, mint: str, exclude: set[str] | None = None, limit: int = 20
     ) -> list[tuple[str, int]]:
         """Largest plain-wallet holders, combining multiple token accounts per owner.
@@ -896,6 +971,8 @@ class Rpc:
             return []
         addresses = [entry["address"] for entry in largest]
         accounts = self.call("getMultipleAccounts", [addresses, {"encoding": "jsonParsed"}]).get("value") or []
+        if len(accounts) != len(addresses) or any(a is None for a in accounts):
+            raise RuntimeError("holder account data incomplete")
         owners: list[tuple[str, int]] = []
         for entry, acct in zip(largest, accounts):
             if not acct:
@@ -910,6 +987,8 @@ class Rpc:
         owner_accounts = self.call(
             "getMultipleAccounts", [[owner for owner, _ in owners], {"encoding": "base64"}]
         ).get("value") or []
+        if len(owner_accounts) != len(owners):
+            raise RuntimeError("holder owner data incomplete")
         totals: dict[str, int] = {}
         for (owner, amount), acct in zip(owners, owner_accounts):
             program = acct["owner"] if acct else SYSTEM_PROGRAM  # unfunded wallet: still a wallet
@@ -943,9 +1022,30 @@ class Rpc:
         options: dict[str, Any] = {"limit": limit, "commitment": "confirmed"}
         if params.get("before-signature"):
             options["before"] = params["before-signature"]
-        signatures = self.call("getSignaturesForAddress", [address, options]) or []
         gte = int(params.get("gte-time") or 0)
         lte = int(params.get("lte-time") or 2**63 - 1)
+        signatures = []
+        # Read backwards to the requested window instead of filtering only the latest
+        # page (which silently returned an empty early-buy/funding history).
+        reached_window = False
+        for _ in range(3):
+            page = self.call("getSignaturesForAddress", [address, options]) or []
+            signatures.extend(page)
+            times = [r['blockTime'] for r in page if r.get('blockTime') is not None]
+            eligible = [r for r in signatures if r.get('signature') and not r.get('err')
+                        and r.get('blockTime') is not None and gte <= r['blockTime'] <= lte]
+            if gte:
+                reached_window = len(page) < limit or bool(times and min(times) < gte)
+            else:
+                # Funding histories are bounded samples, not exhaustive wallet ancestry.
+                reached_window = len(page) < limit or len(eligible) >= limit
+            if reached_window:
+                break
+            if not page or not page[-1].get('signature'):
+                break
+            options['before'] = page[-1]['signature']
+        if not reached_window:
+            raise RuntimeError('history window unavailable within bounded pagination')
         rows = [
             row for row in signatures
             if row.get("signature") and not row.get("err") and gte <= int(row.get("blockTime") or 0) <= lte
@@ -965,6 +1065,8 @@ class Rpc:
             for row in rows
         ]
         bodies = self.batch_call(calls, timeout=self.cfg.bundle_lookup_timeout_ms / 1000)
+        if len(bodies) != len(rows) or any(not isinstance(body, dict) for body in bodies):
+            raise RuntimeError('history transaction data incomplete')
         normalized = [
             normalize_rpc_transaction(body, row["signature"])
             for row, body in zip(rows, bodies)
@@ -1091,8 +1193,9 @@ class Rpc:
             return {"complete": False, "error": "fewer than two plain-wallet holders returned"}
         wallet_amounts = {wallet: raw / (10 ** decimals) for wallet, raw in holders}
         holder_set = set(wallet_amounts)
+        history_address = bonding_curve_address(mint) if self.cfg.transaction_history_mode == 'raw' else mint
         transactions = self.enhanced_transactions(
-            mint,
+            history_address,
             **{
                 "sort-order": "asc",
                 "gte-time": int(created_ts) - 2,
@@ -1729,6 +1832,11 @@ class Executor:
         if tokens <= 0:
             raise RuntimeError("zero-token quote")
         impact = quote_price_impact_pct(quote)
+        # Reject an already-invalid quote before expensive holder/history/funder queries.
+        early_guard = entry_guard_reason(self.cfg, item['graduated_ts'], now_ts(), impact)
+        if early_guard:
+            self.skip(mint, early_guard)
+            return
         market_cap, curve_age, top_holder_pct, top_holder, bundle = self.entry_metadata(
             mint, item["graduated_ts"], size_usd, tokens
         )

@@ -63,7 +63,7 @@ class CurveAgeGuardTests(unittest.TestCase):
         cfg = executor.Config()
         reason = executor.entry_guard_reason(cfg, GRAD, ENTRY, 1.0, 64_000, curve_age_seconds=29)
         self.assertIn("29s after creation", reason)
-        self.assertIn("bundle", reason)
+        self.assertIn("minimum curve age", reason)
 
     def test_slow_curve_passes(self):
         executor, p = fresh()
@@ -365,12 +365,12 @@ class BundleSnapshotTests(unittest.TestCase):
             "slot": 10,
             "feePayer": "dev",
             "tokenTransfers": [
-                {"mint": "m", "toUserAccount": wallet, "tokenAmount": 0.09, "decimals": 2}
+                {"mint": "4nBz25Nk2J1M4JMjdjE6VQYi66yJBtducUQTNCzSpump", "toUserAccount": wallet, "tokenAmount": 0.09, "decimals": 2}
                 for wallet in wallets
             ],
         }]
         rpc.origin_funder = lambda wallet, before: "dev"
-        snapshot = rpc.bundle_snapshot("m", 1.0, 2, 900, 1000)
+        snapshot = rpc.bundle_snapshot("4nBz25Nk2J1M4JMjdjE6VQYi66yJBtducUQTNCzSpump", 1.0, 2, 900, 1000)
         self.assertTrue(snapshot["complete"])
         self.assertAlmostEqual(snapshot["bundle_slot_pct"], 54.0)
         self.assertAlmostEqual(snapshot["cluster_pct"], 54.0)
@@ -395,13 +395,13 @@ class BundleSnapshotTests(unittest.TestCase):
             "slot": 10,
             "feePayer": "dev",
             "tokenTransfers": [
-                {"mint": "m", "toUserAccount": wallet, "tokenAmount": raw, "decimals": 0}
+                {"mint": "4nBz25Nk2J1M4JMjdjE6VQYi66yJBtducUQTNCzSpump", "toUserAccount": wallet, "tokenAmount": raw, "decimals": 0}
                 for wallet, raw in holders
             ],
         }]
         rpc.origin_funder = lambda wallet, before: "treasury" if wallet.startswith("w") else None
 
-        snapshot = rpc.bundle_snapshot("m", 10_000.0, 0, 900, 1000)
+        snapshot = rpc.bundle_snapshot("4nBz25Nk2J1M4JMjdjE6VQYi66yJBtducUQTNCzSpump", 10_000.0, 0, 900, 1000)
         self.assertTrue(snapshot["complete"])
         self.assertEqual(snapshot["holder_sample_count"], 50)
         self.assertEqual(snapshot["funder_sample_count"], 20)
@@ -418,13 +418,13 @@ class BundleSnapshotTests(unittest.TestCase):
             "slot": 10,
             "feePayer": "dev",
             "tokenTransfers": [
-                {"mint": "m", "toUserAccount": wallet, "tokenAmount": raw, "decimals": 0}
+                {"mint": "4nBz25Nk2J1M4JMjdjE6VQYi66yJBtducUQTNCzSpump", "toUserAccount": wallet, "tokenAmount": raw, "decimals": 0}
                 for wallet, raw in holders
             ],
         }]
         rpc.origin_funder = lambda wallet, before: None
 
-        snapshot = rpc.bundle_snapshot("m", 1_000.0, 0, 900, 1000)
+        snapshot = rpc.bundle_snapshot("4nBz25Nk2J1M4JMjdjE6VQYi66yJBtducUQTNCzSpump", 1_000.0, 0, 900, 1000)
         self.assertFalse(snapshot["complete"])
         self.assertAlmostEqual(snapshot["funder_lookup_pct"], 100.0)
         self.assertEqual(snapshot["bundle_confidence"], "insufficient")

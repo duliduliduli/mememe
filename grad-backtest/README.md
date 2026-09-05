@@ -272,6 +272,37 @@ variables taking precedence. Use provider-issued endpoints for sustained operati
 
 ### 4.5 Swaps, slippage, retries
 
+Discovery now decodes Pump's `migrate`/`migrate_v2` instructions and requires a
+matching PumpSwap `create_pool` (same base mint, quote mint, pool and LP mint).
+Layouts come from the official [Pump IDL](https://github.com/pump-fun/pump-public-docs/blob/main/idl/pump.json)
+and [PumpSwap IDL](https://github.com/pump-fun/pump-public-docs/blob/main/idl/pump_amm.json).
+Transfers, ordinary swaps and repeat migrations without pool creation are not new
+graduations. Unknown layouts are skipped. A reduced real migration fixture is
+covered in `test_rate_limits.py`.
+
+Provider failure cooldowns apply per endpoint and RPC method: 15 minutes for
+401/403 responses, 30 seconds for transient failures. Another available provider
+is tried, and blocked holder queries do not disable wallet reads on that endpoint.
+Fresh holder snapshots are shared for 10 seconds between top-holder and bundle
+checks. Excessive quote impact/stale entries are rejected before expensive metadata.
+
+Raw bundle history follows the Pump bonding-curve PDA; mint age lookups fall back
+to that address when mint history alone cannot establish the minimum age. This is
+earliest observed activity, not proof of the exact creation time or one-buyer ownership.
+Raw history pages backwards up to three pages toward the requested window and
+rejects exhausted pagination or missing transaction responses as incomplete data.
+Funding ancestry remains a bounded sample, not a complete wallet history.
+
+**Provider access remains required:** on September 5, 2026, a live PublicNode
+`getTokenLargestAccounts` request returned HTTP 403 stating that indexed requests
+require a personal token. Solana's public endpoint returned HTTP 429 for that method.
+dRPC's documented public Solana endpoint rejected access as unavailable on the free
+plan. Keyless balance reads/streaming therefore do not establish holder-query access.
+The code cannot lift provider restrictions: use an authorized provider endpoint
+supporting holder queries and transaction history through `RPC_URL(S)`.
+Missing bundle evidence continues to block entries; these changes do not restore
+Helius credits or guarantee trading through shared public infrastructure.
+
 Operational logs are enabled without additional environment variables:
 
 - `HEARTBEAT` every 30 seconds while the main loop advances: subscription status,
