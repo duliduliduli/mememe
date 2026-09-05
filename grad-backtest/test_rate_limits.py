@@ -173,6 +173,58 @@ class ProviderDiscoveryProtectionTests(unittest.TestCase):
         self.assertEqual(cfg.rpc_urls, ["https://rpc.example/key"])
         self.assertEqual(cfg.transaction_history_mode, "raw")
 
+    def test_keyless_defaults_ignore_existing_helius_key(self):
+        executor, p = fresh(HELIUS_API_KEY="exhausted", RPC_URL="", RPC_URLS="",
+                            RPC_WS_URL="", RPC_WS_URLS="")
+        self.addCleanup(p.stop)
+        cfg = executor.Config()
+        cfg.validate()
+        self.assertEqual(cfg.rpc_urls, list(executor.DEFAULT_RPC_URLS))
+        self.assertEqual(cfg.rpc_ws_urls, [executor.websocket_url(u) for u in cfg.rpc_urls])
+        self.assertFalse(any("helius" in u for u in cfg.rpc_urls))
+
+    def test_explicit_endpoint_lists_override_defaults(self):
+        executor, p = fresh(RPC_URL="https://ignored.example", RPC_URLS="https://custom.example",
+                            RPC_WS_URL="wss://ignored.example", RPC_WS_URLS="wss://custom-ws.example")
+        self.addCleanup(p.stop)
+        cfg = executor.Config()
+        self.assertEqual(cfg.rpc_urls, ["https://custom.example"])
+        self.assertEqual(cfg.rpc_ws_urls, ["wss://custom-ws.example"])
+
+    def test_websocket_429_uses_backup_without_waiting(self):
+        executor, p = fresh(RPC_URLS="https://one.example,https://two.example",
+                            RPC_WS_URL="", RPC_WS_URLS="")
+        self.addCleanup(p.stop)
+        stream = executor.MigrationStream(executor.Config())
+        conn = mock.Mock()
+        def acknowledged():
+            stream.stop_event.set()
+            return json.dumps({"jsonrpc": "2.0", "id": 1, "result": 123})
+        conn.recv.side_effect = acknowledged
+        with mock.patch.object(executor.websocket, "create_connection", side_effect=[http_error(429), conn]) as connect, mock.patch.object(executor, "log"), mock.patch.object(stream.stop_event, "wait") as wait:
+            stream._run()
+        self.assertEqual([c.args[0] for c in connect.call_args_list],
+                         ["wss://one.example", "wss://two.example"])
+        wait.assert_not_called()
+        conn.close.assert_called_once()
+
+    def test_websocket_all_unavailable_backs_off_per_endpoint(self):
+        executor, p = fresh(RPC_URLS="https://one.example,https://two.example",
+                            RPC_WS_URL="", RPC_WS_URLS="")
+        self.addCleanup(p.stop)
+        stream = executor.MigrationStream(executor.Config())
+        clock = [1000.0]
+        waits = []
+        def advance(delay):
+            waits.append(delay)
+            clock[0] += delay
+            if len(waits) == 3:
+                stream.stop_event.set()
+        with mock.patch.object(executor.websocket, "create_connection", side_effect=http_error(429)) as connect, mock.patch.object(executor.time, "monotonic", side_effect=lambda: clock[0]), mock.patch.object(stream.stop_event, "wait", side_effect=advance), mock.patch.object(executor, "log"):
+            stream._run()
+        self.assertEqual(waits, [30.0, 60.0, 120.0])
+        self.assertEqual(connect.call_count, 6)
+
     def test_rpc_fails_over_from_rate_limited_primary(self):
         executor, p = fresh(HELIUS_API_KEY="", RPC_URLS="https://one.example,https://two.example")
         self.addCleanup(p.stop)
