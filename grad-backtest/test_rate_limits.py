@@ -338,13 +338,108 @@ class ProviderDiscoveryProtectionTests(unittest.TestCase):
                 ],
             },
         }
-        self.assertEqual(executor.candidate_mints_from_rpc_transaction(tx), [mint])
+        # A swap with token balances is not evidence of a new migration.
+        self.assertEqual(executor.candidate_mints_from_rpc_transaction(tx), [])
         normalized = executor.normalize_rpc_transaction(tx)
         self.assertEqual(normalized["type"], "SWAP")
         self.assertEqual(normalized["feePayer"], "buyer")
         self.assertEqual(normalized["nativeTransfers"][0]["amount"], 200000)
         self.assertTrue(any(t["mint"] == mint and t["toUserAccount"] == "buyer" for t in normalized["tokenTransfers"]))
 
+
+
+class MigrationRegressionTests(unittest.TestCase):
+    # Reduced real getTransaction response from the user's ambiguous migration:
+    # 5pQ8Mp6VBtg9CqPqpmDtmRtwErtEvyejBxrPjmv8paiuSRUNcfhbmoDf7eUAPDnb91ue5qaVr97y5niNcrakDfSJ
+    FIXTURE = "{\"meta\":{\"err\":null,\"innerInstructions\":[{\"index\":0,\"instructions\":[{\"accounts\":[\"7vUJ4nx2sBhi5yKVxqgGqeE6uB9QJBw2Ku9LFz4qqZjp\",\"ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw\",\"2pY7RfGbEgLhKAzvBTb62zgqpKZ1nUHq1ueN2Y1q3ZPc\",\"4nBz25Nk2J1M4JMjdjE6VQYi66yJBtducUQTNCzSpump\",\"So11111111111111111111111111111111111111112\",\"FyZ6ZZG5zV4R8F7pxQnFWm5j4kTq8yc8H2MMd4Q9C8za\",\"3NnPJrKhKTEm6yEoYegJmc5LmZaQaKJDiaSFrT6TfPDA\",\"nLhGHHN4WimjTzUSoyTD4ebpSzceXK28fYmZxkum8G4\",\"AxjjseUMSqBgeqQGNRzQpWJqwCr7CeriqGN9cG8LXuRV\",\"DPYWK4m69rmGDNsPBNgpFEbphCWGWduRuKnrHLrn8CMy\",\"FAMk7vM8xMZ8QSxKJgscNTkKDQ5Eu5Z7ADsnGhcgVQjd\",\"11111111111111111111111111111111\",\"TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb\",\"TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb\",\"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA\",\"ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL\",\"GS4CU59F31iL7aR2Q8zVS8DRrcRnXX1yjQ66TqNVQnaR\",\"pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA\"],\"data\":\"iPiwDbPRj3YavFpj3AxMZtPvR35cgUxfFEfpLbo5rj7QYVbs6GvStgmhjBTrj9fnLdqVaBoRRWeLKFreHd\",\"programId\":\"pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA\",\"stackHeight\":2}]}],\"postTokenBalances\":[{\"accountIndex\":6,\"mint\":\"So11111111111111111111111111111111111111112\",\"owner\":\"FddUDciQbVKWUfNtiHt635ewDrARzVkEGE2LjNkn6D2s\",\"programId\":\"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA\",\"uiTokenAmount\":{\"amount\":\"17584505289\",\"decimals\":9,\"uiAmount\":17.584505289,\"uiAmountString\":\"17.584505289\"}},{\"accountIndex\":8,\"mint\":\"4nBz25Nk2J1M4JMjdjE6VQYi66yJBtducUQTNCzSpump\",\"owner\":\"7vUJ4nx2sBhi5yKVxqgGqeE6uB9QJBw2Ku9LFz4qqZjp\",\"programId\":\"TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb\",\"uiTokenAmount\":{\"amount\":\"206900000000000\",\"decimals\":6,\"uiAmount\":206900000.0,\"uiAmountString\":\"206900000\"}},{\"accountIndex\":9,\"mint\":\"So11111111111111111111111111111111111111112\",\"owner\":\"7vUJ4nx2sBhi5yKVxqgGqeE6uB9QJBw2Ku9LFz4qqZjp\",\"programId\":\"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA\",\"uiTokenAmount\":{\"amount\":\"67405853771\",\"decimals\":9,\"uiAmount\":67.405853771,\"uiAmountString\":\"67.405853771\"}},{\"accountIndex\":11,\"mint\":\"4nBz25Nk2J1M4JMjdjE6VQYi66yJBtducUQTNCzSpump\",\"owner\":\"3pvWeAPDiXJtA2XcSRMW4qXgnLsKKVgoRWtWHzWqUuMq\",\"programId\":\"TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb\",\"uiTokenAmount\":{\"amount\":\"0\",\"decimals\":6,\"uiAmount\":null,\"uiAmountString\":\"0\"}}]},\"transaction\":{\"message\":{\"instructions\":[{\"accounts\":[\"4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf\",\"39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg\",\"4nBz25Nk2J1M4JMjdjE6VQYi66yJBtducUQTNCzSpump\",\"3pvWeAPDiXJtA2XcSRMW4qXgnLsKKVgoRWtWHzWqUuMq\",\"Gm7335VfUGjXJ5uMMbzainioQTcjHzJqi4ta45tS4TCD\",\"LfEcaUf77iEhnz6gFpLqYgDb5Uk6Ekc5n69wu7Qa9Uw\",\"11111111111111111111111111111111\",\"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA\",\"pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA\",\"7vUJ4nx2sBhi5yKVxqgGqeE6uB9QJBw2Ku9LFz4qqZjp\",\"2pY7RfGbEgLhKAzvBTb62zgqpKZ1nUHq1ueN2Y1q3ZPc\",\"3NnPJrKhKTEm6yEoYegJmc5LmZaQaKJDiaSFrT6TfPDA\",\"nLhGHHN4WimjTzUSoyTD4ebpSzceXK28fYmZxkum8G4\",\"ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw\",\"So11111111111111111111111111111111111111112\",\"FyZ6ZZG5zV4R8F7pxQnFWm5j4kTq8yc8H2MMd4Q9C8za\",\"AxjjseUMSqBgeqQGNRzQpWJqwCr7CeriqGN9cG8LXuRV\",\"DPYWK4m69rmGDNsPBNgpFEbphCWGWduRuKnrHLrn8CMy\",\"FAMk7vM8xMZ8QSxKJgscNTkKDQ5Eu5Z7ADsnGhcgVQjd\",\"TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb\",\"ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL\",\"GS4CU59F31iL7aR2Q8zVS8DRrcRnXX1yjQ66TqNVQnaR\",\"Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1\",\"6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P\",\"SysvarRent111111111111111111111111111111111\",\"FddUDciQbVKWUfNtiHt635ewDrARzVkEGE2LjNkn6D2s\",\"A5ymTE5xMXnFetVxmvuwk3ikiPiSpcS2fpSgter3si55\"],\"data\":\"T5bZvAk4s5f\",\"programId\":\"6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P\",\"stackHeight\":1}]}}}"
+
+    def setUp(self):
+        self.ex, p = fresh()
+        self.addCleanup(p.stop)
+        self.tx = json.loads(self.FIXTURE)
+
+    def test_real_migration_selects_base_not_lp(self):
+        self.assertEqual(self.ex.candidate_mints_from_rpc_transaction(self.tx),
+                         ["4nBz25Nk2J1M4JMjdjE6VQYi66yJBtducUQTNCzSpump"])
+
+    def test_repeat_migration_without_pool_creation_is_not_new(self):
+        self.tx["meta"]["innerInstructions"] = []
+        self.assertEqual(self.ex.candidate_mints_from_rpc_transaction(self.tx), [])
+
+    def test_wrong_program_or_failed_transaction_cannot_migrate(self):
+        self.tx["meta"]["err"] = {"InstructionError": [0, "error"]}
+        self.assertEqual(self.ex.candidate_mints_from_rpc_transaction(self.tx), [])
+        self.tx["meta"]["err"] = None
+        self.tx["transaction"]["message"]["instructions"][0]["programId"] = "fake"
+        self.assertEqual(self.ex.candidate_mints_from_rpc_transaction(self.tx), [])
+
+    def test_mismatched_pool_cannot_supply_candidate(self):
+        self.tx["meta"]["innerInstructions"][0]["instructions"][0]["accounts"][3] = "wrong-mint"
+        self.assertEqual(self.ex.candidate_mints_from_rpc_transaction(self.tx), [])
+
+    def test_migration_v2_layout(self):
+        ix = self.tx["transaction"]["message"]["instructions"][0]
+        old = ix["accounts"]
+        accounts = ["placeholder"] * 27
+        accounts[2], accounts[3], accounts[10], accounts[15] = old[2], old[14], old[9], old[15]
+        ix["accounts"] = accounts
+        n = int.from_bytes(bytes([187,203,18,31,206,237,254,41]), "big")
+        encoded = ""
+        while n:
+            n, rem = divmod(n, 58)
+            encoded = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"[rem] + encoded
+        ix["data"] = encoded
+        self.assertEqual(self.ex.candidate_mints_from_rpc_transaction(self.tx), [accounts[2]])
+
+    def test_method_cooldown_does_not_disable_wallet_reads(self):
+        rpc = self.ex.Rpc(self.ex.Config())
+        endpoint = rpc.cfg.rpc_urls[0]
+        with mock.patch.object(self.ex, "log"):
+            rpc._cool_method(endpoint, "getTokenLargestAccounts", http_error(403))
+        self.assertNotIn(endpoint, [u for _, u in rpc._endpoint_order(("getTokenLargestAccounts",))])
+        self.assertIn(endpoint, [u for _, u in rpc._endpoint_order(("getBalance",))])
+
+    def test_holder_snapshot_shared_between_checks_then_expires(self):
+        rpc = self.ex.Rpc(self.ex.Config())
+        fetch = mock.Mock(return_value=[("a", 10), ("b", 5)])
+        rpc._plain_wallet_holders_uncached = fetch
+        with mock.patch.object(self.ex.time, "monotonic", return_value=100):
+            self.assertEqual(rpc.plain_wallet_holders("mint", limit=1), [("a", 10)])
+            self.assertEqual(len(rpc.plain_wallet_holders("mint", limit=50)), 2)
+        self.assertEqual(fetch.call_count, 1)
+        with mock.patch.object(self.ex.time, "monotonic", return_value=111):
+            rpc.plain_wallet_holders("mint")
+        self.assertEqual(fetch.call_count, 2)
+
+    def test_missing_batch_reply_does_not_become_empty_history(self):
+        rpc = self.ex.Rpc(self.ex.Config())
+        rpc._batch_post = mock.Mock(return_value=[])
+        with self.assertRaisesRegex(RuntimeError, "batch missing"):
+            rpc.batch_call([("getTransaction", ["sig"])])
+
+    def test_history_pages_to_requested_time_window(self):
+        rpc = self.ex.Rpc(self.ex.Config())
+        page = [{"signature": str(i), "blockTime": 200} for i in range(5)]
+        rpc.call = mock.Mock(side_effect=[page, [{"signature": "old", "blockTime": 100}]])
+        rpc.batch_call = mock.Mock(return_value=[{"slot": 1, "blockTime": 100}])
+        result = rpc.raw_transactions("wallet", **{"limit": 5, "gte-time": 90, "lte-time": 110})
+        self.assertEqual(len(result), 1)
+        self.assertEqual(rpc.call.call_args.args[1][1]["before"], "4")
+
+    def test_incomplete_history_window_stays_unknown(self):
+        rpc = self.ex.Rpc(self.ex.Config())
+        rpc.call = mock.Mock(return_value=[{"signature": str(i), "blockTime": 200} for i in range(5)])
+        with self.assertRaisesRegex(RuntimeError, "history window unavailable"):
+            rpc.raw_transactions("wallet", **{"limit": 5, "gte-time": 90, "lte-time": 110})
+
+    def test_high_impact_does_not_spend_holder_requests(self):
+        bot = self.ex.Executor(self.ex.Config())
+        bot.equity_usd = mock.Mock(return_value=100)
+        bot.jup.quote = mock.Mock(return_value={"outAmount": "100", "priceImpactPct": "0.60"})
+        bot.entry_metadata = mock.Mock()
+        with mock.patch.object(self.ex, "now_ts", return_value=1030):
+            bot.try_enter({"mint": "mint", "graduated_ts": 1000}, 100)
+        bot.entry_metadata.assert_not_called()
 
 class AdoptedSlotTests(unittest.TestCase):
     def test_adopted_positions_do_not_take_entry_slots(self):
