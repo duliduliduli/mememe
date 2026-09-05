@@ -32,7 +32,7 @@ class MetadataOrderingTests(unittest.TestCase):
         self.addCleanup(clock.stop)
         self.bot = self.ex.Executor(self.ex.Config())
         self.bot.rpc = mock.Mock()
-        self.bot.rpc.token_supply.return_value = (1_000_000, 0)
+        self.bot.rpc.token_supply_details.return_value = (1_000_000, 0, 1_000_000)
         self.bot.rpc.mint_first_seen.return_value = GRAD - 120
         self.bot.rpc.top_wallet_holder.return_value = ("holder", 100_000)
         self.bot.rpc.bundle_snapshot.return_value = {"complete": True}
@@ -68,7 +68,7 @@ class MetadataOrderingTests(unittest.TestCase):
         self.assertTrue(result[4]["complete"])
         self.bot.rpc.bundle_snapshot.assert_called_once()
         self.assertEqual([c[0] for c in self.bot.rpc.method_calls],
-                         ["token_supply", "mint_first_seen", "top_wallet_holder", "bundle_snapshot"])
+                         ["token_supply_details", "mint_first_seen", "top_wallet_holder", "bundle_snapshot"])
 
     def test_unknown_curve_stays_incomplete(self):
         self.bot.rpc.mint_first_seen.return_value = None
@@ -510,7 +510,10 @@ class EntryIntegrationTests(unittest.TestCase):
             "priceImpactPct": "0.01",
         }
         responses = {
-            "getTokenSupply": {"value": {"uiAmountString": str(supply_ui), "decimals": 6}},
+            "getTokenSupply": {"value": {
+                "amount": str(int(supply_ui * 10**6)),
+                "uiAmountString": str(supply_ui), "decimals": 6,
+            }},
             "getSignaturesForAddress": [sigs([GRAD, created])],
             "getTokenLargestAccounts": {"value": [{"address": "ta", "amount": str(holder_amount * 10**6)}]},
             "getMultipleAccounts": [{"value": [token_account("whale")]}, {"value": [{"owner": self.executor.SYSTEM_PROGRAM}]}],
