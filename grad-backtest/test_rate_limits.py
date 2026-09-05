@@ -447,14 +447,27 @@ class MigrationRegressionTests(unittest.TestCase):
 
     def test_large_window_is_not_silently_sampled(self):
         rpc = self.ex.Rpc(self.ex.Config())
-        rpc.call = mock.Mock(return_value=[
-            {"signature": str(i), "blockTime": 100}
-            for i in range(501)
+        rpc.call = mock.Mock(side_effect=[
+            [{"signature": str(i), "blockTime": 100} for i in range(1000)],
+            [{"signature": "1000", "blockTime": 100}],
         ])
         rpc.batch_call = mock.Mock()
         with self.assertRaisesRegex(RuntimeError, "decode budget"):
             rpc.raw_transactions("curve", **{"gte-time": 90, "lte-time": 110})
         rpc.batch_call.assert_not_called()
+
+    def test_busy_705_transaction_window_is_decoded_fully(self):
+        rpc = self.ex.Rpc(self.ex.Config())
+        rpc.call = mock.Mock(return_value=[
+            {"signature": str(i), "blockTime": 100}
+            for i in range(705)
+        ])
+        rpc.batch_call = mock.Mock(
+            side_effect=lambda calls, **kw: [{"slot": 1, "blockTime": 100}] * len(calls)
+        )
+        result = rpc.raw_transactions("curve", **{"gte-time": 90, "lte-time": 110})
+        self.assertEqual(len(result), 705)
+        self.assertEqual(sum(len(c.args[0]) for c in rpc.batch_call.call_args_list), 705)
 
     def test_window_larger_than_old_120_limit_is_decoded_fully(self):
         rpc = self.ex.Rpc(self.ex.Config())
