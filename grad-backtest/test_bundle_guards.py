@@ -293,6 +293,21 @@ def sigs(times, n=None):
 class MintFirstSeenTests(unittest.TestCase):
     MINT = '6zbYeyBbr5hjkPrApW8QDBstMuxbRV8zMP9cYeUwpump'
 
+    def test_creation_search_can_cross_three_thousand_signatures(self):
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        rpc = executor.Rpc(executor.Config())
+        pages = [[{'signature': str(page * 1000 + i), 'blockTime': 5000 - page * 1000 - i}
+                  for i in range(1000)] for page in range(3)]
+        pages.append([{'signature': 'creation', 'blockTime': 1000}])
+        rpc.call = mock.Mock(side_effect=pages)
+        rpc.batch_call = mock.Mock(side_effect=lambda calls, **kw: [{} for _ in calls])
+        creation = {'timestamp': 1000, 'creations': [
+            {'mint': self.MINT, 'timestamp': 1000, 'slot': 1}]}
+        with mock.patch.object(executor, 'normalize_rpc_transaction', return_value=creation):
+            self.assertEqual(rpc.mint_first_seen(self.MINT, 880), 1000)
+        self.assertEqual(rpc.call.call_count, 4)
+
     def test_recent_activity_is_not_verified_creation(self):
         executor, p = fresh()
         self.addCleanup(p.stop)
