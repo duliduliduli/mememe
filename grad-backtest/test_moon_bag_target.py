@@ -187,7 +187,7 @@ class CleanupTests(unittest.TestCase):
         self.addCleanup(p.stop)
         text = executor.describe_error(RuntimeError("429 for url: https://rpc.example/?api-key=SECRET123&x=1"))
         self.assertNotIn("SECRET123", text)
-        self.assertIn("api-key=…", text)
+        self.assertEqual(text, "429 for url: https://rpc.example/…")
 
 
 if __name__ == "__main__":
