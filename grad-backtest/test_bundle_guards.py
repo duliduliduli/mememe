@@ -388,6 +388,29 @@ class TopWalletHolderTests(unittest.TestCase):
         fake = FakeRpc(executor, {"getTokenLargestAccounts": {"value": []}})
         self.assertIsNone(fake.rpc.top_wallet_holder("m"))
 
+    def test_retains_all_token_accounts_for_targeted_holder_history(self):
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        largest = {"value": [
+            {"address": "ta_w1_a", "amount": "60"},
+            {"address": "ta_w1_b", "amount": "20"},
+            {"address": "ta_w2", "amount": "40"},
+        ]}
+        accounts = {"value": [token_account("w1"), token_account("w1"), token_account("w2")]}
+        owners = {"value": [{"owner": executor.SYSTEM_PROGRAM} for _ in range(3)]}
+        fake = FakeRpc(executor, {
+            "getTokenLargestAccounts": largest,
+            "getMultipleAccounts": [accounts, owners],
+        })
+
+        holders = fake.rpc.plain_wallet_holders("m", limit=20)
+
+        self.assertEqual(holders, [("w1", 80), ("w2", 40)])
+        self.assertEqual(
+            fake.rpc.holder_history_addresses("m", holders),
+            ["ta_w1_a", "ta_w1_b", "ta_w2"],
+        )
+
 
 class WalletGraphCacheTests(unittest.TestCase):
     def test_positive_funder_survives_rpc_recreation(self):
@@ -422,6 +445,46 @@ class WalletGraphCacheTests(unittest.TestCase):
 
 
 class BundleSnapshotTests(unittest.TestCase):
+    def test_raw_bundle_uses_targeted_holder_histories_and_deduplicates(self):
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        rpc = executor.Rpc(executor.Config())
+        mint = '4nBz25Nk2J1M4JMjdjE6VQYi66yJBtducUQTNCzSpump'
+        holders = [("w1", 60), ("w2", 40)]
+        rpc.plain_wallet_holders = lambda _mint, _exclude, _limit: holders
+        rpc._holder_token_accounts[(mint, ())] = (
+            __import__('time').monotonic(), {"w1": ["ta1"], "w2": ["ta2"]}
+        )
+        rpc._creation_cache[mint] = {
+            "mint": mint, "timestamp": 900, "slot": 10, "creator": "dev",
+        }
+        purchase = {
+            "signature": "shared-buy", "slot": 11, "nativeTransfers": [],
+            "tokenTransfers": [
+                {"mint": mint, "toUserAccount": "w1", "tokenAmount": 60, "decimals": 0},
+                {"mint": mint, "toUserAccount": "w2", "tokenAmount": 40, "decimals": 0},
+            ],
+        }
+        rpc.enhanced_transactions = mock.Mock(return_value=[purchase])
+        rpc._lookup_funders = lambda wallets, before: ({w: 'funder' for w in wallets}, set(wallets))
+        rpc.cached_origin_funder = lambda wallet, before: None
+
+        snapshot = rpc.bundle_snapshot(mint, 100, 0, 900, 1000)
+
+        self.assertTrue(snapshot["complete"])
+        self.assertEqual(snapshot["bundle_slot_pct"], 100.0)
+        self.assertEqual(
+            [call.args[0] for call in rpc.enhanced_transactions.call_args_list],
+            ["ta1", "ta2"],
+        )
+        self.assertNotIn(executor.bonding_curve_address(mint), [
+            call.args[0] for call in rpc.enhanced_transactions.call_args_list
+        ])
+        for call in rpc.enhanced_transactions.call_args_list:
+            self.assertEqual(call.kwargs["limit"], 25)
+            self.assertEqual(call.kwargs["max-pages"], 1)
+            self.assertNotIn("gte-time", call.kwargs)
+
     def test_raw_bundle_history_uses_deep_bounded_window(self):
         executor, p = fresh()
         self.addCleanup(p.stop)
