@@ -292,7 +292,7 @@ earliest observed activity, not proof of the exact creation time or one-buyer ow
 Raw curve history searches up to three 1,000-signature pages toward the requested
 window, independently of the small funding sample size. Failed transactions and
 out-of-window signatures do not consume the full-transaction decode budget.
-Up to 500 successful transactions in the window are decoded in batches; larger
+Up to 1,000 successful transactions in the window are decoded in batches; larger
 windows remain unknown rather than being silently sampled. Signature search has
 a five-second scheduling budget and decoding checks an eight-second budget between
 batches (an in-flight request/provider retry can overrun these budgets).
