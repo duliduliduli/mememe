@@ -6,9 +6,9 @@ Serves a public, read-only dashboard over the result files that
 and can launch those jobs in a background process so the whole thing
 runs as one Railway service.
 
-Writes are gated: POST /api/run requires ADMIN_TOKEN. Never put wallet
-keys in this service's environment; it only needs HELIUS_API_KEY /
-MIGRATION_ADDRESS for collection jobs.
+Writes are gated: POST /api/run requires ADMIN_TOKEN. Collection jobs use
+HELIUS_API_KEY and MIGRATION_ADDRESS. A live executor additionally uses a sealed
+burner-wallet key plus standard Solana RPC endpoint variables.
 """
 
 from __future__ import annotations
