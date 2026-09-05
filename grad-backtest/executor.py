@@ -1809,17 +1809,24 @@ class Executor:
     def entry_metadata(
         self, mint: str, graduated_ts: float, size_usd: float, tokens: int
     ) -> tuple[float | None, float | None, float | None, str | None, dict[str, Any]]:
-        """Entry metadata plus a mandatory multi-wallet bundle snapshot."""
+        """Reject at each metadata stage before spending on the next one.
+
+        The caller logs the existing guard reason. Only candidates surviving market
+        cap, curve age and concentration reach the mandatory bundle snapshot.
+        """
         cfg = self.cfg
         market_cap = curve_age = top_holder_pct = None
         top_holder = None
         supply_ui = decimals = None
+        not_analyzed = {"complete": False, "error": "earlier entry guard rejected; bundle not analyzed"}
         if cfg.max_entry_market_cap_usd > 0 or cfg.min_entry_market_cap_usd > 0 or cfg.max_top_holder_pct > 0:
             try:
                 supply_ui, decimals = self.rpc.token_supply(mint)
                 market_cap = entry_market_cap_usd(size_usd, tokens, supply_ui, decimals)
             except Exception as exc:
                 log(f"WARN {mint}: market cap check unavailable ({describe_error(exc)})")
+        if entry_guard_reason(cfg, graduated_ts, now_ts(), None, market_cap):
+            return market_cap, curve_age, top_holder_pct, top_holder, not_analyzed
         if cfg.min_curve_age_seconds > 0:
             try:
                 created = self.rpc.mint_first_seen(mint, graduated_ts - cfg.min_curve_age_seconds)
@@ -1827,6 +1834,8 @@ class Executor:
                     curve_age = max(0.0, graduated_ts - created)
             except Exception as exc:
                 log(f"WARN {mint}: curve age check unavailable ({describe_error(exc)})")
+        if entry_guard_reason(cfg, graduated_ts, now_ts(), None, market_cap, curve_age):
+            return market_cap, curve_age, top_holder_pct, top_holder, not_analyzed
         if cfg.max_top_holder_pct > 0 and supply_ui:
             try:
                 exclude = {self.wallet.pubkey} if self.wallet else set()
@@ -1836,6 +1845,8 @@ class Executor:
                     top_holder_pct = amount / (10 ** decimals) / supply_ui * 100
             except Exception as exc:
                 log(f"WARN {mint}: holder concentration check unavailable ({describe_error(exc)})")
+        if entry_guard_reason(cfg, graduated_ts, now_ts(), None, market_cap, curve_age, top_holder_pct):
+            return market_cap, curve_age, top_holder_pct, top_holder, not_analyzed
         bundle: dict[str, Any]
         if not supply_ui or decimals is None:
             bundle = {"complete": False, "error": "token supply unavailable"}
