@@ -118,6 +118,17 @@ class SolPriceCacheTests(unittest.TestCase):
 
 
 class HeliusPollProtectionTests(unittest.TestCase):
+    def test_rate_limit_circuit_breaker_grows_exponentially(self):
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        ex = executor.Executor(executor.Config())
+        with mock.patch.object(executor, "now_ts", return_value=1000.0):
+            self.assertEqual(ex.note_helius_rate_limit(), 30.0)
+        self.assertEqual(ex._helius_poll_cooldown_until, 1030.0)
+        with mock.patch.object(executor, "now_ts", return_value=1030.0):
+            self.assertEqual(ex.note_helius_rate_limit(), 60.0)
+        self.assertEqual(ex._helius_poll_cooldown_until, 1090.0)
+
     def test_rate_limit_starts_cooldown_instead_of_hammering_every_cycle(self):
         executor, p = fresh()
         self.addCleanup(p.stop)
