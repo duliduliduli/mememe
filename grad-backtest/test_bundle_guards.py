@@ -422,6 +422,30 @@ class WalletGraphCacheTests(unittest.TestCase):
 
 
 class BundleSnapshotTests(unittest.TestCase):
+    def test_raw_bundle_history_uses_deep_bounded_window(self):
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        rpc = executor.Rpc(executor.Config())
+        rpc.plain_wallet_holders = lambda mint, exclude, limit: [("w1", 60), ("w2", 40)]
+        rpc.enhanced_transactions = mock.Mock(return_value=[{
+            'creations': [{'mint': '4nBz25Nk2J1M4JMjdjE6VQYi66yJBtducUQTNCzSpump',
+                           'timestamp': 900, 'slot': 10, 'creator': 'dev'}],
+            'slot': 10,
+            'tokenTransfers': [
+                {'mint': '4nBz25Nk2J1M4JMjdjE6VQYi66yJBtducUQTNCzSpump',
+                 'toUserAccount': 'w1', 'tokenAmount': 60, 'decimals': 0},
+            ],
+        }])
+        rpc._lookup_funders = lambda wallets, before: ({w: 'funder' for w in wallets}, set(wallets))
+        rpc.cached_origin_funder = lambda wallet, before: None
+
+        rpc.bundle_snapshot('4nBz25Nk2J1M4JMjdjE6VQYi66yJBtducUQTNCzSpump', 100, 0, 900, 1000)
+
+        params = rpc.enhanced_transactions.call_args.kwargs
+        self.assertEqual(params['max-pages'], 30)
+        self.assertEqual(params['gte-time'], 898)
+        self.assertEqual(params['lte-time'], 1032)
+
     def test_shared_funder_and_same_slot_are_measured(self):
         executor, p = fresh()
         self.addCleanup(p.stop)
