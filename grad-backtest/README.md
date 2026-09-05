@@ -58,11 +58,9 @@ strategy has an edge before you find out with a wallet.
 ## 1. Architecture and data flow
 
 ```
-                 Helius enhanced-transactions API
-                 (history of MIGRATION_ADDRESS)
-                          │
-          ┌───────────────┴────────────────┐
-          │                                │
+            Helius enhanced API       Standard RPC + WebSocket
+             (research collector)       (live executor)
+                    │                         │
    grad_backtest.py collect         executor.py poll_graduations
           │                                │
    graduations.csv                  pending graduations (in memory)
@@ -90,8 +88,8 @@ External services:
 
 | Service | Used by | For |
 |---|---|---|
-| Helius enhanced transactions (`api-mainnet.helius-rpc.com/v0/addresses/{addr}/transactions`) | collector, executor | Finding graduation transactions on the migration address |
-| Helius (or any) Solana JSON-RPC (`RPC_URL`) | executor | Balances, token accounts, supply, signatures, largest holders, sending and confirming transactions |
+| Helius enhanced transactions | collector only; optional executor compatibility mode | Building the historical graduation dataset; optional normalized history when `TRANSACTION_HISTORY_MODE=helius` |
+| Standard Solana JSON-RPC + WebSocket (`RPC_URL(S)`) | executor | Streaming/catching up graduations, raw transaction history, balances, holder data, sending, and confirmation |
 | Jupiter swap API (`JUPITER_BASE_URL`, default lite-api v1) | executor | Quotes (buy, sell, valuation, SOL price) and swap transactions |
 | GeckoTerminal (`api.geckoterminal.com/api/v2`) | backtester | Pool discovery and OHLCV candles |
 
@@ -115,11 +113,11 @@ mememe/
     ├── grad_backtest.py        collector + backtester (section 8)
     ├── optimize.py             parameter sweep with train/validation split
     ├── position_sizing.py      bootstrap Monte Carlo sizing
-    ├── requirements.txt        requests, pandas, fastapi, uvicorn, httpx, solders
+    ├── requirements.txt        requests, websocket-client, pandas, fastapi, uvicorn, httpx, solders
     ├── Dockerfile, railway.json   same as root, for builds rooted here
     ├── .env.example            every variable with a comment
     ├── data/graduations.example.csv
-    └── test_*.py               111 unit tests (section 10)
+    └── test_*.py               151 unit tests (section 10)
 ```
 
 ---
@@ -144,7 +142,7 @@ python server.py                           # dashboard on :8000
 ### Paper trading
 
 ```bash
-export EXECUTOR_MODE=paper
+export EXECUTOR_MODE=paper MIGRATION_ADDRESS='…' RPC_URL='https://your-provider.example/key'
 python executor.py
 ```
 
@@ -154,7 +152,8 @@ Real detection, real Jupiter quotes, simulated fills against a
 ### Live trading
 
 ```bash
-export EXECUTOR_MODE=live WALLET_PRIVATE_KEY='base58 key of a burner wallet'
+export EXECUTOR_MODE=live MIGRATION_ADDRESS='…' RPC_URL='https://your-provider.example/key'
+export WALLET_PRIVATE_KEY='base58 key of a burner wallet'
 python executor.py
 ```
 
@@ -175,9 +174,13 @@ prints the important ones.
 
 | Variable | Default | Read by | Meaning |
 |---|---|---|---|
-| `HELIUS_API_KEY` | (none, required) | collector, executor | Helius key for graduation polling and the default RPC URL. |
+| `HELIUS_API_KEY` | (none) | collector; optional executor fallback | Required by `grad_backtest.py collect`. For the executor only, it can still construct the legacy Helius RPC URL when `RPC_URL(S)` is absent or enable `TRANSACTION_HISTORY_MODE=helius`. |
 | `MIGRATION_ADDRESS` | (none, required) | collector, executor | Pump.fun's migration authority. Public, not a secret; deliberately not hard-coded because it has changed over time. |
-| `RPC_URL` | `https://mainnet.helius-rpc.com/?api-key=$HELIUS_API_KEY` | executor | Solana JSON-RPC endpoint. |
+| `RPC_URL` | Helius URL only when `HELIUS_API_KEY` exists | executor | Primary standard Solana JSON-RPC HTTPS endpoint. Required unless `RPC_URLS` or the legacy Helius fallback is configured. |
+| `RPC_URLS` | `RPC_URL` | executor | Comma/newline-separated standard RPC endpoints. Calls automatically fail over on rate limits, timeouts, connection failures, 5xx responses, or unhealthy-node errors. |
+| `RPC_WS_URL`, `RPC_WS_URLS` | derived from RPC HTTPS URL(s) | executor | Optional provider WebSocket endpoint(s), in the same order as `RPC_URLS`. |
+| `TRANSACTION_HISTORY_MODE` | `raw` | executor | `raw` reconstructs the bundle detector's inputs from standard RPC. `helius` retains the enhanced-history compatibility path and requires `HELIUS_API_KEY`. |
+| `RPC_DAS_ENABLED` | `0` | executor | Enable only for a provider implementing Metaplex DAS `getTokenAccounts`; otherwise holder analysis uses portable standard RPC top-20 data. |
 | `JUPITER_BASE_URL` | `https://lite-api.jup.ag/swap/v1` | executor | Jupiter quote/swap base. |
 | `WALLET_PRIVATE_KEY` | (none; required in live mode) | executor | Base58 private key of a burner wallet. Never a seed phrase, never a main wallet. |
 | `ADMIN_TOKEN` | (none) | server | Password for `POST /api/run` and `POST /api/executor/*`, sent as header `x-admin-token`. Unset means those endpoints return 503. |
@@ -213,7 +216,15 @@ prints the important ones.
 | `MAX_ENTRY_AGE_SECONDS` | `120` | A graduation older than this when first seen is skipped. |
 | `MAX_ENTRY_LATENESS_SECONDS` | `60` | An entry attempt more than this past its target time is skipped. |
 | `POLL_SECONDS` | `5` | Main loop period. |
-| `HELIUS_POLL_TIMEOUT_SECONDS` | `5` | Maximum time an entry-discovery poll may delay the next exit check. |
+| `DISCOVERY_MODE` | `websocket` | WebSocket subscription plus periodic RPC catch-up; `poll` disables the stream. |
+| `DISCOVERY_CATCHUP_SECONDS` | `30` | Interval for standard `getSignaturesForAddress` catch-up, including after WebSocket reconnects. |
+| `DISCOVERY_POLL_LIMIT` | `10` | Number of recent migration signatures inspected per catch-up. |
+| `DISCOVERY_TIMEOUT_SECONDS` | `5` | Maximum time an entry-discovery RPC request may delay the next exit check. |
+| `RPC_TIMEOUT_SECONDS` | `8` | Default timeout per standard RPC request. |
+| `RPC_BATCH_SIZE` | `20` | Maximum standard JSON-RPC history requests per batch. |
+| `RPC_BACKOFF_MAX_SECONDS` | `900` | Maximum entry/discovery provider circuit-breaker delay. |
+| `RAW_HISTORY_SIGNATURE_LIMIT` | `40` | Maximum signatures reconstructed for a bundle-history query. |
+| `RAW_FUNDER_SIGNATURE_LIMIT` | `10` | Maximum early wallet transactions inspected when identifying its funder. |
 | `MAX_ENTRIES_PER_CYCLE` | `1` | Maximum due graduations analyzed per loop, preventing entry bursts from starving exits. |
 
 ### 4.4 Entry guards
@@ -239,10 +250,12 @@ higher coverage uses the normal limits. Configure those controls with
 `MIN_FUNDER_COVERAGE_PCT`. Wallet funders and launch appearances are cached in
 `DATA_DIR/wallet_graph_cache.json`.
 
-Helius 429 responses open an exponential detection circuit breaker (30 seconds,
-then 60/120/240 seconds, capped by `HELIUS_POLL_BACKOFF_MAX_SECONDS`, default 900).
-If startup is already rate-limited, wallet reconciliation is deferred and retried
-after a minimum five-minute cooldown rather than immediately spending more quota.
+RPC rate limits and provider outages first fail over across `RPC_URLS`. If every
+provider is unavailable, new-entry work opens an exponential circuit breaker (30
+seconds, then 60/120/240 seconds, capped by `RPC_BACKOFF_MAX_SECONDS`, default
+900). Exit monitoring remains first in the loop and continues attempting RPC
+failover. If startup is already provider-limited, wallet reconciliation is deferred
+and retried after a minimum five-minute cooldown.
 
 ### 4.5 Swaps, slippage, retries
 
@@ -326,8 +339,8 @@ stdout, which is what Railway shows).
 
 ### 6.1 Startup sequence
 
-1. `Config()` reads every variable; `validate()` requires the Helius key and
-   migration address, and the wallet key in live mode.
+1. `Config()` reads every variable; `validate()` requires a standard RPC
+   endpoint and migration address, plus the burner-wallet key in live mode.
 2. `load_state()` reads `executor_state.json` or creates a fresh state.
 3. The first log line prints the parameters in effect:
    ```
@@ -349,7 +362,7 @@ continues after `POLL_SECONDS`:
 2. Read the flag files: `executor.panic` means panic; `executor.stop` or panic means draining.
 3. Fetch the SOL price when needed and manage every open position first (6.5).
 4. Manage moon bags, stuck positions, and panic liquidation before doing any entry work.
-5. If not draining, poll Helius for new graduations (6.3), bounded by `HELIUS_POLL_TIMEOUT_SECONDS`.
+5. If not draining, drain WebSocket graduation hints and run standard-RPC catch-up when due (6.3), bounded by `DISCOVERY_TIMEOUT_SECONDS`.
 6. Collect due graduations and analyze at most `MAX_ENTRIES_PER_CYCLE`; later items remain queued.
 7. Save state.
 
@@ -358,10 +371,13 @@ later than `MAX_ENTRY_LATENESS_SECONDS` are discarded rather than replayed.
 
 ### 6.3 Detection
 
-`poll_graduations()` fetches the 10 most recent enhanced transactions for
-`MIGRATION_ADDRESS`. For each transaction not yet in `seen_signatures`:
+At startup a background `logsSubscribe` WebSocket watches `MIGRATION_ADDRESS`.
+`poll_graduations()` drains those signature hints, and every
+`DISCOVERY_CATCHUP_SECONDS` calls standard `getSignaturesForAddress` so a reconnect
+does not silently lose launches. Each unseen signature is fetched with parsed
+standard `getTransaction` data:
 
-- Extract candidate mints from `tokenTransfers` and `accountData[].tokenBalanceChanges`, excluding WSOL, USDC, and USDT.
+- Extract candidate mints from parsed instructions and pre/post token balances, excluding WSOL, USDC, and USDT.
 - Exactly one candidate is a graduation. Two or more logs `SKIP …: ambiguous graduation tx …`. Zero is ignored.
 - If the transaction is older than `MAX_ENTRY_AGE_SECONDS`, `SKIP …: graduation too old at detection (Ns)`.
 - Otherwise queue it with `enter_at = timestamp + ENTRY_DELAY_SECONDS` and log `DETECTED graduation <mint> (age Ns, entering at +30s)`.
@@ -527,7 +543,7 @@ There is no kill endpoint. To stop the process, stop the container.
   "moon_bags": [ moon_bag … ],
   "stuck": [ position + "stuck_at" … ],
   "daily": { "date": "YYYY-MM-DD", "realized_pnl_usd": float },
-  "seen_signatures": [ last 500 Helius signatures ],
+  "seen_signatures": [ last 500 migration signatures ],
   "moon_bags_checked_ts": float,
   "draining": bool,
   "updated_at": "ISO Z"
@@ -759,7 +775,7 @@ size. Trade half the recommendation live at first.
 ### Railway (dashboard + executor, recommended)
 
 1. New project → Deploy from GitHub repo → this repo. The root `Dockerfile` builds `grad-backtest/` with no Root Directory setting.
-2. **Variables**: `HELIUS_API_KEY`, `MIGRATION_ADDRESS`, `ADMIN_TOKEN`, then the executor variables you want to change from their defaults (section 4). For live trading: `EXECUTOR_MODE=live`, `EXECUTOR_AUTOSTART=1`, `WALLET_PRIVATE_KEY` (mark it sealed).
+2. **Variables**: `MIGRATION_ADDRESS`, `RPC_URL` (or `RPC_URLS`), `ADMIN_TOKEN`, then the executor variables you want to change from their defaults (section 4). For live trading: `EXECUTOR_MODE=live`, `EXECUTOR_AUTOSTART=1`, `WALLET_PRIVATE_KEY` (mark it sealed). `HELIUS_API_KEY` is only needed for historical collection or the optional Helius compatibility mode.
 3. **Volume** mounted at `/data`. Without it every deploy starts with an empty filesystem: the OHLCV cache, results, trade history, and the executor's state (open positions' entry prices and peaks, moon bags) are lost, and the restart has to adopt whatever is in the wallet at current value.
 4. **Networking → Generate Domain** for the public dashboard.
 5. Every push to `main` redeploys, which restarts the executor. Each restart costs several minutes of not trading plus the state loss above. Set **Settings → Watch Paths** to something like `/grad-backtest/**/*.py`, `/grad-backtest/static/**`, `/Dockerfile` so documentation-only commits do not redeploy.
@@ -786,7 +802,7 @@ request that touches `grad-backtest/`.
 
 ```bash
 docker build -t grad-backtest .
-docker run --rm -p 8000:8000 -e HELIUS_API_KEY=… -e MIGRATION_ADDRESS=… -v "$PWD/data:/data" grad-backtest
+docker run --rm -p 8000:8000 -e RPC_URL=https://provider.example/key -e MIGRATION_ADDRESS=… -v "$PWD/data:/data" grad-backtest
 ```
 
 ---
@@ -893,8 +909,8 @@ Things that are true of the code and easy to get wrong:
 
 - Position valuation uses the buy slippage setting for its quote; real sells use the sell setting. The recorded exit value comes from the sell quote.
 - The daily loss limit measures quote-based closed P&L, resets at UTC midnight, and is reset by a restart. It never fired during the overnight session because of the restarts.
-- Detection reads the 10 most recent migration transactions per poll. A burst of more than 10 graduations in 5 seconds would miss some.
-- Pending graduations are not persisted. A redeploy in the 30-second entry window loses that entry.
+- Detection uses WebSocket signature hints plus a configurable 30-second, 10-signature RPC catch-up. A provider outage longer than the catch-up window can still miss launches, which is safer than buying stale ones.
+- Pending graduations are persisted; a restart retains them but discards any that exceed the lateness window.
 - Adopted positions have no entry price or peak history; they are managed from their adoption value.
 - `record_trade` keeps an old file's header, so columns added later are blank in an old `live_trades.csv`. Rotate the file to get the new columns.
 - The dashboard's paper-balance colour compares against a hard-coded 100, not `START_BALANCE`.
@@ -908,7 +924,7 @@ What the live sessions taught, in order:
 4. Fifty-nine empty token accounts held 0.12 SOL of rent. Every full sell now closes its account.
 5. Bundled launches (creator buys the curve, graduates in seconds, dumps into the pool) were the dominant loser. The floor, curve-age, and holder guards target that profile; the market-cap ceiling turned out to block the best-performing bucket and is now set high.
 6. Adopted dust bags filled every entry slot after a restart. They no longer count.
-7. Helius and Jupiter rate-limit startup bursts. Everything retries on 429 and the price is cached.
+7. RPC providers and Jupiter rate-limit startup bursts. RPC calls fail over across configured providers; entry discovery backs off if all providers are unavailable, and the SOL price is cached.
 8. Moon bags kept on losers just lock rent. Bags are winners-only, have a minimum size, a target multiple, and a dead-bag burn.
 
 ---
