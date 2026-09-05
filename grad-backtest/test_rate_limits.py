@@ -419,18 +419,92 @@ class MigrationRegressionTests(unittest.TestCase):
 
     def test_history_pages_to_requested_time_window(self):
         rpc = self.ex.Rpc(self.ex.Config())
-        page = [{"signature": str(i), "blockTime": 200} for i in range(5)]
+        page = [{"signature": str(i), "blockTime": 200} for i in range(1000)]
         rpc.call = mock.Mock(side_effect=[page, [{"signature": "old", "blockTime": 100}]])
         rpc.batch_call = mock.Mock(return_value=[{"slot": 1, "blockTime": 100}])
         result = rpc.raw_transactions("wallet", **{"limit": 5, "gte-time": 90, "lte-time": 110})
         self.assertEqual(len(result), 1)
-        self.assertEqual(rpc.call.call_args.args[1][1]["before"], "4")
+        self.assertEqual(rpc.call.call_args.args[1][1]["before"], "999")
+        self.assertEqual(rpc.call.call_args.args[1][1]["limit"], 1000)
 
     def test_incomplete_history_window_stays_unknown(self):
         rpc = self.ex.Rpc(self.ex.Config())
-        rpc.call = mock.Mock(return_value=[{"signature": str(i), "blockTime": 200} for i in range(5)])
+        rpc.call = mock.Mock(side_effect=[
+            [{"signature": str(i + p * 1000), "blockTime": 200} for i in range(1000)]
+            for p in range(3)
+        ])
         with self.assertRaisesRegex(RuntimeError, "history window unavailable"):
             rpc.raw_transactions("wallet", **{"limit": 5, "gte-time": 90, "lte-time": 110})
+
+    def test_failed_signature_flood_does_not_hide_curve_window(self):
+        rpc = self.ex.Rpc(self.ex.Config())
+        failed = [{"signature": str(i), "blockTime": 100, "err": {"failed": True}}
+                  for i in range(500)]
+        rpc.call = mock.Mock(return_value=failed + [{"signature": "buy", "blockTime": 100}])
+        rpc.batch_call = mock.Mock(return_value=[{"slot": 1, "blockTime": 100}])
+        self.assertEqual(len(rpc.raw_transactions("curve", **{"gte-time": 90, "lte-time": 110})), 1)
+        self.assertEqual(len(rpc.batch_call.call_args.args[0]), 1)
+
+    def test_large_window_is_not_silently_sampled(self):
+        rpc = self.ex.Rpc(self.ex.Config())
+        rpc.call = mock.Mock(return_value=[
+            {"signature": str(i), "blockTime": 100}
+            for i in range(501)
+        ])
+        rpc.batch_call = mock.Mock()
+        with self.assertRaisesRegex(RuntimeError, "decode budget"):
+            rpc.raw_transactions("curve", **{"gte-time": 90, "lte-time": 110})
+        rpc.batch_call.assert_not_called()
+
+    def test_window_larger_than_old_120_limit_is_decoded_fully(self):
+        rpc = self.ex.Rpc(self.ex.Config())
+        rpc.call = mock.Mock(return_value=[{"signature": str(i), "blockTime": 100} for i in range(200)])
+        rpc.batch_call = mock.Mock(side_effect=lambda calls, **kw: [{"slot": 1, "blockTime": 100}] * len(calls))
+        result = rpc.raw_transactions("curve", **{"gte-time": 90, "lte-time": 110})
+        self.assertEqual(len(result), 200)
+        self.assertEqual(sum(len(c.args[0]) for c in rpc.batch_call.call_args_list), 200)
+
+    def test_decode_stops_between_batches_when_budget_expires(self):
+        rpc = self.ex.Rpc(self.ex.Config())
+        rpc.call = mock.Mock(return_value=[{"signature": str(i), "blockTime": 100} for i in range(40)])
+        rpc.batch_call = mock.Mock(return_value=[{"slot": 1, "blockTime": 100}] * rpc.cfg.rpc_batch_size)
+        with mock.patch.object(self.ex.time, "monotonic", side_effect=[0, 0, 0, 0, 0, 9]):
+            with self.assertRaisesRegex(RuntimeError, "decode time budget exhausted"):
+                rpc.raw_transactions("curve", **{"gte-time": 90, "lte-time": 110})
+        self.assertEqual(rpc.batch_call.call_count, 1)
+
+    def test_funder_search_decodes_only_requested_sample(self):
+        rpc = self.ex.Rpc(self.ex.Config())
+        rpc.call = mock.Mock(return_value=[{"signature": str(i), "blockTime": 100} for i in range(30)])
+        rpc.batch_call = mock.Mock(return_value=[{"slot": 1, "blockTime": 100}] * 5)
+        self.assertEqual(len(rpc.raw_transactions("wallet", **{"limit": 5, "lte-time": 110})), 5)
+        self.assertEqual(len(rpc.batch_call.call_args.args[0]), 5)
+
+    def test_null_signature_reply_is_not_empty_history(self):
+        rpc = self.ex.Rpc(self.ex.Config())
+        rpc.call = mock.Mock(return_value=None)
+        with self.assertRaisesRegex(RuntimeError, "signature data incomplete"):
+            rpc.raw_transactions("curve", **{"gte-time": 90})
+
+    def test_unknown_timestamp_is_not_zero_evidence(self):
+        rpc = self.ex.Rpc(self.ex.Config())
+        rpc.call = mock.Mock(return_value=[{"signature": "unknown", "blockTime": None}])
+        with self.assertRaisesRegex(RuntimeError, "missing block time"):
+            rpc.raw_transactions("curve", **{"gte-time": 90})
+
+    def test_signature_search_yields_when_budget_expires(self):
+        rpc = self.ex.Rpc(self.ex.Config())
+        rpc.call = mock.Mock(return_value=[{"signature": str(i), "blockTime": 200} for i in range(1000)])
+        with mock.patch.object(self.ex.time, "monotonic", side_effect=[0, 0, 6]):
+            with self.assertRaisesRegex(RuntimeError, "time budget exhausted"):
+                rpc.raw_transactions("curve", **{"gte-time": 90, "lte-time": 110})
+        self.assertEqual(rpc.call.call_count, 1)
+
+    def test_repeating_provider_page_does_not_double_count(self):
+        rpc = self.ex.Rpc(self.ex.Config())
+        rpc.call = mock.Mock(return_value=[{"signature": str(i), "blockTime": 200} for i in range(1000)])
+        with self.assertRaisesRegex(RuntimeError, "pagination made no progress"):
+            rpc.raw_transactions("curve", **{"gte-time": 90, "lte-time": 110})
 
     def test_high_impact_does_not_spend_holder_requests(self):
         bot = self.ex.Executor(self.ex.Config())
