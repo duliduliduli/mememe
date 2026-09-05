@@ -1076,12 +1076,11 @@ class Rpc:
                 ]
                 if wallets:
                     wallet_set = {owner for owner, _ in wallets}
-                    self._holder_token_accounts[cache_key] = (
-                        time.monotonic(),
-                        {owner: token_accounts_by_owner.get(owner, [])
-                         for owner in wallet_set if token_accounts_by_owner.get(owner)},
-                    )
-                    return wallets
+                    mapped = {owner: token_accounts_by_owner.get(owner, [])
+                              for owner in wallet_set if token_accounts_by_owner.get(owner)}
+                    if len(mapped) == len(wallet_set):
+                        self._holder_token_accounts[cache_key] = (time.monotonic(), mapped)
+                        return wallets
         except Exception:
             # DAS availability varies by provider/plan; retain the standard 20-account path.
             pass
