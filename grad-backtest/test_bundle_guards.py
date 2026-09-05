@@ -349,7 +349,7 @@ class TopWalletHolderTests(unittest.TestCase):
     def test_optional_das_expands_holder_sample_beyond_twenty(self):
         executor, p = fresh(RPC_DAS_ENABLED="1")
         self.addCleanup(p.stop)
-        rows = [{"owner": f"w{i}", "amount": str(100 - i)} for i in range(50)]
+        rows = [{"owner": f"w{i}", "address": f"ta{i}", "amount": str(100 - i)} for i in range(50)]
         owners = {"value": [{"owner": executor.SYSTEM_PROGRAM} for _ in rows]}
         fake = FakeRpc(executor, {"getTokenAccounts": {"token_accounts": rows}, "getMultipleAccounts": owners})
         holders = fake.rpc.plain_wallet_holders("m", limit=50)
