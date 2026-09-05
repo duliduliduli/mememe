@@ -289,8 +289,18 @@ checks. Excessive quote impact/stale entries are rejected before expensive metad
 Raw bundle history follows the Pump bonding-curve PDA; mint age lookups fall back
 to that address when mint history alone cannot establish the minimum age. This is
 earliest observed activity, not proof of the exact creation time or one-buyer ownership.
-Raw history pages backwards up to three pages toward the requested window and
-rejects exhausted pagination or missing transaction responses as incomplete data.
+Raw curve history searches up to three 1,000-signature pages toward the requested
+window, independently of the small funding sample size. Failed transactions and
+out-of-window signatures do not consume the full-transaction decode budget.
+Up to 500 successful transactions in the window are decoded in batches; larger
+windows remain unknown rather than being silently sampled. Signature search has
+a five-second scheduling budget and decoding checks an eight-second budget between
+batches (an in-flight request/provider retry can overrun these budgets).
+Funding lookups search up to three 100-signature pages but decode only their
+configured sample. `HISTORY` logs report pages, signatures and selected transactions;
+`window=covered` confirms signature traversal, not completion of transaction decoding
+or the subsequent bundle/funder checks. Exhausted budgets, missing timestamps and
+missing responses remain incomplete data and block entry with fail-closed enabled.
 Funding ancestry remains a bounded sample, not a complete wallet history.
 
 **Provider access remains required:** on September 5, 2026, a live PublicNode

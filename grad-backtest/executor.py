@@ -1024,32 +1024,62 @@ class Rpc:
             options["before"] = params["before-signature"]
         gte = int(params.get("gte-time") or 0)
         lte = int(params.get("lte-time") or 2**63 - 1)
+        # Signature metadata is cheap compared with full transaction bodies. The old
+        # 40-row page cap searched only 120 signatures, including failed transactions,
+        # and could never reach the curve window on an active launch.
+        page_size = 1000 if gte else 100
+        options["limit"] = page_size
+        body_limit = 500 if gte else limit
+        started = time.monotonic()
+        deadline = started + 5.0
         signatures = []
         # Read backwards to the requested window instead of filtering only the latest
         # page (which silently returned an empty early-buy/funding history).
         reached_window = False
-        for _ in range(3):
-            page = self.call("getSignaturesForAddress", [address, options]) or []
-            signatures.extend(page)
+        for page_number in range(1, 4):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError('history window unavailable: signature search time budget exhausted')
+            page = self.call("getSignaturesForAddress", [address, dict(options)], timeout=remaining)
+            if not isinstance(page, list):
+                raise RuntimeError('history signature data incomplete')
+            if any(not isinstance(r, dict) or not r.get('signature') for r in page):
+                raise RuntimeError('history signature data incomplete')
+            seen = {r['signature'] for r in signatures}
+            fresh = [r for r in page if r['signature'] not in seen]
+            if page and not fresh:
+                raise RuntimeError('history window unavailable: pagination made no progress')
+            signatures.extend(fresh)
             times = [r['blockTime'] for r in page if r.get('blockTime') is not None]
             eligible = [r for r in signatures if r.get('signature') and not r.get('err')
                         and r.get('blockTime') is not None and gte <= r['blockTime'] <= lte]
             if gte:
-                reached_window = len(page) < limit or bool(times and min(times) < gte)
+                reached_window = len(page) < page_size or bool(times and min(times) < gte)
             else:
                 # Funding histories are bounded samples, not exhaustive wallet ancestry.
-                reached_window = len(page) < limit or len(eligible) >= limit
+                reached_window = len(page) < page_size or len(eligible) >= limit
             if reached_window:
                 break
             if not page or not page[-1].get('signature'):
                 break
             options['before'] = page[-1]['signature']
         if not reached_window:
-            raise RuntimeError('history window unavailable within bounded pagination')
+            raise RuntimeError(f'history window unavailable after {page_number} pages / {len(signatures)} signatures')
+        # A successful transaction with no timestamp cannot be silently excluded from
+        # a time-window analysis. Missing evidence is not a zero-risk observation.
+        if any(not r.get('err') and r.get('blockTime') is None for r in signatures):
+            raise RuntimeError('history window unavailable: successful signature missing block time')
         rows = [
             row for row in signatures
             if row.get("signature") and not row.get("err") and gte <= int(row.get("blockTime") or 0) <= lte
         ]
+        if gte and len(rows) > body_limit:
+            raise RuntimeError(f'history window contains {len(rows)} successful transactions; decode budget is {body_limit}')
+        if not gte:
+            rows = rows[:limit]  # newest eligible funding sample, then reverse for asc
+        log(f"HISTORY address={address} pages={page_number} signatures={len(signatures)} "
+            f"selected={len(rows)} window={'covered' if gte else 'funding_sample'} "
+            f"fetch_seconds={time.monotonic() - started:.2f}")
         calls = [
             (
                 "getTransaction",
@@ -1064,7 +1094,18 @@ class Rpc:
             )
             for row in rows
         ]
-        bodies = self.batch_call(calls, timeout=self.cfg.bundle_lookup_timeout_ms / 1000)
+        # A covered curve window must be decoded in full, never truncated into an
+        # apparently clean snapshot. Bound work between batches to protect exits.
+        bodies = []
+        decode_deadline = time.monotonic() + 8.0
+        for start in range(0, len(calls), self.cfg.rpc_batch_size):
+            remaining = decode_deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError('history transaction decode time budget exhausted')
+            chunk = calls[start:start + self.cfg.rpc_batch_size]
+            bodies.extend(self.batch_call(
+                chunk, timeout=min(remaining, self.cfg.bundle_lookup_timeout_ms / 1000)
+            ))
         if len(bodies) != len(rows) or any(not isinstance(body, dict) for body in bodies):
             raise RuntimeError('history transaction data incomplete')
         normalized = [
