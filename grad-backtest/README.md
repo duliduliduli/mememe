@@ -239,6 +239,11 @@ higher coverage uses the normal limits. Configure those controls with
 `MIN_FUNDER_COVERAGE_PCT`. Wallet funders and launch appearances are cached in
 `DATA_DIR/wallet_graph_cache.json`.
 
+Helius 429 responses open an exponential detection circuit breaker (30 seconds,
+then 60/120/240 seconds, capped by `HELIUS_POLL_BACKOFF_MAX_SECONDS`, default 900).
+If startup is already rate-limited, wallet reconciliation is deferred and retried
+after a minimum five-minute cooldown rather than immediately spending more quota.
+
 ### 4.5 Swaps, slippage, retries
 
 | Variable | Default | Meaning |
