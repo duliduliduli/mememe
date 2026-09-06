@@ -492,7 +492,12 @@ def describe_error(exc: BaseException) -> str:
 
 
 def rpc_account_keys(tx: dict[str, Any]) -> list[str]:
-    message = ((tx.get("transaction") or {}).get("message") or {})
+    transaction = tx.get("transaction")
+    if not isinstance(transaction, dict):
+        return []
+    message = transaction.get("message")
+    if not isinstance(message, dict):
+        return []
     keys: list[str] = []
     for item in message.get("accountKeys") or []:
         keys.append(str(item.get("pubkey")) if isinstance(item, dict) else str(item))
@@ -500,10 +505,18 @@ def rpc_account_keys(tx: dict[str, Any]) -> list[str]:
 
 
 def rpc_instructions(tx: dict[str, Any]) -> list[dict[str, Any]]:
-    message = ((tx.get("transaction") or {}).get("message") or {})
+    transaction = tx.get("transaction")
+    if not isinstance(transaction, dict):
+        return []
+    message = transaction.get("message")
+    if not isinstance(message, dict):
+        return []
     instructions = list(message.get("instructions") or [])
-    for group in (tx.get("meta") or {}).get("innerInstructions") or []:
-        instructions.extend(group.get("instructions") or [])
+    meta = tx.get("meta")
+    if isinstance(meta, dict):
+        for group in meta.get("innerInstructions") or []:
+            if isinstance(group, dict):
+                instructions.extend(group.get("instructions") or [])
     return [item for item in instructions if isinstance(item, dict)]
 
 
@@ -606,7 +619,9 @@ def normalize_rpc_transaction(tx: dict[str, Any], signature: str = "") -> dict[s
     """Convert standard jsonParsed transaction data into the small normalized shape used by
     the bundle detector. This intentionally reconstructs only evidence we consume."""
     keys = rpc_account_keys(tx)
-    meta = tx.get("meta") or {}
+    meta = tx.get("meta")
+    if not isinstance(meta, dict):
+        meta = {}
     fee_payer = keys[0] if keys else None
     native_transfers: list[dict[str, Any]] = []
     for instruction in rpc_instructions(tx):
@@ -615,7 +630,7 @@ def normalize_rpc_transaction(tx: dict[str, Any], signature: str = "") -> dict[s
         # as a dict crashed the whole bundle snapshot ('str' object has no attribute 'get').
         if not isinstance(parsed, dict):
             continue
-        info = parsed.get("info") or {}
+        info = parsed.get("info")
         if not isinstance(info, dict):
             continue
         if instruction.get("program") != "system" or parsed.get("type") not in ("transfer", "transferWithSeed"):
@@ -631,9 +646,13 @@ def normalize_rpc_transaction(tx: dict[str, Any], signature: str = "") -> dict[s
     def token_balances(rows: list[dict[str, Any]]) -> dict[tuple[int, str], dict[str, Any]]:
         out: dict[tuple[int, str], dict[str, Any]] = {}
         for row in rows:
+            if not isinstance(row, dict):
+                continue
             mint = row.get("mint")
             index = row.get("accountIndex")
-            token = row.get("uiTokenAmount") or {}
+            token = row.get("uiTokenAmount")
+            if not isinstance(token, dict):
+                continue
             if mint is None or index is None:
                 continue
             out[(int(index), mint)] = {
@@ -886,6 +905,12 @@ class Rpc:
         self._holder_cache: dict[tuple, tuple[float, list[tuple[str, int]]]] = {}
         self._creator_by_mint: dict[str, str] = {}
         self.last_history_sample: dict[str, Any] | None = None
+        # The standard holder lookup starts from token accounts, then resolves their
+        # wallet owners. Keep that relationship for the entry's bundle screen: those
+        # token-account histories are small and directly relevant, unlike the shared
+        # bonding curve which can contain thousands of unrelated swaps.
+        self._holder_token_accounts: dict[tuple, tuple[float, dict[str, list[str]]]] = {}
+        self._creation_cache: dict[str, dict[str, Any]] = {}
         self.wallet_graph_cache: dict[str, Any] = {"version": 1, "funders": {}, "appearances": {}}
         try:
             loaded = json.loads(WALLET_GRAPH_CACHE_FILE.read_text())
@@ -1067,7 +1092,7 @@ class Rpc:
         supply_ui, decimals, _ = self.token_supply_details(mint)
         return supply_ui, decimals
 
-    def mint_first_seen(self, mint: str, stop_before_ts: float, max_pages: int = 3) -> float | None:
+    def mint_first_seen(self, mint: str, stop_before_ts: float, max_pages: int = 30) -> float | None:
         """Return verified creation only; never reuse a lower-bound activity timestamp.
 
         Retains the public method name for callers. Signature work uses the same bounded
@@ -1083,6 +1108,9 @@ class Rpc:
             created = min(creations, key=lambda c: c['timestamp'])
             if created.get('creator'):
                 self._creator_by_mint[mint] = created['creator']
+            if len(self._creation_cache) >= 1000:
+                self._creation_cache.pop(next(iter(self._creation_cache)))
+            self._creation_cache[mint] = dict(created)
             log(f"CURVE mint={mint} evidence=verified_creation created_ts={created['timestamp']} "
                 f"creation_slot={created['slot']} creator={created.get('creator')}")
             return float(created['timestamp'])
@@ -1244,6 +1272,10 @@ class Rpc:
             rows = self._plain_wallet_holders_uncached(mint, exclude, max(limit, self.cfg.bundle_max_wallets))
             # Share the fresh snapshot between top-holder and bundle checks in this entry.
             self._holder_cache = {k: v for k, v in self._holder_cache.items() if time.monotonic() - v[0] < 10}
+            self._holder_token_accounts = {
+                k: v for k, v in self._holder_token_accounts.items()
+                if time.monotonic() - v[0] < 10
+            }
             self._holder_cache[key] = (time.monotonic(), rows)
         return self._holder_cache[key][1][:limit]
 
@@ -1257,6 +1289,8 @@ class Rpc:
         burn free-provider quota; the portable top-20 path remains the default.
         """
         exclude = exclude or set()
+        cache_key = (mint, tuple(sorted(exclude)))
+        token_accounts_by_owner: dict[str, list[str]] = {}
         try:
             if not self.cfg.rpc_das_enabled:
                 raise RuntimeError("DAS disabled")
@@ -1273,6 +1307,10 @@ class Rpc:
                 amount = row.get("amount")
                 if owner and owner not in exclude and amount is not None:
                     totals[owner] = totals.get(owner, 0) + int(amount)
+                    address = (row.get("address") or row.get("token_account")
+                               or row.get("tokenAccount"))
+                    if address:
+                        token_accounts_by_owner.setdefault(owner, []).append(str(address))
             if totals:
                 ordered = sorted(totals.items(), key=lambda item: item[1], reverse=True)[:limit]
                 owner_accounts = self.call(
@@ -1284,7 +1322,12 @@ class Rpc:
                     if (acct["owner"] if acct else SYSTEM_PROGRAM) == SYSTEM_PROGRAM
                 ]
                 if wallets:
-                    return wallets
+                    wallet_set = {owner for owner, _ in wallets}
+                    mapped = {owner: token_accounts_by_owner.get(owner, [])
+                              for owner in wallet_set if token_accounts_by_owner.get(owner)}
+                    if len(mapped) == len(wallet_set):
+                        self._holder_token_accounts[cache_key] = (time.monotonic(), mapped)
+                        return wallets
         except Exception:
             # DAS availability varies by provider/plan; retain the standard 20-account path.
             pass
@@ -1300,7 +1343,7 @@ class Rpc:
         missing = sum(1 for a in accounts if a is None)
         if missing and missing > len(addresses) // 5:
             raise RuntimeError(f"holder account data incomplete ({missing} of {len(addresses)} accounts missing)")
-        owners: list[tuple[str, int]] = []
+        owners: list[tuple[str, str, int]] = []
         for entry, acct in zip(largest, accounts):
             if not acct:
                 continue
@@ -1308,21 +1351,42 @@ class Rpc:
                 owner = acct["data"]["parsed"]["info"]["owner"]
             except (KeyError, TypeError):
                 continue
-            owners.append((owner, int(entry["amount"])))
+            owners.append((entry["address"], owner, int(entry["amount"])))
         if not owners:
             return []
         owner_accounts = self.call(
-            "getMultipleAccounts", [[owner for owner, _ in owners], {"encoding": "base64"}]
+            "getMultipleAccounts", [[owner for _, owner, _ in owners], {"encoding": "base64"}]
         ).get("value") or []
         if len(owner_accounts) != len(owners):
             raise RuntimeError("holder owner data incomplete")
         totals: dict[str, int] = {}
-        for (owner, amount), acct in zip(owners, owner_accounts):
+        for (address, owner, amount), acct in zip(owners, owner_accounts):
             program = acct["owner"] if acct else SYSTEM_PROGRAM  # unfunded wallet: still a wallet
             if program != SYSTEM_PROGRAM or owner in exclude:
                 continue
             totals[owner] = totals.get(owner, 0) + amount
+            token_accounts_by_owner.setdefault(owner, []).append(address)
+        self._holder_token_accounts[cache_key] = (
+            time.monotonic(), token_accounts_by_owner,
+        )
         return sorted(totals.items(), key=lambda row: row[1], reverse=True)[:limit]
+
+    def holder_history_addresses(
+        self, mint: str, holders: list[tuple[str, int]], exclude: set[str] | None = None
+    ) -> list[str]:
+        """Token accounts whose histories cover the current plain-wallet holders."""
+        key = (mint, tuple(sorted(exclude or set())))
+        cached = self._holder_token_accounts.get(key)
+        if cached is None or time.monotonic() - cached[0] >= 10:
+            return []
+        accounts = cached[1]
+        if any(not accounts.get(wallet) for wallet, _ in holders):
+            # Never present a partial holder-history sample as a clean screen.
+            return []
+        # Preserve holder rank and de-duplicate accounts shared through malformed data.
+        return list(dict.fromkeys(
+            address for wallet, _ in holders for address in accounts.get(wallet, [])
+        ))
 
     def top_wallet_holder(self, mint: str, exclude: set[str] | None = None) -> tuple[str, int] | None:
         """(owner, raw amount) of the largest plain-wallet holder."""
@@ -1369,7 +1433,7 @@ class Rpc:
         # Read backwards to the requested window instead of filtering only the latest
         # page (which silently returned an empty early-buy/funding history).
         reached_window = False
-        for page_number in range(1, min(3, max(1, int(params.get('max-pages', 3)))) + 1):
+        for page_number in range(1, min(30, max(1, int(params.get('max-pages', 3)))) + 1):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise RuntimeError('history window unavailable: signature search time budget exhausted')
@@ -1584,29 +1648,74 @@ class Rpc:
         wallet_amounts = {wallet: raw / (10 ** decimals) for wallet, raw in holders}
         holder_set = set(wallet_amounts)
         history_address = bonding_curve_address(mint) if self.cfg.transaction_history_mode == 'raw' else mint
-        transactions = self.enhanced_transactions(
-            history_address,
-            **{
-                "sort-order": "asc",
-                "gte-time": int(created_ts) - 2,
-                "lte-time": int(graduated_ts + self.cfg.entry_delay_seconds) + 2,
-                "limit": 100,
-            },
+        history_params: dict[str, Any] = {
+            "sort-order": "asc",
+            "gte-time": int(created_ts) - 2,
+            "lte-time": int(graduated_ts + self.cfg.entry_delay_seconds) + 2,
+            "limit": 100,
+        }
+        if self.cfg.transaction_history_mode == 'raw':
+            # Creation lookup already searches this deeply. Bundle analysis must cover
+            # the same curve lifetime instead of reintroducing the old 3,000-signature
+            # ceiling after creation was found. raw_transactions retains its five-second
+            # signature-search deadline and bounded transaction decode budget.
+            history_params["max-pages"] = 30
+        creation = self._creation_cache.get(mint)
+        targeted_addresses = (
+            self.holder_history_addresses(mint, holders, exclude)
+            if self.cfg.transaction_history_mode == 'raw' and creation
+            else []
         )
-        history_sample = getattr(self, "last_history_sample", None)
-        history_total = history_sample["total"] if history_sample else len(transactions)
-        history_decoded = history_sample["decoded"] if history_sample else len(transactions)
+        if targeted_addresses:
+            # A transaction can touch several sampled token accounts. Count it once in
+            # the final evidence set. Token accounts are mint-specific, so their earliest
+            # activity is the acquisition/distribution evidence we need; there is no value
+            # in decoding every later swap on the shared curve. A one-page boundary keeps
+            # this screen cheap, and raw_transactions fails closed for an exceptionally
+            # active sampled account rather than silently treating a recent sample as old.
+            targeted_history_params = {
+                "sort-order": "asc",
+                "lte-time": history_params["lte-time"],
+                "limit": 25,
+                "max-pages": 1,
+            }
+            by_signature: dict[str, dict[str, Any]] = {}
+            for address in targeted_addresses:
+                for tx in self.enhanced_transactions(address, **targeted_history_params):
+                    signature = tx.get("signature")
+                    if not signature:
+                        return {"complete": False, "error": "targeted holder history missing signature"}
+                    by_signature.setdefault(str(signature), tx)
+            transactions = sorted(
+                by_signature.values(), key=lambda tx: (int(tx.get("slot") or 0), str(tx.get("signature") or ""))
+            )
+            log(f"BUNDLE_HISTORY mint={mint} mode=targeted holder_accounts={len(targeted_addresses)} "
+                f"transactions={len(transactions)}")
+        else:
+            # Compatibility fallback for enhanced history providers and callers that did
+            # not perform the holder/creation lookups through this Rpc instance.
+            transactions = self.enhanced_transactions(history_address, **history_params)
+        if targeted_addresses:
+            history_total = history_decoded = len(transactions)
+        else:
+            history_sample = getattr(self, "last_history_sample", None)
+            history_total = history_sample["total"] if history_sample else len(transactions)
+            history_decoded = history_sample["decoded"] if history_sample else len(transactions)
         buys: list[dict[str, Any]] = []
         transfer_edges: list[tuple[str, str]] = []
         creator = None
         create_slot = None
         if self.cfg.transaction_history_mode == 'raw':
-            creations = [c for tx in transactions for c in tx.get('creations', [])
-                         if c['mint'] == mint and c['timestamp'] == created_ts]
-            if not creations:
-                return {'complete': False, 'error': 'verified creation missing from curve history'}
-            creator = creations[0]['creator']
-            create_slot = int(creations[0]['slot'])
+            if targeted_addresses and creation:
+                creator = creation.get('creator')
+                create_slot = int(creation['slot'])
+            else:
+                creations = [c for tx in transactions for c in tx.get('creations', [])
+                             if c['mint'] == mint and c['timestamp'] == created_ts]
+                if not creations:
+                    return {'complete': False, 'error': 'verified creation missing from curve history'}
+                creator = creations[0]['creator']
+                create_slot = int(creations[0]['slot'])
         for tx in transactions:
             slot = tx.get("slot")
             if slot is None:

@@ -300,6 +300,21 @@ def sigs(times, n=None):
 class MintFirstSeenTests(unittest.TestCase):
     MINT = '6zbYeyBbr5hjkPrApW8QDBstMuxbRV8zMP9cYeUwpump'
 
+    def test_creation_search_can_cross_three_thousand_signatures(self):
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        rpc = executor.Rpc(executor.Config())
+        pages = [[{'signature': str(page * 1000 + i), 'blockTime': 5000 - page * 1000 - i}
+                  for i in range(1000)] for page in range(3)]
+        pages.append([{'signature': 'creation', 'blockTime': 1000}])
+        rpc.call = mock.Mock(side_effect=pages)
+        rpc.batch_call = mock.Mock(side_effect=lambda calls, **kw: [{} for _ in calls])
+        creation = {'timestamp': 1000, 'creations': [
+            {'mint': self.MINT, 'timestamp': 1000, 'slot': 1}]}
+        with mock.patch.object(executor, 'normalize_rpc_transaction', return_value=creation):
+            self.assertEqual(rpc.mint_first_seen(self.MINT, 880), 1000)
+        self.assertEqual(rpc.call.call_count, 4)
+
     def test_recent_activity_is_not_verified_creation(self):
         executor, p = fresh()
         self.addCleanup(p.stop)
@@ -341,7 +356,7 @@ class TopWalletHolderTests(unittest.TestCase):
     def test_optional_das_expands_holder_sample_beyond_twenty(self):
         executor, p = fresh(RPC_DAS_ENABLED="1")
         self.addCleanup(p.stop)
-        rows = [{"owner": f"w{i}", "amount": str(100 - i)} for i in range(50)]
+        rows = [{"owner": f"w{i}", "address": f"ta{i}", "amount": str(100 - i)} for i in range(50)]
         owners = {"value": [{"owner": executor.SYSTEM_PROGRAM} for _ in rows]}
         fake = FakeRpc(executor, {"getTokenAccounts": {"token_accounts": rows}, "getMultipleAccounts": owners})
         holders = fake.rpc.plain_wallet_holders("m", limit=50)
@@ -380,6 +395,29 @@ class TopWalletHolderTests(unittest.TestCase):
         fake = FakeRpc(executor, {"getTokenLargestAccounts": {"value": []}})
         self.assertIsNone(fake.rpc.top_wallet_holder("m"))
 
+    def test_retains_all_token_accounts_for_targeted_holder_history(self):
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        largest = {"value": [
+            {"address": "ta_w1_a", "amount": "60"},
+            {"address": "ta_w1_b", "amount": "20"},
+            {"address": "ta_w2", "amount": "40"},
+        ]}
+        accounts = {"value": [token_account("w1"), token_account("w1"), token_account("w2")]}
+        owners = {"value": [{"owner": executor.SYSTEM_PROGRAM} for _ in range(3)]}
+        fake = FakeRpc(executor, {
+            "getTokenLargestAccounts": largest,
+            "getMultipleAccounts": [accounts, owners],
+        })
+
+        holders = fake.rpc.plain_wallet_holders("m", limit=20)
+
+        self.assertEqual(holders, [("w1", 80), ("w2", 40)])
+        self.assertEqual(
+            fake.rpc.holder_history_addresses("m", holders),
+            ["ta_w1_a", "ta_w1_b", "ta_w2"],
+        )
+
 
 class WalletGraphCacheTests(unittest.TestCase):
     def test_positive_funder_survives_rpc_recreation(self):
@@ -414,6 +452,70 @@ class WalletGraphCacheTests(unittest.TestCase):
 
 
 class BundleSnapshotTests(unittest.TestCase):
+    def test_raw_bundle_uses_targeted_holder_histories_and_deduplicates(self):
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        rpc = executor.Rpc(executor.Config())
+        mint = '4nBz25Nk2J1M4JMjdjE6VQYi66yJBtducUQTNCzSpump'
+        holders = [("w1", 60), ("w2", 40)]
+        rpc.plain_wallet_holders = lambda _mint, _exclude, _limit: holders
+        rpc._holder_token_accounts[(mint, ())] = (
+            __import__('time').monotonic(), {"w1": ["ta1"], "w2": ["ta2"]}
+        )
+        rpc._creation_cache[mint] = {
+            "mint": mint, "timestamp": 900, "slot": 10, "creator": "dev",
+        }
+        purchase = {
+            "signature": "shared-buy", "slot": 11, "nativeTransfers": [],
+            "tokenTransfers": [
+                {"mint": mint, "toUserAccount": "w1", "tokenAmount": 60, "decimals": 0},
+                {"mint": mint, "toUserAccount": "w2", "tokenAmount": 40, "decimals": 0},
+            ],
+        }
+        rpc.enhanced_transactions = mock.Mock(return_value=[purchase])
+        rpc._lookup_funders = lambda wallets, before: ({w: 'funder' for w in wallets}, set(wallets))
+        rpc.cached_origin_funder = lambda wallet, before: None
+
+        snapshot = rpc.bundle_snapshot(mint, 100, 0, 900, 1000)
+
+        self.assertTrue(snapshot["complete"])
+        self.assertEqual(snapshot["bundle_slot_pct"], 100.0)
+        self.assertEqual(
+            [call.args[0] for call in rpc.enhanced_transactions.call_args_list],
+            ["ta1", "ta2"],
+        )
+        self.assertNotIn(executor.bonding_curve_address(mint), [
+            call.args[0] for call in rpc.enhanced_transactions.call_args_list
+        ])
+        for call in rpc.enhanced_transactions.call_args_list:
+            self.assertEqual(call.kwargs["limit"], 25)
+            self.assertEqual(call.kwargs["max-pages"], 1)
+            self.assertNotIn("gte-time", call.kwargs)
+
+    def test_raw_bundle_history_uses_deep_bounded_window(self):
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        rpc = executor.Rpc(executor.Config())
+        rpc.plain_wallet_holders = lambda mint, exclude, limit: [("w1", 60), ("w2", 40)]
+        rpc.enhanced_transactions = mock.Mock(return_value=[{
+            'creations': [{'mint': '4nBz25Nk2J1M4JMjdjE6VQYi66yJBtducUQTNCzSpump',
+                           'timestamp': 900, 'slot': 10, 'creator': 'dev'}],
+            'slot': 10,
+            'tokenTransfers': [
+                {'mint': '4nBz25Nk2J1M4JMjdjE6VQYi66yJBtducUQTNCzSpump',
+                 'toUserAccount': 'w1', 'tokenAmount': 60, 'decimals': 0},
+            ],
+        }])
+        rpc._lookup_funders = lambda wallets, before: ({w: 'funder' for w in wallets}, set(wallets))
+        rpc.cached_origin_funder = lambda wallet, before: None
+
+        rpc.bundle_snapshot('4nBz25Nk2J1M4JMjdjE6VQYi66yJBtducUQTNCzSpump', 100, 0, 900, 1000)
+
+        params = rpc.enhanced_transactions.call_args.kwargs
+        self.assertEqual(params['max-pages'], 30)
+        self.assertEqual(params['gte-time'], 898)
+        self.assertEqual(params['lte-time'], 1032)
+
     def test_shared_funder_and_same_slot_are_measured(self):
         executor, p = fresh()
         self.addCleanup(p.stop)
