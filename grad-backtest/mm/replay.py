@@ -50,7 +50,9 @@ def portfolio_metrics(p: Portfolio, starting_cash: float) -> dict[str, Any]:
         prev_close = values[-1]
     wins = sum(v for v in p.pnl_by_mint.values() if v > 0)
     losses = -sum(v for v in p.pnl_by_mint.values() if v < 0)
-    final = p.cash  # every strategy liquidates in finish()
+    # Replay liquidates in finish() and marks once more, so the last mark equals cash there;
+    # paper and live report mid-run, where open positions are part of the value.
+    final = history[-1]
     return {
         "strategy": p.strategy,
         "starting_cash": starting_cash,

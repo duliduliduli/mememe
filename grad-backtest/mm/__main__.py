@@ -69,6 +69,16 @@ def cmd_paper(args: argparse.Namespace, cfg: MMConfig) -> int:
     return 0
 
 
+def cmd_live(args: argparse.Namespace, cfg: MMConfig) -> int:
+    from .live import LiveEngine
+    log(f"MM LIVE: bankroll ${cfg.bankroll_usd:.2f}, max position ${cfg.max_position_usd:.2f}, "
+        f"portfolio cap ${cfg.max_portfolio_exposure_usd:.2f}, daily loss limit ${cfg.daily_loss_limit_usd:.2f}", cfg)
+    engine = LiveEngine(cfg, log=lambda m: log(m, cfg))
+    engine.run(args.hours)
+    print(json.dumps(engine.report(), indent=1, default=str))
+    return 0
+
+
 def cmd_costs(args: argparse.Namespace, cfg: MMConfig) -> int:
     q, d, c = args.notional, args.disadvantage, args.fixed
     print(f"notional ${q:.2f}, execution disadvantage {d:.2%} per side, fixed ${c:.2f}")
@@ -96,6 +106,9 @@ def main(argv: list[str] | None = None) -> int:
     pa = sub.add_parser("paper", help="forward paper engine (screen + record + shadow strategies)")
     pa.add_argument("--hours", type=float, default=24.0)
     pa.set_defaults(fn=cmd_paper)
+    lv = sub.add_parser("live", help="LIVE: real DLMM ranges and Jupiter swaps for adaptive_dlmm and momentum")
+    lv.add_argument("--hours", type=float, default=876000.0)
+    lv.set_defaults(fn=cmd_live)
     co = sub.add_parser("costs", help="print the round-trip break-even table")
     co.add_argument("--notional", type=float, default=50.0)
     co.add_argument("--disadvantage", type=float, default=0.001)

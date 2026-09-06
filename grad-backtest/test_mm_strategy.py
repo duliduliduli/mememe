@@ -157,7 +157,9 @@ class AccountingTests(unittest.TestCase):
     def test_momentum_buys_breakout_and_trails_out(self):
         cfg = MMConfig(data_dir=Path(tempfile.mkdtemp()), momentum_lookback=5, reentry_cooldown_minutes=0)
         strat = Momentum(cfg, 87.0)
-        prices = [1.0] * 6 + [1.08, 1.2, 1.3, 1.1]
+        # Buy at the +8% breakout, ride to 1.4, trail out at 1.2 (-14% from the peak). The pool's
+        # 1% fee and measured impact are paid on both sides, so the run must be worth more than that.
+        prices = [1.0] * 6 + [1.08, 1.3, 1.4, 1.2]
         rows = path(prices)
         for i, r in enumerate(rows):
             r["volume_1h"] = 20_000 if i >= 6 else 5000

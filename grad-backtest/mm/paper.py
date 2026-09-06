@@ -2,16 +2,17 @@
 
 Runs the screener on a schedule, records snapshots every poll, feeds them to the same
 strategy engine replay uses, persists state between runs and writes daily net-liquidation
-reports. A restart resumes from DATA_DIR/mm_paper/state.pkl."""
+reports. A restart resumes from DATA_DIR/mm_paper/state.pkl. LiveEngine subclasses this
+and only swaps the brokers of the two candidate strategies."""
 from __future__ import annotations
 
-import csv
 import pickle
 import time
 from pathlib import Path
 from typing import Any
 
 from .config import MMConfig
+from .execution import PaperBroker
 from .recorder import Recorder
 from .replay import ReplayEngine, portfolio_metrics
 from .screener import Screener, append_rows, load_universe, utc_iso
@@ -20,24 +21,39 @@ from .strategy import default_strategies
 
 EVENT_COLUMNS = ["ts", "recorded_at", "strategy", "mint", "action", "reason", "price", "value", "detail"]
 NLV_COLUMNS = ["ts", "recorded_at", "strategy", "nlv", "cash", "exposure", "fees_earned", "costs_paid", "trades",
-               "open_positions", "daily_pnl"]
+               "open_positions", "daily_pnl", "wallet_sol"]
 REGIME_COLUMNS = ["ts", "recorded_at", "mint", "regime", "sigma_hourly", "drift_pct", "volume_ratio",
                   "liquidity_change_pct", "participation_ratio", "flow_imbalance", "reasons"]
 
 
 class PaperEngine:
+    mode = "paper"
+
     def __init__(self, cfg: MMConfig, sources: Sources | None = None, log=print) -> None:
         self.cfg = cfg
         self.src = sources or Sources(cfg)
         self.log = log
         self.screener = Screener(cfg, self.src)
         self.recorder = Recorder(cfg, self.src)
-        self.state_file = cfg.paper_dir / "state.pkl"
+        self.state_file = self.out_dir / "state.pkl"
         self.engine = self._load_engine()
         self.universe: list[dict[str, Any]] = load_universe(cfg.universe_file)
         # A restart inside the refresh window reuses the universe file instead of re-screening.
         self.universe_refreshed = cfg.universe_file.stat().st_mtime if self.universe else 0.0
         self.events_written = {s.name: len(s.portfolio.events) for s in self.engine.strategies}
+        self.wallet_sol: float | None = None
+
+    @property
+    def out_dir(self) -> Path:
+        return self.cfg.paper_dir
+
+    def _new_engine(self) -> ReplayEngine:
+        return ReplayEngine(self.cfg, default_strategies(self.cfg, self.cfg.bankroll_usd), self.cfg.bankroll_usd)
+
+    def _attach_brokers(self, engine: ReplayEngine) -> None:
+        for strategy in engine.strategies:
+            if getattr(strategy, "broker", None) is None:
+                strategy.broker = PaperBroker(self.cfg)
 
     def _load_engine(self) -> ReplayEngine:
         if self.state_file.exists():
@@ -47,14 +63,17 @@ class PaperEngine:
                 engine.cfg = self.cfg
                 for strategy in engine.strategies:
                     strategy.cfg = self.cfg
-                self.log(f"resumed paper state with {len(engine.strategies)} strategies")
+                self._attach_brokers(engine)
+                self.log(f"resumed {self.mode} state with {len(engine.strategies)} strategies")
                 return engine
             except Exception as exc:  # noqa: BLE001
-                self.log(f"paper state unreadable ({exc}); starting fresh")
-        return ReplayEngine(self.cfg, default_strategies(self.cfg, self.cfg.bankroll_usd), self.cfg.bankroll_usd)
+                self.log(f"{self.mode} state unreadable ({exc}); starting fresh")
+        engine = self._new_engine()
+        self._attach_brokers(engine)
+        return engine
 
     def save(self) -> None:
-        self.cfg.paper_dir.mkdir(parents=True, exist_ok=True)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
         tmp = self.state_file.with_suffix(".tmp")
         with tmp.open("wb") as fh:
             pickle.dump(self.engine, fh)
@@ -81,7 +100,7 @@ class PaperEngine:
                                 "volume_ratio": regime.volume_ratio, "liquidity_change_pct": regime.liquidity_change_pct,
                                 "participation_ratio": regime.participation_ratio, "flow_imbalance": regime.flow_imbalance,
                                 "reasons": "; ".join(regime.reasons)})
-        append_rows(self.cfg.paper_dir / "regimes.csv", REGIME_COLUMNS, regime_rows)
+        append_rows(self.out_dir / "regimes.csv", REGIME_COLUMNS, regime_rows)
         marks = self.engine.mark(now)
         stamp = utc_iso(now)
         nlv_rows, event_rows = [], []
@@ -90,15 +109,16 @@ class PaperEngine:
             nlv_rows.append({"ts": round(now, 3), "recorded_at": stamp, "strategy": strategy.name, "nlv": round(marks[strategy.name], 4),
                              "cash": round(p.cash, 4), "exposure": round(p.exposure(self.engine.prices), 4),
                              "fees_earned": round(p.fees_earned, 4), "costs_paid": round(p.costs_paid, 4), "trades": p.trades,
-                             "open_positions": len(p.lp) + len(p.spot), "daily_pnl": round(p.daily_pnl, 4)})
+                             "open_positions": len(p.lp) + len(p.spot), "daily_pnl": round(p.daily_pnl, 4),
+                             "wallet_sol": self.wallet_sol if getattr(strategy, "is_live", False) else None})
             new = p.events[self.events_written.get(strategy.name, 0):]
             for e in new:
                 event_rows.append({"ts": e.ts, "recorded_at": utc_iso(e.ts), "strategy": e.strategy, "mint": e.mint, "action": e.action,
                                    "reason": e.reason, "price": e.price, "value": round(e.value, 4), "detail": e.detail})
                 self.log(f"[{strategy.name}] {e.action} {e.mint[:8]} {e.reason} value=${e.value:.2f} {e.detail}")
             self.events_written[strategy.name] = len(p.events)
-        append_rows(self.cfg.paper_dir / "nlv.csv", NLV_COLUMNS, nlv_rows)
-        append_rows(self.cfg.paper_dir / "events.csv", EVENT_COLUMNS, event_rows)
+        append_rows(self.out_dir / "nlv.csv", NLV_COLUMNS, nlv_rows)
+        append_rows(self.out_dir / "events.csv", EVENT_COLUMNS, event_rows)
         self.save()
         summary = ", ".join(f"{n}={v:.2f}" for n, v in marks.items())
         self.log(f"tick: {len(rows)} snapshots; NLV {summary}")
@@ -116,7 +136,7 @@ class PaperEngine:
             if time.time() >= deadline:
                 break
             time.sleep(max(1.0, self.cfg.poll_seconds - (time.time() - started)))
-        self.log("paper run finished")
+        self.log(f"{self.mode} run finished")
 
     def report(self) -> dict[str, Any]:
         return {s.name: portfolio_metrics(s.portfolio, self.engine.starting_cash) for s in self.engine.strategies}

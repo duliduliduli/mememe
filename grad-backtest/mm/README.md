@@ -13,7 +13,50 @@ It does not, and cannot, sign transactions. See "What is deliberately not built"
 | 1 | Data recorder and pool screener | `screener.py`, `recorder.py`, `sources.py` | built, verified against live APIs |
 | 2 | Counterfactual replay with full cost accounting | `replay.py`, `strategy.py`, `costs.py`, `regime.py` | built, unit-tested on synthetic paths and on live recordings |
 | 3 | Forward paper engine | `paper.py` | built, resumable, writes daily NLV reports |
-| 4 | Small live calibration | none | **not built**; gated on phase 2 and 3 results, see thresholds |
+| 4 | Small live calibration | `live.py`, `execution.py`, `sidecar/` | built at the owner's direction; see "Live mode" |
+
+## Live mode
+
+`python -m mm live` (or `MM_AUTOSTART=1 MM_MODE=live` on the Railway service) runs the paper
+engine with real fills for the two candidate strategies. Every other strategy keeps running
+as a shadow on the same rows, so the live run produces the comparison the brief asks for.
+
+| Piece | What it does |
+|---|---|
+| `execution.LiveBroker` | Jupiter swaps built by lite-api, signed with `WALLET_PRIVATE_KEY` (solders), sent and confirmed through `RPC_URLS`. DLMM ranges through the sidecar. Every fill returns what the chain reported, never the model's expectation. |
+| `sidecar/server.js` | Node process on localhost running Meteora's `@meteora-ag/dlmm` SDK: `/pool`, `/positions`, `/open` (Spot strategy, symmetric range around the live active bin, one position of at most 69 bins), `/close` (remove 100%, claim fees, close account), `/claim`. Spawned by the engine, or pointed at with `MM_SIDECAR_URL`. |
+| `live.LiveEngine` | Reconciles persisted positions against the chain on every start (missing ones are dropped and logged `CLOSE_EXTERNAL`), reports untracked DLMM positions in universe pools, logs the wallet's SOL each tick, and obeys the kill switches. |
+
+Opening a range: buy half the size in the token through Jupiter, then deposit token and SOL
+into a Spot-shaped position spanning `±half_width` around the active bin. Closing: remove all
+liquidity with fees claimed, close the position account (rent refunded), sell the returned
+tokens through Jupiter. Rent of about 0.057 SOL per open position is locked, refundable, and
+kept free by `MM_LP_POSITION_RENT_SOL` before an open is allowed.
+
+Capital rules, all enforced in the broker before any transaction:
+
+- `MM_BANKROLL_USD` caps what this lane may have deployed; the executor keeps the rest.
+- The wallet must hold `MM_GAS_RESERVE_SOL` plus one position's rent beyond the size.
+- `MM_MAX_POSITION_USD`, `MM_MAX_TOKEN_EXPOSURE_USD`, `MM_MAX_PORTFOLIO_EXPOSURE_USD` and
+  `MM_DAILY_LOSS_LIMIT_USD` apply exactly as in paper.
+- A failed open or buy is logged (`OPEN_FAILED`, `BUY_FAILED`) and the token cools down; a
+  failed close or sell keeps the position and retries next tick (`CLOSE_FAILED`, `SELL_FAILED`).
+
+Kill switches, as files under `DATA_DIR` or through the dashboard API with the admin token:
+
+- `mm.stop` (`POST /api/mm/stop`): drain, no new entries, open positions still managed.
+- `mm.panic` (`POST /api/mm/panic`): close every live position at market, then drain.
+- `GET /api/mm/status`: mode, running flag, latest NLV per strategy, recent events.
+
+Files: `DATA_DIR/mm_live/{state.pkl,nlv.csv,events.csv,regimes.csv}`. Events carry the
+transaction signatures. Live positions survive restarts through `state.pkl` and the
+reconciliation pass.
+
+What was verified without funds: the sidecar's `/health`, `/pool`, `/positions` against live
+pools, a full `/open` transaction built by the SDK for a real pool (submission fails only for
+lack of lamports on the throwaway key), the engine's spawn, reconcile, flag and tick paths in
+dry-run, and the broker's accounting under mocked fills. The first funded open and close are
+the first true end-to-end test; run with `MM_MAX_POSITION_USD` small and watch `events.csv`.
 
 ## Why this is a separate lane and not a replacement
 
@@ -147,23 +190,20 @@ All of the following, on held-out recordings and at least two weeks of paper:
 - fees earned exceed costs paid by at least 2x on the LP strategies;
 - paper exit impact inside the routine band on every withdrawal.
 
-## What is deliberately not built
+## What is not built
 
-- **Live DLMM execution.** Meteora ships a TypeScript SDK for position creation, liquidity
-  add/remove and fee claims; there is no maintained Python equivalent. Hand-building those
-  instructions and testing them with real funds is outside a one-shot push. When phase 4
-  is earned, the plan is a small Node sidecar exposed over HTTP that the paper engine's
-  actions map onto one to one.
-- **Live momentum execution.** The graduation executor's Jupiter swap path could carry it
-  today, but the brief's validation plan comes first.
 - **Swap-level streaming and bin-level state.** Snapshots are polled; fee attribution is
   pool-level. Bin-level replay needs an archive of DLMM account state that no public API
   serves.
+- **Partial rebalancing.** The live engine only opens and fully closes positions; there is no
+  in-place range shift. The brief's own rule is that routine rebalancing needs an economic
+  reason, and a close-and-reopen pays the same costs explicitly.
+- **Native DLMM maker orders and JupiterZ RFQ** (ranks 2 and 7 in the brief).
 
 ## Tests
 
 ```bash
-python -m unittest test_mm_costs test_mm_screener test_mm_strategy
+python -m unittest test_mm_costs test_mm_screener test_mm_strategy test_mm_live
 ```
 
 `test_mm_costs` reproduces the brief's break-even, CPMM-impact and full-range tables to

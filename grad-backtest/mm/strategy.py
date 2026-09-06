@@ -1,16 +1,19 @@
 """Strategy state machine, inventory controller, risk controller and shadow accounting.
 
-The same classes drive counterfactual replay and the forward paper engine: each strategy
-is fed one snapshot row at a time and keeps its own Portfolio, so the two never diverge
-in accounting. No strategy here can send a transaction."""
+The same classes drive counterfactual replay, the forward paper engine and live trading:
+each strategy is fed one snapshot row at a time and keeps its own Portfolio. Fills come
+from a Broker (PaperBroker by default, LiveBroker in live mode), so the accounting path is
+identical everywhere and a strategy never sends a transaction itself."""
 from __future__ import annotations
 
 import math
+import time as _time
 from dataclasses import dataclass, field
 from typing import Any
 
 from .config import MMConfig
 from .costs import RangePosition, in_range_probability, projected_lp_edge, symmetric_range
+from .execution import Broker, PaperBroker
 from .regime import CRASH, DECAY, LIQUIDITY_WITHDRAWAL, STALE, Regime
 
 OBSERVE = "OBSERVE"
@@ -56,6 +59,10 @@ class LpPosition:
     last_price: float = 0.0
     time_in_range_s: float = 0.0
     time_open_s: float = 0.0
+    position_key: str = ""       # on-chain position account in live mode
+    pool: str = ""
+    rent_sol: float = 0.0
+    signatures: list[str] = field(default_factory=list)
 
     def value(self, price: float) -> float:
         return self.rng.value(price) + self.fees_earned
@@ -73,6 +80,7 @@ class SpotPosition:
     entry_price: float
     peak_price: float
     costs_paid: float = 0.0
+    signature: str = ""
 
     def value(self, price: float) -> float:
         return self.tokens * price
@@ -80,7 +88,7 @@ class SpotPosition:
 
 @dataclass
 class Portfolio:
-    """Cash plus shadow positions; NLV is cash + marked positions - liquidation cost."""
+    """Cash plus positions; NLV is cash + marked positions - liquidation cost."""
     strategy: str
     cash: float
     lp: dict[str, LpPosition] = field(default_factory=dict)
@@ -123,8 +131,9 @@ class Portfolio:
     def mark(self, ts: float, prices: dict[str, float], liquidation_pct: dict[str, float] | None = None) -> float:
         value = self.nlv(prices, liquidation_pct)
         self.nlv_history.append((ts, value))
-        import time as _t
-        day = _t.strftime("%Y-%m-%d", _t.gmtime(ts))
+        if len(self.nlv_history) > 100_000:
+            del self.nlv_history[: len(self.nlv_history) - 100_000]
+        day = _time.strftime("%Y-%m-%d", _time.gmtime(ts))
         if day != self.day_key:
             self.day_key = day
             self.day_start_nlv = value
@@ -224,12 +233,23 @@ class RiskController:
 class Strategy:
     name = "base"
 
-    def __init__(self, cfg: MMConfig, cash: float) -> None:
+    def __init__(self, cfg: MMConfig, cash: float, broker: Broker | None = None) -> None:
         self.cfg = cfg
+        self.broker: Broker = broker or PaperBroker(cfg)
         self.portfolio = Portfolio(self.name, cash)
         self.prev: dict[str, dict[str, Any]] = {}
         self.cooldown_until: dict[str, float] = {}
         self.state: dict[str, str] = {}
+
+    def __getstate__(self) -> dict[str, Any]:
+        # Brokers hold sessions and signers; the engine re-attaches them after unpickling.
+        state = self.__dict__.copy()
+        state["broker"] = None
+        return state
+
+    @property
+    def is_live(self) -> bool:
+        return getattr(self.broker, "name", "") == "live"
 
     def step(self, row: dict[str, Any], regime: Regime, prices: dict[str, float]) -> None:
         raise NotImplementedError
@@ -242,8 +262,9 @@ class AdaptiveDLMM(Strategy):
     """Rank-1 candidate: moderate symmetric ranges, edge gate, inventory skew, stay-out state."""
     name = "adaptive_dlmm"
 
-    def __init__(self, cfg: MMConfig, cash: float, half_width_pct: float | None = None, adaptive: bool = True) -> None:
-        super().__init__(cfg, cash)
+    def __init__(self, cfg: MMConfig, cash: float, half_width_pct: float | None = None, adaptive: bool = True,
+                 broker: Broker | None = None) -> None:
+        super().__init__(cfg, cash, broker)
         self.risk = RiskController(cfg)
         self.fixed_half_width = half_width_pct / 100 if half_width_pct else None
         self.adaptive = adaptive
@@ -278,11 +299,18 @@ class AdaptiveDLMM(Strategy):
         pos.last_price = price
         pos.peak_value = max(pos.peak_value, pos.value(price))
 
-    def _close(self, pos: LpPosition, row: dict[str, Any], price: float, reason: str, action: str = "WITHDRAW") -> None:
+    def _close(self, pos: LpPosition, row: dict[str, Any], price: float, reason: str, action: str = "WITHDRAW") -> bool:
         cfg = self.cfg
-        token_value = pos.rng.value(price) * pos.token_fraction(price)
-        cost = cfg.tx_fee_usd * 2 + token_value * exit_cost_pct(row, cfg, token_value) / 100
-        proceeds = pos.value(price) - cost
+        ts = _f(row, "ts") or 0.0
+        try:
+            fill = self.broker.close_lp(row, pos, price)
+        except Exception as exc:  # noqa: BLE001 - keep the position and retry next tick
+            self.portfolio.log(ts, pos.mint, "CLOSE_FAILED", f"{reason}: {exc}", price, pos.value(price))
+            return False
+        # Real claimed fees replace the accrued estimate; paper returns the estimate itself.
+        self.portfolio.fees_earned += fill.fees_usd - pos.fees_earned
+        pos.fees_earned = fill.fees_usd
+        proceeds, cost = fill.proceeds_usd, fill.cost_usd
         pnl = proceeds - pos.entry_value
         pos.costs_paid += cost
         self.portfolio.costs_paid += cost
@@ -291,9 +319,12 @@ class AdaptiveDLMM(Strategy):
         self.portfolio.record_pnl(pos.mint, pnl)
         self.portfolio.trades += 1
         self.portfolio.lp.pop(pos.mint, None)
-        self.portfolio.log(_f(row, "ts") or 0.0, pos.mint, action, reason, price, proceeds,
-                           f"pnl={pnl:.4f} fees={pos.fees_earned:.4f} cost={cost:.4f} in_range={pos.time_in_range_s / max(1, pos.time_open_s):.2f}")
-        self.cooldown_until[pos.mint] = (_f(row, "ts") or 0.0) + cfg.reentry_cooldown_minutes * 60
+        self.portfolio.log(ts, pos.mint, action, reason, price, proceeds,
+                           f"pnl={pnl:.4f} fees={pos.fees_earned:.4f} cost={cost:.4f} "
+                           f"in_range={pos.time_in_range_s / max(1, pos.time_open_s):.2f}"
+                           + (f" sigs={','.join(s for s in fill.signatures if s)}" if fill.signatures else ""))
+        self.cooldown_until[pos.mint] = ts + cfg.reentry_cooldown_minutes * 60
+        return True
 
     def step(self, row: dict[str, Any], regime: Regime, prices: dict[str, float]) -> None:
         cfg = self.cfg
@@ -339,18 +370,32 @@ class AdaptiveDLMM(Strategy):
 
     def _open(self, row: dict[str, Any], price: float, half_width: float, size: float, edge: float) -> None:
         cfg = self.cfg
+        mint, ts = row["mint"], _f(row, "ts") or 0.0
         lower, upper = symmetric_range(price, half_width)
-        setup = cfg.tx_fee_usd * cfg.lp_setup_transactions + size * 0.5 * (_f(row, "dlmm_base_fee_pct") or cfg.momentum_fee_pct_each_side) / 100
-        rng = RangePosition.open(size - setup, price, lower, upper)
-        pos = LpPosition(row["mint"], _f(row, "ts") or 0.0, rng, size, price, costs_paid=setup, last_price=price)
+        size = self.broker.deployable_usd(size)
+        if size < 1.0:
+            self.portfolio.log(ts, mint, "OPEN_SKIPPED", "no deployable capital", price, size)
+            self.cooldown_until[mint] = ts + cfg.reentry_cooldown_minutes * 60
+            return
+        try:
+            fill = self.broker.open_lp(row, size, half_width, lower, upper)
+        except Exception as exc:  # noqa: BLE001
+            self.portfolio.log(ts, mint, "OPEN_FAILED", str(exc), price, size)
+            self.cooldown_until[mint] = ts + cfg.reentry_cooldown_minutes * 60
+            return
+        rng = RangePosition.open(fill.deployed_usd, price, fill.lower_usd, fill.upper_usd)
+        pos = LpPosition(mint, ts, rng, size, price, costs_paid=fill.cost_usd, last_price=price,
+                         position_key=fill.position_key, pool=row.get("dlmm_pool") or "", rent_sol=fill.rent_sol,
+                         signatures=list(fill.signatures))
         pos.peak_value = pos.value(price)
         self.portfolio.cash -= size
-        self.portfolio.costs_paid += setup
-        self.portfolio.lp[row["mint"]] = pos
+        self.portfolio.costs_paid += fill.cost_usd
+        self.portfolio.lp[mint] = pos
         self.portfolio.trades += 1
-        self.state[row["mint"]] = PROVIDE
-        self.portfolio.log(pos.opened_ts, row["mint"], "OPEN", f"edge {edge * 100:.2f}% over {cfg.horizon_hours:.0f}h",
-                           price, size, f"range=[{lower:.6g},{upper:.6g}] half_width={half_width:.1%}")
+        self.state[mint] = PROVIDE
+        self.portfolio.log(ts, mint, "OPEN", f"edge {edge * 100:.2f}% over {cfg.horizon_hours:.0f}h", price, size,
+                           f"range=[{fill.lower_usd:.6g},{fill.upper_usd:.6g}] half_width={half_width:.1%}"
+                           + (f" position={fill.position_key}" if self.is_live else ""))
 
     def finish(self, row: dict[str, Any], regime: Regime) -> None:
         for pos in list(self.portfolio.lp.values()):
@@ -361,9 +406,8 @@ class FixedNarrowDLMM(AdaptiveDLMM):
     """Benchmark: fixed narrow range with immediate recentering; documented as a control."""
     name = "fixed_narrow_dlmm"
 
-    def __init__(self, cfg: MMConfig, cash: float) -> None:
-        super().__init__(cfg, cash, half_width_pct=5.0)
-        self.cooldown_seconds = 0.0
+    def __init__(self, cfg: MMConfig, cash: float, broker: Broker | None = None) -> None:
+        super().__init__(cfg, cash, half_width_pct=5.0, broker=broker)
 
     def step(self, row, regime, prices):
         super().step(row, regime, prices)
@@ -419,8 +463,8 @@ class Momentum(Strategy):
     """Rank-3 challenger: breakout above the lookback high with volume confirmation, trailing stop."""
     name = "momentum"
 
-    def __init__(self, cfg: MMConfig, cash: float) -> None:
-        super().__init__(cfg, cash)
+    def __init__(self, cfg: MMConfig, cash: float, broker: Broker | None = None) -> None:
+        super().__init__(cfg, cash, broker)
         self.risk = RiskController(cfg)
         self.history: dict[str, list[dict[str, Any]]] = {}
 
@@ -445,23 +489,43 @@ class Momentum(Strategy):
             blocks = self.risk.entry_blocks(row, regime, self.portfolio, prices, size / max(cfg.target_token_fraction, 1e-9))
             if price >= high * (1 + cfg.momentum_breakout_pct / 100) and vol_now >= cfg.momentum_volume_confirm * mean_vol \
                     and not blocks and size >= 1.0:
-                fee = size * (cfg.momentum_fee_pct_each_side + (_f(row, "impact_at_max_position_pct") or 0)) / 100 + cfg.tx_fee_usd
-                tokens = (size - fee) / price
-                self.portfolio.spot[mint] = SpotPosition(mint, ts, tokens, size, price, price, costs_paid=fee)
-                self.portfolio.cash -= size
-                self.portfolio.costs_paid += fee
-                self.portfolio.trades += 1
-                self.portfolio.log(ts, mint, "BUY", f"breakout > {high:.6g} with volume x{vol_now / mean_vol if mean_vol else 0:.1f}", price, size)
+                self._open(row, price, size, f"breakout > {high:.6g} with volume x{vol_now / mean_vol if mean_vol else 0:.1f}")
         hist.append(row)
         if len(hist) > cfg.momentum_lookback * 4:
             del hist[: len(hist) - cfg.momentum_lookback * 4]
         self.prev[mint] = row
 
-    def _close(self, pos: SpotPosition, row, price, reason):
+    def _open(self, row: dict[str, Any], price: float, size: float, reason: str) -> None:
         cfg = self.cfg
-        gross = pos.value(price)
-        fee = gross * exit_cost_pct(row, cfg, gross) / 100 + cfg.tx_fee_usd
-        proceeds = gross - fee
+        mint, ts = row["mint"], _f(row, "ts") or 0.0
+        size = self.broker.deployable_usd(size)
+        if size < 1.0:
+            self.portfolio.log(ts, mint, "BUY_SKIPPED", "no deployable capital", price, size)
+            self.cooldown_until[mint] = ts + cfg.reentry_cooldown_minutes * 60
+            return
+        try:
+            fill = self.broker.buy(row, size)
+        except Exception as exc:  # noqa: BLE001
+            self.portfolio.log(ts, mint, "BUY_FAILED", str(exc), price, size)
+            self.cooldown_until[mint] = ts + cfg.reentry_cooldown_minutes * 60
+            return
+        self.portfolio.spot[mint] = SpotPosition(mint, ts, fill.tokens, fill.value_usd, price, price,
+                                                 costs_paid=fill.cost_usd, signature=fill.signature)
+        self.portfolio.cash -= fill.value_usd
+        self.portfolio.costs_paid += fill.cost_usd
+        self.portfolio.trades += 1
+        self.portfolio.log(ts, mint, "BUY", reason, price, fill.value_usd,
+                           f"tokens={fill.tokens:.6g}" + (f" sig={fill.signature}" if fill.signature else ""))
+
+    def _close(self, pos: SpotPosition, row, price, reason) -> bool:
+        cfg = self.cfg
+        ts = _f(row, "ts") or 0.0
+        try:
+            fill = self.broker.sell(row, pos.tokens, price)
+        except Exception as exc:  # noqa: BLE001
+            self.portfolio.log(ts, pos.mint, "SELL_FAILED", f"{reason}: {exc}", price, pos.value(price))
+            return False
+        proceeds, fee = fill.value_usd, fill.cost_usd
         pnl = proceeds - pos.entry_value
         self.portfolio.cash += proceeds
         self.portfolio.costs_paid += fee
@@ -469,12 +533,15 @@ class Momentum(Strategy):
         self.portfolio.record_pnl(pos.mint, pnl)
         self.portfolio.trades += 1
         self.portfolio.spot.pop(pos.mint, None)
-        self.cooldown_until[pos.mint] = (_f(row, "ts") or 0.0) + cfg.reentry_cooldown_minutes * 60
-        self.portfolio.log(_f(row, "ts") or 0.0, pos.mint, "SELL", reason, price, proceeds, f"pnl={pnl:.4f} cost={fee:.4f}")
+        self.cooldown_until[pos.mint] = ts + cfg.reentry_cooldown_minutes * 60
+        self.portfolio.log(ts, pos.mint, "SELL", reason, price, proceeds,
+                           f"pnl={pnl:.4f} cost={fee:.4f}" + (f" sig={fill.signature}" if fill.signature else ""))
+        return True
 
     def finish(self, row, regime):
         for pos in list(self.portfolio.spot.values()):
-            self._close(pos, self.prev.get(pos.mint, row), _f(self.prev.get(pos.mint, row), "price_usd") or pos.entry_price, "end of data")
+            last = self.prev.get(pos.mint, row)
+            self._close(pos, last, _f(last, "price_usd") or pos.entry_price, "end of data")
 
 
 class Hold(Strategy):
@@ -506,6 +573,14 @@ class Cash(Strategy):
         self.prev[row["mint"]] = row
 
 
-def default_strategies(cfg: MMConfig, cash: float) -> list[Strategy]:
-    return [AdaptiveDLMM(cfg, cash), FixedNarrowDLMM(cfg, cash), FullRangeCPMM(cfg, cash),
-            Momentum(cfg, cash), Hold(cfg, cash), Cash(cfg, cash)]
+def default_strategies(cfg: MMConfig, cash: float, live_broker: Broker | None = None) -> list[Strategy]:
+    """Replay/paper: every strategy on paper. Live: the two candidates trade through `live_broker`
+    while the controls and benchmarks keep running as shadows on the same rows."""
+    return [
+        AdaptiveDLMM(cfg, cash, broker=live_broker),
+        FixedNarrowDLMM(cfg, cash),
+        FullRangeCPMM(cfg, cash),
+        Momentum(cfg, cash, broker=live_broker),
+        Hold(cfg, cash),
+        Cash(cfg, cash),
+    ]

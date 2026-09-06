@@ -85,6 +85,10 @@ class MMConfig:
     target_token_fraction: float = 0.50
     inventory_band: float = 0.15              # REDUCE when token fraction exceeds target + band
     reentry_cooldown_minutes: float = 30.0
+    live_slippage_bps: int = 100
+    lp_position_rent_sol: float = 0.06        # refundable DLMM position rent kept free per open
+    sidecar_url: str = ""                     # empty: spawn mm/sidecar/server.js on sidecar_port
+    sidecar_port: int = 8787
     stale_data_seconds: float = 180.0
     poll_seconds: float = 60.0
     universe_refresh_minutes: float = 60.0
@@ -146,6 +150,10 @@ class MMConfig:
         cfg.target_token_fraction = _float("MM_TARGET_TOKEN_FRACTION", cfg.target_token_fraction)
         cfg.inventory_band = _float("MM_INVENTORY_BAND", cfg.inventory_band)
         cfg.reentry_cooldown_minutes = _float("MM_REENTRY_COOLDOWN_MINUTES", cfg.reentry_cooldown_minutes)
+        cfg.live_slippage_bps = _int("MM_LIVE_SLIPPAGE_BPS", cfg.live_slippage_bps)
+        cfg.lp_position_rent_sol = _float("MM_LP_POSITION_RENT_SOL", cfg.lp_position_rent_sol)
+        cfg.sidecar_url = os.getenv("MM_SIDECAR_URL", cfg.sidecar_url)
+        cfg.sidecar_port = _int("MM_SIDECAR_PORT", cfg.sidecar_port)
         cfg.stale_data_seconds = _float("MM_STALE_DATA_SECONDS", cfg.stale_data_seconds)
         cfg.poll_seconds = _float("MM_POLL_SECONDS", cfg.poll_seconds)
         cfg.universe_refresh_minutes = _float("MM_UNIVERSE_REFRESH_MINUTES", cfg.universe_refresh_minutes)
@@ -172,6 +180,18 @@ class MMConfig:
     @property
     def paper_dir(self) -> Path:
         return self.data_dir / "mm_paper"
+
+    @property
+    def live_dir(self) -> Path:
+        return self.data_dir / "mm_live"
+
+    @property
+    def stop_flag(self) -> Path:
+        return self.data_dir / "mm.stop"
+
+    @property
+    def panic_flag(self) -> Path:
+        return self.data_dir / "mm.panic"
 
     @property
     def log_file(self) -> Path:

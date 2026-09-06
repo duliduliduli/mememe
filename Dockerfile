@@ -1,9 +1,15 @@
 # Root-level build so Railway (and any container host) works without setting
 # a Root Directory — it builds the grad-backtest app. Identical behavior to
 # grad-backtest/Dockerfile, which remains for builds rooted in that folder.
+FROM node:22-slim AS node
 FROM python:3.12-slim
 
 WORKDIR /app
+
+# Node runs the Meteora DLMM sidecar (mm/sidecar/server.js) beside the Python engine.
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm
 
 COPY grad-backtest/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
@@ -12,12 +18,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 # omitted from the container by an outdated hand-maintained file list.
 COPY grad-backtest/*.py ./
 COPY grad-backtest/mm mm
+RUN cd mm/sidecar && npm ci --omit=dev --no-audit --no-fund && node -e "require('@meteora-ag/dlmm')"
 COPY grad-backtest/static static
 COPY grad-backtest/data/graduations.example.csv data/
 
 # Catch missing runtime modules during the image build instead of after
 # Railway has already started the web server and autostarted the executor.
-RUN python -c "import bundle_analysis, executor, mm.paper"
+RUN python -c "import bundle_analysis, executor, mm.paper, mm.live"
 
 ENV PYTHONUNBUFFERED=1
 # All scripts read/write here; mount a Railway volume at /data to persist

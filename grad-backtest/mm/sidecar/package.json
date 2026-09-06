@@ -1,0 +1,15 @@
+{
+  "name": "mm-dlmm-sidecar",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local HTTP bridge from the Python market-making engine to Meteora's DLMM SDK",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "@meteora-ag/dlmm": "1.9.14",
+    "@solana/web3.js": "1.98.4",
+    "bn.js": "^5.2.1",
+    "bs58": "^6.0.0"
+  }
+}

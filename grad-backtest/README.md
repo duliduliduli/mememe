@@ -891,8 +891,8 @@ size. Trade half the recommendation live at first.
 
 A separate lane that evaluates the alternative in the market-making brief: selective
 Meteora DLMM liquidity provision and cost-aware momentum on *established* memes (30+ days,
-$100K+ pools), instead of fresh graduates. It shares `DATA_DIR` with the executor, prefixes
-every file `mm_`, and never sends a transaction.
+$100K+ pools), instead of fresh graduates. It shares `DATA_DIR` and the wallet with the
+executor and prefixes every file `mm_`.
 
 ```bash
 python -m mm costs        # break-even table
@@ -900,10 +900,14 @@ python -m mm screen       # universe + reject log
 python -m mm record --hours 6
 python -m mm replay       # every strategy, full cost accounting
 python -m mm paper --hours 168
+python -m mm live         # real DLMM ranges + Jupiter swaps for adaptive_dlmm and momentum
 ```
 
-Design, the edge gate, the inventory rule, the thresholds that gate live sizing, and what
-is deliberately not built are documented in [`mm/README.md`](mm/README.md).
+On Railway, `MM_AUTOSTART=1` with `MM_MODE=paper|live` launches the lane next to the
+executor; `/api/mm/status`, `/api/mm/stop` and `/api/mm/panic` control it. Live mode needs
+the Node sidecar (`mm/sidecar`, built into the image) and `WALLET_PRIVATE_KEY`; capital is
+capped by `MM_BANKROLL_USD`. Design, the edge gate, the inventory rule, live execution and
+kill switches are documented in [`mm/README.md`](mm/README.md).
 
 ## 9. Deployment
 
