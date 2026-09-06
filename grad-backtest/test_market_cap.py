@@ -76,8 +76,12 @@ class MarketCapMathTests(unittest.TestCase):
 
 
 class MarketCapGuardTests(unittest.TestCase):
-    def test_default_ceiling_blocks_pumped_and_passes_real(self):
+    def test_ceiling_off_by_default_and_blocks_pumped_when_set(self):
         executor, p = fresh_executor()
+        self.addCleanup(p.stop)
+        self.assertEqual(executor.Config().max_entry_market_cap_usd, 0)  # off: it rejected the liquid cohort
+        p.stop()
+        executor, p = fresh_executor(MAX_ENTRY_MARKET_CAP_USD="300000")
         self.addCleanup(p.stop)
         cfg = executor.Config()
         self.assertEqual(cfg.max_entry_market_cap_usd, 300_000)

@@ -464,16 +464,22 @@ class MigrationRegressionTests(unittest.TestCase):
         self.assertEqual(len(rpc.raw_transactions("curve", **{"gte-time": 90, "lte-time": 110})), 1)
         self.assertEqual(len(rpc.batch_call.call_args.args[0]), 1)
 
-    def test_large_window_is_not_silently_sampled(self):
+    def test_large_window_is_sampled_from_the_earliest_rows_and_reported(self):
+        # A window busier than the decode budget is evidence of a crowd. It is decoded from the
+        # earliest rows (creation, dev buys, bundles live there) and the sample size is reported,
+        # never refused and never hidden.
         rpc = self.ex.Rpc(self.ex.Config())
         rpc.call = mock.Mock(side_effect=[
             [{"signature": str(i), "blockTime": 100} for i in range(1000)],
             [{"signature": "1000", "blockTime": 100}],
         ])
-        rpc.batch_call = mock.Mock()
-        with self.assertRaisesRegex(RuntimeError, "decode budget"):
-            rpc.raw_transactions("curve", **{"gte-time": 90, "lte-time": 110})
-        rpc.batch_call.assert_not_called()
+        rpc.batch_call = mock.Mock(side_effect=lambda calls, **kw: [{"slot": 1, "blockTime": 100}] * len(calls))
+        result = rpc.raw_transactions("curve", **{"gte-time": 90, "lte-time": 110})
+        self.assertEqual(len(result), 1000)
+        decoded = {call[1][0] for c in rpc.batch_call.call_args_list for call in c.args[0]}
+        self.assertIn("1000", decoded)      # the earliest signature is in the sample
+        self.assertNotIn("0", decoded)      # the newest one is what gets dropped
+        self.assertEqual(rpc.last_history_sample, {"address": "curve", "total": 1001, "decoded": 1000})
 
     def test_busy_705_transaction_window_is_decoded_fully(self):
         rpc = self.ex.Rpc(self.ex.Config())

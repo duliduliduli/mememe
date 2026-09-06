@@ -26,8 +26,9 @@ class GuardTests(unittest.TestCase):
 
     def test_price_impact_rejected(self):
         g = self.executor.entry_guard_reason
-        self.assertIsNone(g(self.cfg, 1000.0, 1030.0, 4.9))
-        self.assertIn("price impact", g(self.cfg, 1000.0, 1030.0, 5.1))
+        self.assertEqual(self.cfg.max_price_impact_pct, 10.0)  # $5 orders: 5% was $0.25 and cost ARGOS
+        self.assertIsNone(g(self.cfg, 1000.0, 1030.0, 9.9))
+        self.assertIn("price impact", g(self.cfg, 1000.0, 1030.0, 10.1))
         self.assertIsNone(g(self.cfg, 1000.0, 1030.0, None))  # missing impact doesn't block
 
     def test_quote_price_impact_parsing(self):
@@ -38,18 +39,34 @@ class GuardTests(unittest.TestCase):
         self.assertIsNone(f({"priceImpactPct": "garbage"}))
 
     def test_skip_log_written(self):
-        self.executor.record_skip("mintX", "test reason")
-        rows = list(csv.reader(open(Path(self.tmp) / "skips.csv")))
-        self.assertEqual(rows[0], ["timestamp", "mint", "reason"])
-        self.assertEqual(rows[1][1:], ["mintX", "test reason"])
+        self.executor.record_skip("mintX", "test reason", {"market_cap_usd": 12345.678, "curve_tx_count": 9, "ignored": 1})
+        rows = list(csv.DictReader(open(Path(self.tmp) / "skips.csv")))
+        self.assertEqual(list(rows[0].keys()), self.executor.SKIP_COLUMNS)
+        self.assertEqual((rows[0]["mint"], rows[0]["reason"]), ("mintX", "test reason"))
+        self.assertEqual(rows[0]["market_cap_usd"], "12345.68")
+        self.assertEqual(rows[0]["curve_tx_count"], "9")
+        self.assertNotIn("ignored", rows[0])
 
-    def test_record_trade_respects_existing_header(self):
+    def test_record_trade_rotates_older_header_and_keeps_wider_one(self):
+        # An older file (header missing columns we now record) is rotated aside so no metadata
+        # is dropped; the new file carries the full header and an aligned row.
         old_header = ["opened_at", "mint", "net_return"]
         trades = Path(self.tmp) / "live_trades.csv"
         trades.write_text(",".join(old_header) + "\n")
         self.executor.record_trade({"opened_at": "t1", "mint": "m", "net_return": 0.1, "entry_price_impact_pct": 2.0})
         rows = list(csv.reader(open(trades)))
-        self.assertEqual(len(rows[1]), 3)  # no misaligned extra columns
+        self.assertEqual(rows[0], self.executor.TRADE_COLUMNS)
+        self.assertEqual(len(rows[1]), len(self.executor.TRADE_COLUMNS))
+        rotated = [p for p in Path(self.tmp).glob("live_trades.*.csv")]
+        self.assertEqual(len(rotated), 1)
+        self.assertEqual(rotated[0].read_text().strip(), ",".join(old_header))
+        # A file with extra/reordered columns keeps its own header: never misalign a row.
+        wider = self.executor.TRADE_COLUMNS + ["custom"]
+        trades.write_text(",".join(wider) + "\n")
+        self.executor.record_trade({"opened_at": "t2", "mint": "m"})
+        rows = list(csv.reader(open(trades)))
+        self.assertEqual(rows[0], wider)
+        self.assertEqual(len(rows[1]), len(wider))
 
 
 if __name__ == "__main__":
