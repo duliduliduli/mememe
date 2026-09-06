@@ -35,12 +35,16 @@ class MetadataOrderingTests(unittest.TestCase):
         self.bot.rpc.token_supply_details.return_value = (1_000_000, 0, 1_000_000)
         self.bot.rpc.mint_first_seen.return_value = GRAD - 120
         self.bot.rpc.top_wallet_holder.return_value = ("holder", 100_000)
+        self.bot.rpc.curve_transaction_count.return_value = 500
+        self.bot.rpc.mint_creator.return_value = None
+        self.bot.rpc.largest_seller_since.return_value = None
         self.bot.rpc.bundle_snapshot.return_value = {"complete": True}
 
     def metadata(self, tokens=100):
         return self.bot.entry_metadata("mint", GRAD, 5, tokens)
 
     def test_market_cap_rejection_skips_all_later_metadata(self):
+        self.bot.cfg.max_entry_market_cap_usd = 300_000  # ceiling is off by default now
         result = self.metadata(tokens=1)
         self.assertEqual(result[0], 5_000_000)
         self.bot.rpc.mint_first_seen.assert_not_called()
@@ -67,8 +71,11 @@ class MetadataOrderingTests(unittest.TestCase):
         result = self.metadata()
         self.assertTrue(result[4]["complete"])
         self.bot.rpc.bundle_snapshot.assert_called_once()
-        self.assertEqual([c[0] for c in self.bot.rpc.method_calls],
-                         ["token_supply_details", "mint_first_seen", "top_wallet_holder", "bundle_snapshot"])
+        self.assertEqual(
+            [c[0] for c in self.bot.rpc.method_calls],
+            ["token_supply_details", "mint_first_seen", "curve_transaction_count", "top_wallet_holder",
+             "mint_creator", "largest_seller_since", "bundle_snapshot"],
+        )
 
     def test_unknown_curve_stays_incomplete(self):
         self.bot.rpc.mint_first_seen.return_value = None
@@ -111,7 +118,7 @@ class FloorGuardTests(unittest.TestCase):
         self.assertIsNone(executor.entry_guard_reason(cfg, GRAD, ENTRY, 1.0, None))
 
     def test_ceiling_still_applies_above_floor(self):
-        executor, p = fresh()
+        executor, p = fresh(MAX_ENTRY_MARKET_CAP_USD="300000")
         self.addCleanup(p.stop)
         cfg = executor.Config()
         self.assertIn("pumped", executor.entry_guard_reason(cfg, GRAD, ENTRY, 1.0, 5_000_000))

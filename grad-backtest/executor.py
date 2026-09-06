@@ -90,6 +90,20 @@ TRADE_COLUMNS = [
     "entry_top10_wallet_pct", "entry_early_buy_pct", "entry_funder_coverage_pct",
     "entry_funder_lookup_pct", "entry_funder_sample_count",
     "entry_holder_sample_count", "entry_bundle_confidence",
+    "entry_seconds_after_graduation", "entry_in_boost_window",
+    "exit_seconds_after_graduation", "exit_in_boost_window",
+    "entry_curve_tx_count", "entry_early_sell_pct", "entry_creator",
+    "entry_creator_prior_launches", "entry_creator_hold_pct",
+    "entry_history_total", "entry_history_decoded",
+]
+
+SKIP_COLUMNS = [
+    "timestamp", "mint", "reason", "seconds_after_graduation", "in_boost_window",
+    "market_cap_usd", "price_impact_pct", "curve_age_seconds", "curve_tx_count",
+    "top_holder_pct", "creator", "creator_prior_launches", "creator_hold_pct",
+    "early_sell_pct", "early_seller", "bundle_confidence", "bundle_slot_pct", "cluster_pct",
+    "dev_cluster_pct", "top10_wallet_pct", "early_buy_pct", "funder_coverage_pct",
+    "history_total", "history_decoded", "round_trip_pct",
 ]
 
 
@@ -274,7 +288,9 @@ class Config:
         # market is not.  Bound both sources of entry work so an active position is never starved
         # behind a burst of graduations.
         self.max_entries_per_cycle = max(1, int(os.getenv("MAX_ENTRIES_PER_CYCLE", "1")))
-        self.max_price_impact_pct = float(os.getenv("MAX_PRICE_IMPACT_PCT", "5"))
+        # On a $5 order 5% impact is $0.25; the guard's job is to reject drained pools (30-79%
+        # impact seen live on $3 pools), not fresh ones. ARGOS was skipped at 5.3% and doubled.
+        self.max_price_impact_pct = float(os.getenv("MAX_PRICE_IMPACT_PCT", "10"))
         # A route existing is not enough: require that the just-quoted tokens can immediately
         # be sold back for most of the input. This is an executable liquidity check, not a UI badge.
         self.min_entry_round_trip_pct = percent_env("MIN_ENTRY_ROUND_TRIP_PCT", 80)
@@ -282,7 +298,10 @@ class Config:
         # market cap far above that 30s after migration means a bundled buy already pumped it
         # and we would be buying the top of someone else's pump, which then dumps into us.
         # Observed live: 15-holder tokens at $5M, $150M caps one minute old. 0 disables.
-        self.max_entry_market_cap_usd = float(os.getenv("MAX_ENTRY_MARKET_CAP_USD", "300000"))
+        # Off by default since 2026-09-05: a $2M ceiling rejected $13M-$26M graduations carrying
+        # $300K-$440K of real liquidity, the healthiest cohort on the tape, while the bundle and
+        # dump checks below catch the pumped-then-dumped case directly. Set a value to re-enable.
+        self.max_entry_market_cap_usd = float(os.getenv("MAX_ENTRY_MARKET_CAP_USD", "0"))
         # Floor: graduation is ~$69k, so a token far below that a minute later was already dumped
         # into its own pool. SOLL: the creator sold 78% of supply 24s after migration and we bought
         # at a $450 cap. Overnight, sub-$30k entries went 1 for 7. 0 disables.
@@ -292,6 +311,28 @@ class Config:
         # the one that dumps on us (SOLL's creator held 59% at graduation). 0 disables either.
         self.min_curve_age_seconds = float(os.getenv("MIN_CURVE_AGE_SECONDS", "120"))
         self.max_top_holder_pct = float(os.getenv("MAX_TOP_HOLDER_PCT", "20"))
+        # Curve activity floor. A curve that filled with a handful of transactions was bought by
+        # one party: rugs seen live had 2, 9 and 15 successful curve transactions, organic
+        # launches 311 to 2,293. Counted from signature metadata alone (one or two calls), so it
+        # does not depend on the creation timestamp being found. 0 disables.
+        self.min_curve_transactions = int(os.getenv("MIN_CURVE_TRANSACTIONS", "150"))
+        # Early-dump check at entry time: a single plain wallet that has already sold this much
+        # of supply into the pool since migration means the dump started before we arrived
+        # (SOLL's creator sold 78% at +53s; we bought at +98s). 0 disables.
+        self.max_early_sell_pct = percent_env("MAX_EARLY_SELL_PCT", 3)
+        # Creator checks. Serial launchers are rug factories; a creator still holding a large
+        # slice at entry is the wallet that dumps. Prior launches are counted from a bounded
+        # sample of the creator's history, so a busy legitimate wallet undercounts (fails open)
+        # while a factory that launches constantly is seen. 0 disables either.
+        self.max_creator_prior_launches = int(os.getenv("MAX_CREATOR_PRIOR_LAUNCHES", "3"))
+        self.max_creator_hold_pct = percent_env("MAX_CREATOR_HOLD_PCT", 5)
+        self.creator_history_signatures = min(1000, max(20, int(os.getenv("CREATOR_HISTORY_SIGNATURES", "100"))))
+        self.creator_history_decode_limit = min(200, max(10, int(os.getenv("CREATOR_HISTORY_DECODE_LIMIT", "60"))))
+        # Pump.fun BOOST (live since 2026-07-21) spends ~17.6 SOL of migration proceeds on a
+        # five-minute TWAP buy-and-burn immediately after migration. A +30s entry rides that
+        # protocol bid; exits after +300s do not. Every position and trade row records whether
+        # entry and exit fell inside the window so the subsidy can be separated from the edge.
+        self.boost_window_seconds = float(os.getenv("BOOST_WINDOW_SECONDS", "300"))
         # Multi-wallet bundle checks. The old .env example expressed percentages as fractions
         # (0.30 == 30%), so percent_env accepts both forms during rollout.
         self.max_bundle_slot_pct = percent_env("MAX_BUNDLE_SLOT_PCT", 30)
@@ -389,31 +430,43 @@ def roll_daily(state: dict[str, Any]) -> None:
         state["daily"] = {"date": today, "realized_pnl_usd": 0.0}
 
 
-def record_trade(row: dict[str, Any]) -> None:
+def _append_row(path: Path, columns: list[str], row: dict[str, Any]) -> None:
+    """Append one CSV row. A file written by an older version (a header missing columns we now
+    record) is rotated to <name>.<timestamp>.csv so no metadata is silently dropped and no
+    column is ever misaligned; a file with extra or reordered columns keeps its own header."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    columns = TRADE_COLUMNS
-    new = not TRADES_FILE.exists()
-    if not new:  # keep appending against whatever header the file already has
-        with TRADES_FILE.open() as fh:
+    fieldnames = columns
+    new = not path.exists()
+    if not new:
+        with path.open() as fh:
             existing = fh.readline().strip().split(",")
         if existing and existing != [""]:
-            columns = existing
-    with TRADES_FILE.open("a", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=columns, extrasaction="ignore")
+            if set(existing) < set(columns):
+                rotated = path.with_name(f"{path.stem}.{int(now_ts())}{path.suffix}")
+                os.replace(path, rotated)
+                log(f"rotated {path.name} (older header) to {rotated.name}")
+                new = True
+            else:
+                fieldnames = existing
+    with path.open("a", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
         if new:
             writer.writeheader()
-        writer.writerow({k: row.get(k) for k in columns})
+        writer.writerow({k: row.get(k) for k in fieldnames})
 
 
-def record_skip(mint: str, reason: str) -> None:
-    """Audit trail of everything the bot passed on, and why."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    new = not SKIPS_FILE.exists()
-    with SKIPS_FILE.open("a", newline="") as fh:
-        writer = csv.writer(fh)
-        if new:
-            writer.writerow(["timestamp", "mint", "reason"])
-        writer.writerow([utc_iso(), mint, reason])
+def record_trade(row: dict[str, Any]) -> None:
+    _append_row(TRADES_FILE, TRADE_COLUMNS, row)
+
+
+def record_skip(mint: str, reason: str, meta: dict[str, Any] | None = None) -> None:
+    """Audit trail of everything the bot passed on, why, and what was known at the time, so a
+    day of skips can be scored against what the tokens did next."""
+    row = {"timestamp": utc_iso(), "mint": mint, "reason": reason}
+    for key, value in (meta or {}).items():
+        if key in SKIP_COLUMNS and value is not None:
+            row[key] = round(value, 2) if isinstance(value, float) else value
+    _append_row(SKIPS_FILE, SKIP_COLUMNS, row)
 
 
 def quote_price_impact_pct(quote: dict[str, Any]) -> float | None:
@@ -557,8 +610,14 @@ def normalize_rpc_transaction(tx: dict[str, Any], signature: str = "") -> dict[s
     fee_payer = keys[0] if keys else None
     native_transfers: list[dict[str, Any]] = []
     for instruction in rpc_instructions(tx):
-        parsed = instruction.get("parsed") or {}
+        parsed = instruction.get("parsed")
+        # Memo and a few other programs come back with `parsed` as a bare string; treating it
+        # as a dict crashed the whole bundle snapshot ('str' object has no attribute 'get').
+        if not isinstance(parsed, dict):
+            continue
         info = parsed.get("info") or {}
+        if not isinstance(info, dict):
+            continue
         if instruction.get("program") != "system" or parsed.get("type") not in ("transfer", "transferWithSeed"):
             continue
         source = info.get("source")
@@ -668,10 +727,17 @@ def entry_guard_reason(
     curve_age_seconds: float | None = None,
     top_holder_pct: float | None = None,
     bundle: dict[str, Any] | None = None,
+    *,
+    curve_tx_count: int | None = None,
+    creator_prior_launches: int | None = None,
+    creator_hold_pct: float | None = None,
+    early_sell_pct: float | None = None,
+    early_seller: str | None = None,
 ) -> str | None:
     """Reject entries that are no longer the trade the backtest models.
 
-    Unknown inputs (None) never block: a failed metadata lookup is logged, not traded on."""
+    Unknown inputs (None) never block: a failed metadata lookup is logged, not traded on.
+    The one exception is the bundle snapshot, which fails closed when BUNDLE_FAIL_CLOSED is set."""
     lateness = now - (graduated_ts + cfg.entry_delay_seconds)
     if lateness > cfg.max_entry_lateness_seconds:
         return f"stale entry: {lateness:.0f}s past target"
@@ -705,6 +771,15 @@ def entry_guard_reason(
             "(observed history does not meet minimum curve age)"
         )
     if (
+        curve_tx_count is not None
+        and cfg.min_curve_transactions > 0
+        and curve_tx_count < cfg.min_curve_transactions
+    ):
+        return (
+            f"curve filled with {curve_tx_count} successful transactions < {cfg.min_curve_transactions} "
+            "(one-party fill)"
+        )
+    if (
         top_holder_pct is not None
         and cfg.max_top_holder_pct > 0
         and top_holder_pct > cfg.max_top_holder_pct
@@ -712,6 +787,34 @@ def entry_guard_reason(
         return (
             f"top wallet holds {top_holder_pct:.1f}% of supply > {cfg.max_top_holder_pct:.0f}% "
             "(one holder can dump the pool)"
+        )
+    if (
+        creator_hold_pct is not None
+        and cfg.max_creator_hold_pct > 0
+        and creator_hold_pct > cfg.max_creator_hold_pct
+    ):
+        return (
+            f"creator still holds {creator_hold_pct:.1f}% of supply > {cfg.max_creator_hold_pct:.0f}% "
+            "(the wallet that dumps)"
+        )
+    if (
+        creator_prior_launches is not None
+        and cfg.max_creator_prior_launches > 0
+        and creator_prior_launches > cfg.max_creator_prior_launches
+    ):
+        return (
+            f"creator launched {creator_prior_launches} prior Pump.fun tokens > {cfg.max_creator_prior_launches} "
+            "(launch factory)"
+        )
+    if (
+        early_sell_pct is not None
+        and cfg.max_early_sell_pct > 0
+        and early_sell_pct > cfg.max_early_sell_pct
+    ):
+        who = f" [{early_seller}]" if early_seller else ""
+        return (
+            f"a wallet already sold {early_sell_pct:.1f}% of supply since migration > {cfg.max_early_sell_pct:.0f}% "
+            f"(dump started before entry){who}"
         )
     if bundle is not None:
         if not bundle.get("complete", False) and cfg.bundle_fail_closed:
@@ -781,6 +884,8 @@ class Rpc:
         self._method_cooldowns: dict[tuple[str, str], float] = {}
         self._provider_lock = threading.Lock()
         self._holder_cache: dict[tuple, tuple[float, list[tuple[str, int]]]] = {}
+        self._creator_by_mint: dict[str, str] = {}
+        self.last_history_sample: dict[str, Any] | None = None
         self.wallet_graph_cache: dict[str, Any] = {"version": 1, "funders": {}, "appearances": {}}
         try:
             loaded = json.loads(WALLET_GRAPH_CACHE_FILE.read_text())
@@ -976,12 +1081,158 @@ class Rpc:
                      if c['mint'] == mint]
         if creations:
             created = min(creations, key=lambda c: c['timestamp'])
+            if created.get('creator'):
+                self._creator_by_mint[mint] = created['creator']
             log(f"CURVE mint={mint} evidence=verified_creation created_ts={created['timestamp']} "
-                f"creation_slot={created['slot']}")
+                f"creation_slot={created['slot']} creator={created.get('creator')}")
             return float(created['timestamp'])
         times = [tx['timestamp'] for tx in transactions if tx.get('timestamp') is not None]
         evidence = 'minimum_age_only' if times and min(times) <= stop_before_ts else 'unknown'
         log(f"CURVE mint={mint} evidence={evidence} creation_unverified=True")
+        return None
+
+    def mint_creator(self, mint: str) -> str | None:
+        """Creator argument of the verified Create instruction, remembered by mint_first_seen."""
+        return self._creator_by_mint.get(mint)
+
+    def curve_transaction_count(self, mint: str, created_ts: float, graduated_ts: float) -> int:
+        """Successful transactions on the bonding curve between creation and graduation, from
+        signature metadata only (no transaction bodies). Capped at two pages of 1,000: anything
+        past that is already far above any sane floor."""
+        curve = bonding_curve_address(mint)
+        count = 0
+        before: str | None = None
+        for _ in range(2):
+            options: dict[str, Any] = {"limit": 1000, "commitment": "confirmed"}
+            if before:
+                options["before"] = before
+            page = self.call("getSignaturesForAddress", [curve, options])
+            if not isinstance(page, list):
+                raise RuntimeError("curve signature data incomplete")
+            times = []
+            for row in page:
+                if not isinstance(row, dict):
+                    continue
+                block_time = row.get("blockTime")
+                if block_time is None:
+                    continue
+                times.append(block_time)
+                if row.get("err") is None and created_ts - 2 <= block_time <= graduated_ts + 2:
+                    count += 1
+            if len(page) < 1000 or (times and min(times) < created_ts - 2):
+                break
+            before = page[-1].get("signature") if isinstance(page[-1], dict) else None
+            if not before:
+                break
+        return count
+
+    def creator_profile(self, creator: str, mint: str, before_ts: float) -> dict[str, Any]:
+        """Prior Pump.fun launches by this creator, from a bounded sample of its history before
+        this launch, cached for a day. Counts verified Create instructions only, so it never
+        mistakes ordinary activity for a launch; a busy legitimate wallet undercounts."""
+        cache = self.wallet_graph_cache.setdefault("creators", {})
+        cached = cache.get(creator)
+        if isinstance(cached, dict) and now_ts() - float(cached.get("checked_at") or 0) <= 86400:
+            return cached
+        page = self.call(
+            "getSignaturesForAddress",
+            [creator, {"limit": self.cfg.creator_history_signatures, "commitment": "confirmed"}],
+        )
+        if not isinstance(page, list):
+            raise RuntimeError("creator signature data incomplete")
+        rows = [
+            r for r in page
+            if isinstance(r, dict) and r.get("signature") and r.get("err") is None
+            and r.get("blockTime") is not None and r["blockTime"] < before_ts
+        ]
+        times = [r["blockTime"] for r in rows]
+        sample = rows[: self.cfg.creator_history_decode_limit]
+        calls = [
+            ("getTransaction", [r["signature"], {"encoding": "jsonParsed", "commitment": "confirmed",
+                                                "maxSupportedTransactionVersion": 0}])
+            for r in sample
+        ]
+        bodies: list[Any] = []
+        for start in range(0, len(calls), self.cfg.rpc_batch_size):
+            bodies.extend(self.batch_call(
+                calls[start:start + self.cfg.rpc_batch_size],
+                timeout=self.cfg.bundle_lookup_timeout_ms / 1000 * 2,
+            ))
+        launches = 0
+        for body in bodies:
+            if isinstance(body, dict):
+                launches += sum(
+                    1 for c in pump_creations(body) if c["creator"] == creator and c["mint"] != mint
+                )
+        profile = {
+            "prior_launches": launches,
+            "sampled_signatures": len(rows),
+            "decoded": len(sample),
+            "first_seen_ts": min(times) if times else None,
+            "checked_at": now_ts(),
+        }
+        cache[creator] = profile
+        return profile
+
+    def largest_seller_since(
+        self, mint: str, since_ts: float, supply_raw: int, exclude: set[str] | None = None, limit: int = 100
+    ) -> tuple[str, float] | None:
+        """(wallet, percent of supply) for the plain wallet with the largest net token outflow
+        since `since_ts`, read from the mint's most recent transactions. Program-owned accounts
+        are ignored: the pool's vault drains on every buy and the BOOST burn empties a vault.
+        None when no wallet has sold."""
+        exclude = exclude or set()
+        page = self.call("getSignaturesForAddress", [mint, {"limit": limit, "commitment": "confirmed"}])
+        if not isinstance(page, list):
+            raise RuntimeError("mint signature data incomplete")
+        rows = [
+            r for r in page
+            if isinstance(r, dict) and r.get("signature") and r.get("err") is None
+            and (r.get("blockTime") or 0) >= since_ts - 2
+        ]
+        if not rows:
+            return None
+        calls = [
+            ("getTransaction", [r["signature"], {"encoding": "jsonParsed", "commitment": "confirmed",
+                                                "maxSupportedTransactionVersion": 0}])
+            for r in rows
+        ]
+        bodies: list[Any] = []
+        for start in range(0, len(calls), self.cfg.rpc_batch_size):
+            bodies.extend(self.batch_call(
+                calls[start:start + self.cfg.rpc_batch_size],
+                timeout=self.cfg.bundle_lookup_timeout_ms / 1000 * 2,
+            ))
+        net: dict[str, int] = {}
+        for body in bodies:
+            if not isinstance(body, dict):
+                continue
+            meta = body.get("meta") or {}
+            balances: dict[int, tuple[str, int, int]] = {}  # account index -> (owner, pre, post)
+            for row in meta.get("preTokenBalances") or []:
+                if row.get("mint") == mint and row.get("owner") is not None:
+                    idx = int(row.get("accountIndex"))
+                    amount = int(((row.get("uiTokenAmount") or {}).get("amount")) or 0)
+                    balances[idx] = (row["owner"], amount, 0)
+            for row in meta.get("postTokenBalances") or []:
+                if row.get("mint") == mint and row.get("owner") is not None:
+                    idx = int(row.get("accountIndex"))
+                    amount = int(((row.get("uiTokenAmount") or {}).get("amount")) or 0)
+                    owner, pre, _ = balances.get(idx, (row["owner"], 0, 0))
+                    balances[idx] = (owner, pre, amount)
+            for owner, pre, post in balances.values():
+                net[owner] = net.get(owner, 0) + (post - pre)
+        sellers = {owner: -delta for owner, delta in net.items() if delta < 0 and owner not in exclude}
+        if not sellers or supply_raw <= 0:
+            return None
+        candidates = sorted(sellers.items(), key=lambda item: item[1], reverse=True)[:10]
+        accounts = self.call(
+            "getMultipleAccounts", [[owner for owner, _ in candidates], {"encoding": "base64"}]
+        ).get("value") or []
+        for (owner, sold), acct in zip(candidates, accounts):
+            program = acct["owner"] if acct else SYSTEM_PROGRAM
+            if program == SYSTEM_PROGRAM:
+                return owner, sold / supply_raw * 100
         return None
 
     def plain_wallet_holders(
@@ -1042,8 +1293,13 @@ class Rpc:
             return []
         addresses = [entry["address"] for entry in largest]
         accounts = self.call("getMultipleAccounts", [addresses, {"encoding": "jsonParsed"}]).get("value") or []
-        if len(accounts) != len(addresses) or any(a is None for a in accounts):
+        if len(accounts) != len(addresses):
             raise RuntimeError("holder account data incomplete")
+        # A token account can close between the two calls (a holder dumping and closing during
+        # a launch is normal). Tolerate a few missing entries; refuse only when most are gone.
+        missing = sum(1 for a in accounts if a is None)
+        if missing and missing > len(addresses) // 5:
+            raise RuntimeError(f"holder account data incomplete ({missing} of {len(addresses)} accounts missing)")
         owners: list[tuple[str, int]] = []
         for entry, acct in zip(largest, accounts):
             if not acct:
@@ -1152,13 +1408,19 @@ class Rpc:
             row for row in signatures
             if row.get("signature") and not row.get("err") and gte <= int(row.get("blockTime") or 0) <= lte
         ]
+        self.last_history_sample = None
         if gte and len(rows) > body_limit:
-            raise RuntimeError(f'history window contains {len(rows)} successful transactions; decode budget is {body_limit}')
+            # A window busier than the decode budget is evidence of a crowd, not a reason to
+            # refuse the token. Decode the earliest rows, where creation, dev buys and bundles
+            # live, and report how much of the window that covered.
+            self.last_history_sample = {"address": address, "total": len(rows), "decoded": body_limit}
+            rows = rows[-body_limit:]  # rows are newest-first here; the earliest sit at the end
         if not gte:
             rows = rows[-limit:] if oldest_first else rows[:limit]
+        sampled = f" sampled={self.last_history_sample['decoded']}/{self.last_history_sample['total']}" if self.last_history_sample else ""
         log(f"HISTORY address={address} pages={page_number} signatures={len(signatures)} "
-            f"selected={len(rows)} window={'covered' if gte else 'oldest_sample' if oldest_first else 'recent_sample'} "
-            f"fetch_seconds={time.monotonic() - started:.2f}")
+            f"selected={len(rows)} window={'covered' if gte else 'oldest_sample' if oldest_first else 'recent_sample'}"
+            f"{sampled} fetch_seconds={time.monotonic() - started:.2f}")
         calls = [
             (
                 "getTransaction",
@@ -1331,6 +1593,9 @@ class Rpc:
                 "limit": 100,
             },
         )
+        history_sample = getattr(self, "last_history_sample", None)
+        history_total = history_sample["total"] if history_sample else len(transactions)
+        history_decoded = history_sample["decoded"] if history_sample else len(transactions)
         buys: list[dict[str, Any]] = []
         transfer_edges: list[tuple[str, str]] = []
         creator = None
@@ -1479,6 +1744,8 @@ class Rpc:
             "holder_sample_count": len(holders),
             "bundle_confidence": confidence,
             "creator": creator,
+            "history_total": history_total,
+            "history_decoded": history_decoded,
         }
 
     def send_raw(self, raw: bytes) -> str:
@@ -1714,6 +1981,7 @@ class Executor:
         # queue and then rediscover/process an unbounded burst before checking open positions.
         self.pending: list[dict[str, Any]] = self.state.setdefault("pending", [])
         self._prune_stale_pending()
+        self.last_entry_meta: dict[str, Any] = {}
 
     # ---- pricing helpers -------------------------------------------------
     def sol_price_usd(self) -> float:
@@ -1897,7 +2165,7 @@ class Executor:
         return signature
 
     def skip(self, mint: str, reason: str) -> None:
-        record_skip(mint, reason)
+        record_skip(mint, reason, getattr(self, "last_entry_meta", None))
         log(f"SKIP {mint}: {reason}")
 
     def entry_metadata(
@@ -1905,15 +2173,45 @@ class Executor:
     ) -> tuple[float | None, float | None, float | None, str | None, dict[str, Any]]:
         """Reject at each metadata stage before spending on the next one.
 
-        The caller logs the existing guard reason. Only candidates surviving market
-        cap, curve age and concentration reach the mandatory bundle snapshot.
+        Returns (market cap, curve age, top holder pct, top holder wallet, bundle snapshot) for
+        existing callers; everything else learned on the way (curve transaction count, creator
+        profile and holding, early seller, BOOST window) lands in self.last_entry_meta so both
+        the position record and the skip row carry it. Only candidates surviving every cheaper
+        stage reach the mandatory bundle snapshot.
         """
         cfg = self.cfg
+        meta = self.last_entry_meta
         market_cap = curve_age = top_holder_pct = None
         top_holder = None
         supply_ui = decimals = supply_raw = None
+        curve_tx_count = creator_prior_launches = creator_hold_pct = early_sell_pct = None
+        creator = early_seller = None
         not_analyzed = {"complete": False, "error": "earlier entry guard rejected; bundle not analyzed"}
-        if cfg.max_entry_market_cap_usd > 0 or cfg.min_entry_market_cap_usd > 0 or cfg.max_top_holder_pct > 0:
+
+        def rejected(bundle: dict[str, Any] | None = None) -> str | None:
+            return entry_guard_reason(
+                cfg, graduated_ts, now_ts(), None, market_cap, curve_age, top_holder_pct, bundle,
+                curve_tx_count=curve_tx_count, creator_prior_launches=creator_prior_launches,
+                creator_hold_pct=creator_hold_pct, early_sell_pct=early_sell_pct, early_seller=early_seller,
+            )
+
+        def result(bundle: dict[str, Any]):
+            meta.update({
+                "market_cap_usd": market_cap, "curve_age_seconds": curve_age,
+                "top_holder_pct": top_holder_pct, "top_holder": top_holder,
+                "curve_tx_count": curve_tx_count, "creator": creator,
+                "creator_prior_launches": creator_prior_launches, "creator_hold_pct": creator_hold_pct,
+                "early_sell_pct": early_sell_pct, "early_seller": early_seller,
+                "bundle_confidence": bundle.get("bundle_confidence"),
+                "history_total": bundle.get("history_total"), "history_decoded": bundle.get("history_decoded"),
+            })
+            for key in ("bundle_slot_pct", "cluster_pct", "dev_cluster_pct", "top10_wallet_pct",
+                        "early_buy_pct", "funder_coverage_pct"):
+                meta[key] = bundle.get(key)
+            return market_cap, curve_age, top_holder_pct, top_holder, bundle
+
+        if cfg.max_entry_market_cap_usd > 0 or cfg.min_entry_market_cap_usd > 0 or cfg.max_top_holder_pct > 0 \
+                or cfg.max_creator_hold_pct > 0 or cfg.max_early_sell_pct > 0:
             try:
                 supply_ui, decimals, supply_raw = self.rpc.token_supply_details(mint)
                 market_cap = entry_market_cap_usd(
@@ -1925,17 +2223,28 @@ class Executor:
                     f"supply_ui={supply_ui:.16g} decimals={decimals} value_usd={market_cap}")
             except Exception as exc:
                 log(f"WARN {mint}: market cap check unavailable ({describe_error(exc)})")
-        if entry_guard_reason(cfg, graduated_ts, now_ts(), None, market_cap):
-            return market_cap, curve_age, top_holder_pct, top_holder, not_analyzed
-        if cfg.min_curve_age_seconds > 0:
+        if rejected():
+            return result(not_analyzed)
+        created = None
+        if cfg.min_curve_age_seconds > 0 or cfg.min_curve_transactions > 0 or cfg.max_creator_prior_launches > 0 \
+                or cfg.max_creator_hold_pct > 0:
             try:
                 created = self.rpc.mint_first_seen(mint, graduated_ts - cfg.min_curve_age_seconds)
                 if created is not None:
                     curve_age = max(0.0, graduated_ts - created)
             except Exception as exc:
                 log(f"WARN {mint}: curve age check unavailable ({describe_error(exc)})")
-        if entry_guard_reason(cfg, graduated_ts, now_ts(), None, market_cap, curve_age):
-            return market_cap, curve_age, top_holder_pct, top_holder, not_analyzed
+        if rejected():
+            return result(not_analyzed)
+        if cfg.min_curve_transactions > 0 and created is not None:
+            try:
+                curve_tx_count = int(self.rpc.curve_transaction_count(mint, created, graduated_ts))
+                log(f"CURVE mint={mint} successful_transactions={curve_tx_count}")
+            except Exception as exc:
+                curve_tx_count = None
+                log(f"WARN {mint}: curve activity check unavailable ({describe_error(exc)})")
+        if rejected():
+            return result(not_analyzed)
         if cfg.max_top_holder_pct > 0 and supply_ui:
             try:
                 exclude = {self.wallet.pubkey} if self.wallet else set()
@@ -1946,8 +2255,39 @@ class Executor:
                     top_holder_pct = amount / supply_raw * 100
             except Exception as exc:
                 log(f"WARN {mint}: holder concentration check unavailable ({describe_error(exc)})")
-        if entry_guard_reason(cfg, graduated_ts, now_ts(), None, market_cap, curve_age, top_holder_pct):
-            return market_cap, curve_age, top_holder_pct, top_holder, not_analyzed
+        if rejected():
+            return result(not_analyzed)
+        if cfg.max_creator_prior_launches > 0 or cfg.max_creator_hold_pct > 0:
+            try:
+                creator = self.rpc.mint_creator(mint)
+                if isinstance(creator, str) and creator:
+                    if cfg.max_creator_hold_pct > 0 and supply_raw:
+                        held = int(self.rpc.token_balance(creator, mint))
+                        creator_hold_pct = held / supply_raw * 100
+                    if cfg.max_creator_prior_launches > 0 and created is not None:
+                        profile = self.rpc.creator_profile(creator, mint, created)
+                        creator_prior_launches = int(profile["prior_launches"])
+                        log(f"CREATOR mint={mint} wallet={creator} prior_launches={creator_prior_launches} "
+                            f"sampled={profile.get('sampled_signatures')} holds={creator_hold_pct if creator_hold_pct is None else round(creator_hold_pct, 2)}%")
+                else:
+                    creator = None
+            except Exception as exc:
+                creator_prior_launches = creator_hold_pct = None
+                log(f"WARN {mint}: creator check unavailable ({describe_error(exc)})")
+        if rejected():
+            return result(not_analyzed)
+        if cfg.max_early_sell_pct > 0 and supply_raw:
+            try:
+                exclude = {self.wallet.pubkey} if self.wallet else set()
+                seller = self.rpc.largest_seller_since(mint, graduated_ts, supply_raw, exclude)
+                if seller:
+                    early_seller, early_sell_pct = seller[0], float(seller[1])
+                    log(f"EARLY-SELL mint={mint} wallet={early_seller} sold={early_sell_pct:.2f}% of supply since migration")
+            except Exception as exc:
+                early_sell_pct = early_seller = None
+                log(f"WARN {mint}: early-dump check unavailable ({describe_error(exc)})")
+        if rejected():
+            return result(not_analyzed)
         bundle: dict[str, Any]
         if not supply_ui or decimals is None:
             bundle = {"complete": False, "error": "token supply unavailable"}
@@ -1967,10 +2307,16 @@ class Executor:
             except Exception as exc:
                 bundle = {"complete": False, "error": describe_error(exc)}
                 log(f"WARN {mint}: bundle snapshot unavailable ({describe_error(exc)})")
-        return market_cap, curve_age, top_holder_pct, top_holder, bundle
+        return result(bundle)
 
     def try_enter(self, item: dict[str, Any], sol_price: float) -> None:
         mint = item["mint"]
+        graduated_ts = float(item["graduated_ts"])
+        since_graduation = now_ts() - graduated_ts
+        self.last_entry_meta = {
+            "seconds_after_graduation": round(since_graduation),
+            "in_boost_window": since_graduation <= self.cfg.boost_window_seconds,
+        }
         daily_pnl = float(self.state["daily"]["realized_pnl_usd"])
         # Adopted bags are money already in the market, not a choice we are making now, so they
         # do not take an entry slot: three $2 leftovers must not block every new graduation.
@@ -1985,6 +2331,7 @@ class Executor:
         if tokens <= 0:
             raise RuntimeError("zero-token quote")
         impact = quote_price_impact_pct(quote)
+        self.last_entry_meta["price_impact_pct"] = impact
         # Reject an already-invalid quote before expensive holder/history/funder queries.
         early_guard = entry_guard_reason(self.cfg, item['graduated_ts'], now_ts(), impact)
         if early_guard:
@@ -1993,8 +2340,16 @@ class Executor:
         market_cap, curve_age, top_holder_pct, top_holder, bundle = self.entry_metadata(
             mint, item["graduated_ts"], size_usd, tokens
         )
+        meta = self.last_entry_meta
+        extra = dict(
+            curve_tx_count=meta.get("curve_tx_count"),
+            creator_prior_launches=meta.get("creator_prior_launches"),
+            creator_hold_pct=meta.get("creator_hold_pct"),
+            early_sell_pct=meta.get("early_sell_pct"),
+            early_seller=meta.get("early_seller"),
+        )
         guard = entry_guard_reason(
-            self.cfg, item["graduated_ts"], now_ts(), impact, market_cap, curve_age, top_holder_pct
+            self.cfg, item["graduated_ts"], now_ts(), impact, market_cap, curve_age, top_holder_pct, **extra
         )
         if guard:
             if top_holder and "top wallet" in guard:
@@ -2010,6 +2365,7 @@ class Executor:
             curve_age,
             top_holder_pct,
             bundle,
+            **extra,
         )
         summary = " ".join(
             f"{key.removesuffix('_pct')}={bundle[key]:.1f}%"
@@ -2049,6 +2405,7 @@ class Executor:
             self.skip(mint, f"no sell route (possible honeypot): {exc}")
             return
         round_trip_pct = int(reverse_quote["outAmount"]) / lamports * 100 if lamports > 0 else 0.0
+        self.last_entry_meta["round_trip_pct"] = round_trip_pct
         if self.cfg.min_entry_round_trip_pct > 0 and round_trip_pct < self.cfg.min_entry_round_trip_pct:
             self.skip(
                 mint,
@@ -2101,6 +2458,16 @@ class Executor:
                 "entry_funder_sample_count": bundle.get("funder_sample_count"),
                 "entry_holder_sample_count": bundle.get("holder_sample_count"),
                 "entry_bundle_confidence": bundle.get("bundle_confidence"),
+                "graduated_ts": graduated_ts,
+                "entry_seconds_after_graduation": round(now_ts() - graduated_ts),
+                "entry_in_boost_window": (now_ts() - graduated_ts) <= self.cfg.boost_window_seconds,
+                "entry_curve_tx_count": meta.get("curve_tx_count"),
+                "entry_early_sell_pct": round(meta["early_sell_pct"], 2) if meta.get("early_sell_pct") is not None else None,
+                "entry_creator": meta.get("creator"),
+                "entry_creator_prior_launches": meta.get("creator_prior_launches"),
+                "entry_creator_hold_pct": round(meta["creator_hold_pct"], 2) if meta.get("creator_hold_pct") is not None else None,
+                "entry_history_total": bundle.get("history_total"),
+                "entry_history_decoded": bundle.get("history_decoded"),
                 "peak_usd": size_usd,
             }
         )
@@ -2268,6 +2635,7 @@ class Executor:
 
     def _record_close(self, pos: dict[str, Any], reason: str, exit_usd: float, sell_sig: str, sold_cost: float) -> None:
         net = exit_usd / sold_cost - 1.0 if sold_cost > 0 else 0.0
+        exit_after = round(now_ts() - float(pos["graduated_ts"])) if pos.get("graduated_ts") else None
         peak_gain = float(pos.get("peak_usd", 0.0)) / pos["position_usd"] - 1.0 if pos["position_usd"] else None
         record_trade(
             {
@@ -2300,6 +2668,17 @@ class Executor:
                 "entry_funder_sample_count": pos.get("entry_funder_sample_count"),
                 "entry_holder_sample_count": pos.get("entry_holder_sample_count"),
                 "entry_bundle_confidence": pos.get("entry_bundle_confidence"),
+                "entry_seconds_after_graduation": pos.get("entry_seconds_after_graduation"),
+                "entry_in_boost_window": pos.get("entry_in_boost_window"),
+                "exit_seconds_after_graduation": exit_after,
+                "exit_in_boost_window": (exit_after <= self.cfg.boost_window_seconds) if exit_after is not None else None,
+                "entry_curve_tx_count": pos.get("entry_curve_tx_count"),
+                "entry_early_sell_pct": pos.get("entry_early_sell_pct"),
+                "entry_creator": pos.get("entry_creator"),
+                "entry_creator_prior_launches": pos.get("entry_creator_prior_launches"),
+                "entry_creator_hold_pct": pos.get("entry_creator_hold_pct"),
+                "entry_history_total": pos.get("entry_history_total"),
+                "entry_history_decoded": pos.get("entry_history_decoded"),
                 "peak_gain_pct": round(peak_gain * 100, 1) if peak_gain is not None else None,
             }
         )
@@ -2592,6 +2971,9 @@ class Executor:
             f"round_trip>={self.cfg.min_entry_round_trip_pct:.0f}% "
             f"mcap=${self.cfg.min_entry_market_cap_usd:,.0f}-${self.cfg.max_entry_market_cap_usd:,.0f} "
             f"curve_age>={self.cfg.min_curve_age_seconds:.0f}s top_holder<={self.cfg.max_top_holder_pct:.0f}% "
+            f"curve_txs>={self.cfg.min_curve_transactions} early_sell<={self.cfg.max_early_sell_pct:.0f}% "
+            f"creator_launches<={self.cfg.max_creator_prior_launches} creator_hold<={self.cfg.max_creator_hold_pct:.0f}% "
+            f"boost_window={self.cfg.boost_window_seconds:.0f}s "
             f"bundle_slot<={self.cfg.max_bundle_slot_pct:.0f}% cluster<={self.cfg.max_cluster_pct:.0f}% "
             f"ancestry<={self.cfg.max_ancestry_cluster_pct:.0f}% transfer<={self.cfg.max_transfer_cluster_pct:.0f}% "
             f"coordinated<={self.cfg.max_coordinated_buy_pct:.0f}% repeat<={self.cfg.max_repeat_cohort_pct:.0f}% "

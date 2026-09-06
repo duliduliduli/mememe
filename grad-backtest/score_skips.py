@@ -32,6 +32,14 @@ REASON_PREFIXES = [
 
 def reason_bucket(reason: str) -> str:
     text = (reason or "").lower()
+    for needle, label in (
+        ("one-party fill", "curve activity floor"),
+        ("dump started before entry", "early dump"),
+        ("launch factory", "creator launches"),
+        ("creator still holds", "creator holding"),
+    ):
+        if needle in text:
+            return label
     for needle, label in REASON_PREFIXES:
         if needle in text:
             if needle == "market cap" and "<" in text:

@@ -233,12 +233,18 @@ prints the important ones.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MAX_PRICE_IMPACT_PCT` | `5` | Skip if the buy quote's price impact exceeds this. |
+| `MAX_PRICE_IMPACT_PCT` | `10` | Skip if the buy quote's price impact exceeds this. Raised from 5 on 2026-09-05: on a $5 order 5% is $0.25, and drained pools show 30–79%. |
 | `MIN_ENTRY_ROUND_TRIP_PCT` | `80` | Skip unless an immediate executable sell quote returns at least this percentage of the proposed input. |
-| `MAX_ENTRY_MARKET_CAP_USD` | `300000` | Skip if the implied entry market cap is above this. `0` disables. |
+| `MAX_ENTRY_MARKET_CAP_USD` | `0` | Skip if the implied entry market cap is above this. Off by default since 2026-09-05: a $2M ceiling rejected $13M–$26M graduations carrying $300K–$440K of real liquidity. |
 | `MIN_ENTRY_MARKET_CAP_USD` | `25000` | Skip if the implied entry market cap is below this. `0` disables. |
 | `MIN_CURVE_AGE_SECONDS` | `120` | Skip if the token graduated less than this many seconds after it was created. `0` disables. |
 | `MAX_TOP_HOLDER_PCT` | `20` | Skip if the largest plain-wallet holder owns more than this share of supply. `0` disables. |
+| `MIN_CURVE_TRANSACTIONS` | `150` | Skip if the bonding curve filled with fewer successful transactions than this between creation and graduation (one-party fill). Rugs seen live: 2, 9, 15; organic: 311–2,293. Signature metadata only. `0` disables. |
+| `MAX_EARLY_SELL_PCT` | `3` | Skip if any single plain wallet has already sold more than this share of supply into the pool since migration (the dump started before entry). `0` disables. |
+| `MAX_CREATOR_PRIOR_LAUNCHES` | `3` | Skip if the mint's creator has more prior Pump.fun launches than this in a bounded sample of its history (launch factory). `0` disables. |
+| `MAX_CREATOR_HOLD_PCT` | `5` | Skip if the creator still holds more than this share of supply at entry. `0` disables. |
+| `CREATOR_HISTORY_SIGNATURES` / `CREATOR_HISTORY_DECODE_LIMIT` | `100` / `60` | Creator history sample: signatures fetched before the launch, and how many are decoded to count Create instructions. |
+| `BOOST_WINDOW_SECONDS` | `300` | Pump.fun BOOST buy-and-burn window after migration. Not a guard: every position, trade row and skip row records whether entry and exit fell inside it. |
 
 Bundle graph defaults: inspect up to 50 holders and trace funding for the largest 20; block same-slot (`30%`), direct-funder
 (`30%`), two-hop ancestry (`20%`), unpaid token-transfer (`12%`), coordinated
@@ -501,12 +507,16 @@ entry can land.
    - a mandatory bundle graph over up to 50 plain-wallet holders. It combines same-slot and short-window purchases, first-three-slot purchases, top-ten concentration, direct and two-hop non-CEX funding ancestry, unpaid wallet-to-wallet token distributions, creator linkage, and wallet cohorts previously seen together. The broad 50-holder sample feeds transfer, coordination, repeat-cohort and concentration checks; funding ancestry is traced over the largest 20 holders so adding small holders does not dilute coverage. Lookup completion is measured separately from identifiable-funder coverage. With `BUNDLE_FAIL_CLOSED=1`, missing supply, creation history, purchase history, less than 80% lookup completion, or less than 30% funder coverage skips the entry; 30–60% coverage applies stricter thresholds.
 4. **`entry_guard_reason`**, first hit wins:
    1. lateness > `MAX_ENTRY_LATENESS_SECONDS` → `stale entry: Ns past target`
-   2. price impact > `MAX_PRICE_IMPACT_PCT` → `price impact X% > 5.0% (pool too thin for our size)`
+   2. price impact > `MAX_PRICE_IMPACT_PCT` → `price impact X% > 10.0% (pool too thin for our size)`
    3. market cap > `MAX_ENTRY_MARKET_CAP_USD` → `market cap $X > $Y (already pumped far past graduation)`
    4. market cap < `MIN_ENTRY_MARKET_CAP_USD` → `market cap $X < $Y (already dumped since graduation)`
-   5. curve age < `MIN_CURVE_AGE_SECONDS` → `graduated Ns after creation < 120s (curve filled by one buyer: bundle)`
-   6. top holder > `MAX_TOP_HOLDER_PCT` → `top wallet holds X% of supply > 20% (one holder can dump the pool) [wallet]`
-   7. incomplete mandatory bundle data → `bundle data unavailable (…)`
+   5. curve age < `MIN_CURVE_AGE_SECONDS` → `graduated Ns after creation < 120s (observed history does not meet minimum curve age)`
+   6. curve transactions < `MIN_CURVE_TRANSACTIONS` → `curve filled with N successful transactions < 150 (one-party fill)`
+   7. top holder > `MAX_TOP_HOLDER_PCT` → `top wallet holds X% of supply > 20% (one holder can dump the pool) [wallet]`
+   8. creator holding > `MAX_CREATOR_HOLD_PCT` → `creator still holds X% of supply > 5% (the wallet that dumps)`
+   9. creator launches > `MAX_CREATOR_PRIOR_LAUNCHES` → `creator launched N prior Pump.fun tokens > 3 (launch factory)`
+   10. early seller > `MAX_EARLY_SELL_PCT` → `a wallet already sold X% of supply since migration > 3% (dump started before entry) [wallet]`
+   11. incomplete mandatory bundle data → `bundle data unavailable (…)`. A curve window busier than the decode budget is no longer refused: the earliest rows are decoded and the snapshot reports `history_total` / `history_decoded` (log line shows `sampled=`).
    8. same-slot holdings > `MAX_BUNDLE_SLOT_PCT`
    9. largest connected funding cluster > `MAX_CLUSTER_PCT`
    10. two-hop ancestry cluster > `MAX_ANCESTRY_CLUSTER_PCT`
@@ -666,7 +676,7 @@ moon_bag = {
 | `executor.log` | every `log()` | `<ISO Z> <message>` per line |
 | `executor_state.json` | `save_state` | schema above |
 | `live_trades.csv` | closes, scale-outs, bag sells, dead-bag burns | one row per exit leg |
-| `skips.csv` | `skip()` | `timestamp,mint,reason` |
+| `skips.csv` | `skip()` | `timestamp,mint,reason` plus everything known at the time: seconds after graduation, BOOST window, market cap, impact, curve age, curve transaction count, top holder, creator, creator launches and holding, early seller, bundle metrics, history sample size, round trip |
 | `executor.stop`, `executor.panic` | server / executor | empty flag files |
 
 `live_trades.csv` columns:
@@ -954,8 +964,8 @@ Module functions:
 - `log(message)` — timestamp, print, append to `executor.log`.
 - `load_state(cfg)` / `save_state(state)` — read the state file or build a fresh one; write atomically, trimming `seen_signatures` to 500.
 - `roll_daily(state)` — reset the daily P&L on a new UTC date.
-- `record_trade(row)` — append to `live_trades.csv`, honouring an existing header.
-- `record_skip(mint, reason)` — append to `skips.csv`.
+- `record_trade(row)` — append to `live_trades.csv`. A file with an older header (missing columns now recorded) is rotated to `live_trades.<timestamp>.csv` first; a file with extra columns keeps its own header.
+- `record_skip(mint, reason, meta)` — append to `skips.csv` with the entry metadata known at the time; same rotation rule.
 - `quote_price_impact_pct(quote)` — Jupiter's fraction as a percent.
 - `describe_error(exc)` — redact API keys, name Jupiter 6001/6000, truncate.
 - `entry_market_cap_usd(size_usd, out_amount_raw, supply_ui, decimals, supply_raw=...)` — executable quote-implied FDV; production uses raw supply so decimals cancel.
@@ -1017,7 +1027,7 @@ Things that are true of the code and easy to get wrong:
 - Detection uses WebSocket signature hints plus a configurable 30-second, 10-signature RPC catch-up. A provider outage longer than the catch-up window can still miss launches, which is safer than buying stale ones.
 - Pending graduations are persisted; a restart retains them but discards any that exceed the lateness window.
 - Adopted positions have no entry price or peak history; they are managed from their adoption value.
-- `record_trade` keeps an old file's header, so columns added later are blank in an old `live_trades.csv`. Rotate the file to get the new columns.
+- `record_trade` and `record_skip` rotate a file whose header predates the current columns (`<name>.<timestamp>.csv`), so a redeploy with new columns starts a fresh file and the dashboard shows only rows since then.
 - The dashboard's paper-balance colour compares against a hard-coded 100, not `START_BALANCE`.
 - GeckoTerminal's 30-second candle endpoint may require a paid plan from some networks (a 401 was observed), in which case the backtest's entry step fails for every token.
 
