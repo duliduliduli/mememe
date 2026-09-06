@@ -8,6 +8,8 @@ OHLCV from GeckoTerminal, and simulates a +75% TP / -30% SL / 30-minute time-sto
 strategy with configurable friction costs.
 
 - Code and full usage docs: [`grad-backtest/`](grad-backtest/README.md)
+- Market-making research track for established memes (screener, recorder, replay,
+  paper engine; no live trading): [`grad-backtest/mm/`](grad-backtest/mm/README.md)
 - Public web dashboard (`server.py` + `static/`) showing equity curve, win rate,
   return distribution, recent trades, and a live activity log — deployable to
   Railway with a public URL.

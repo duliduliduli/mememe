@@ -47,6 +47,7 @@ strategy has an edge before you find out with a wallet.
    - 8.3 Outputs
    - 8.4 `optimize.py`
    - 8.5 `position_sizing.py`
+   - 8.6 Market-making research track (`mm/`)
 9. [Deployment](#9-deployment)
 10. [Tests](#10-tests)
 11. [Function-by-function reference](#11-function-by-function-reference)
@@ -113,6 +114,7 @@ mememe/
     ├── grad_backtest.py        collector + backtester (section 8)
     ├── optimize.py             parameter sweep with train/validation split
     ├── position_sizing.py      bootstrap Monte Carlo sizing
+    ├── mm/                     market-making research track: screener, recorder, replay, paper (8.6)
     ├── requirements.txt        requests, websocket-client, pandas, fastapi, uvicorn, httpx, solders
     ├── Dockerfile, railway.json   same as root, for builds rooted here
     ├── .env.example            every variable with a comment
@@ -884,6 +886,24 @@ Output `sizing_summary.json`, which the dashboard picks up as its position
 size. Trade half the recommendation live at first.
 
 ---
+
+### 8.6 Market-making research track (`mm/`)
+
+A separate lane that evaluates the alternative in the market-making brief: selective
+Meteora DLMM liquidity provision and cost-aware momentum on *established* memes (30+ days,
+$100K+ pools), instead of fresh graduates. It shares `DATA_DIR` with the executor, prefixes
+every file `mm_`, and never sends a transaction.
+
+```bash
+python -m mm costs        # break-even table
+python -m mm screen       # universe + reject log
+python -m mm record --hours 6
+python -m mm replay       # every strategy, full cost accounting
+python -m mm paper --hours 168
+```
+
+Design, the edge gate, the inventory rule, the thresholds that gate live sizing, and what
+is deliberately not built are documented in [`mm/README.md`](mm/README.md).
 
 ## 9. Deployment
 
