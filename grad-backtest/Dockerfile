@@ -16,6 +16,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY *.py ./
 COPY mm mm
 RUN cd mm/sidecar && npm ci --omit=dev --no-audit --no-fund && node -e "require('@meteora-ag/dlmm')"
+# Launch sniper lane (sniper/hunter-sniper.mjs): its parsing tests run at build time.
+COPY sniper sniper
+RUN cd sniper && npm ci --omit=dev --no-audit --no-fund && node --test lib.test.mjs && node --check hunter-sniper.mjs
 COPY static static
 COPY data/graduations.example.csv data/
 
