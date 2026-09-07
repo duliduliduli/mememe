@@ -2,6 +2,7 @@ import base64
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -100,6 +101,45 @@ class ServerTests(unittest.TestCase):
                 os.environ.pop("LOG_VIEWER_TOKEN", None)
             else:
                 os.environ["LOG_VIEWER_TOKEN"] = old_viewer
+
+
+class AutostartTests(unittest.TestCase):
+    KEYS = ("EXECUTOR_AUTOSTART", "EXECUTOR_MODE", "WALLET_PRIVATE_KEY", "MM_AUTOSTART", "MM_MODE", "RUN_BOTH_LANES")
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in self.KEYS}
+        for k in self.KEYS:
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _run(self, **env):
+        os.environ.update(env)
+        started = []
+        with patch.object(server, "_start_executor", lambda: started.append(True)), \
+                patch.object(server, "_executor_running", lambda: False):
+            server.maybe_autostart_executor()
+        return bool(started)
+
+    def test_executor_stays_off_when_mm_lane_is_live(self):
+        self.assertFalse(self._run(EXECUTOR_AUTOSTART="1", EXECUTOR_MODE="live", WALLET_PRIVATE_KEY="k"))
+
+    def test_run_both_lanes_restores_executor(self):
+        self.assertTrue(self._run(EXECUTOR_AUTOSTART="1", EXECUTOR_MODE="live", WALLET_PRIVATE_KEY="k",
+                                  RUN_BOTH_LANES="1"))
+
+    def test_executor_runs_when_mm_lane_is_paper_or_off(self):
+        self.assertTrue(self._run(EXECUTOR_AUTOSTART="1", EXECUTOR_MODE="paper"))
+        self.assertTrue(self._run(EXECUTOR_AUTOSTART="1", EXECUTOR_MODE="live", WALLET_PRIVATE_KEY="k",
+                                  MM_AUTOSTART="0"))
+
+    def test_executor_autostart_still_opt_in(self):
+        self.assertFalse(self._run(EXECUTOR_MODE="live", WALLET_PRIVATE_KEY="k", RUN_BOTH_LANES="1"))
 
 
 if __name__ == "__main__":

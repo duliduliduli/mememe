@@ -512,10 +512,24 @@ def maybe_autostart_mm() -> None:
         print("[server] MM_AUTOSTART=0: market-making lane NOT started", flush=True)
 
 
+def _mm_owns_wallet() -> bool:
+    """True when the market-making lane is live on this deployment: the graduation
+    executor then stays off unless RUN_BOTH_LANES=1, so the two lanes never trade
+    the same wallet against each other."""
+    return _mm_autostart() and _mm_mode() == "live" and os.getenv("RUN_BOTH_LANES", "0") != "1"
+
+
 @app.on_event("startup")
 def maybe_autostart_executor() -> None:
     autostart = os.getenv("EXECUTOR_AUTOSTART", "0") == "1"
     mode = os.getenv("EXECUTOR_MODE", "paper")
+    if autostart and _mm_owns_wallet():
+        print(
+            "[server] market-making lane is live; graduation executor NOT started "
+            "(set RUN_BOTH_LANES=1 to run both lanes on the same wallet)",
+            flush=True,
+        )
+        return
     if autostart and not _executor_running():
         _start_executor()
         print(f"[server] autostart enabled: launched executor in {mode} mode", flush=True)

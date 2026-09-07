@@ -142,6 +142,20 @@ class LadderTests(unittest.TestCase):
         self.assertAlmostEqual(impact_at_size(rows, 550), 0.55)
         self.assertIsNone(depth_at_impact([{"size_usd": 1, "impact_pct": None}], 1))
 
+    def test_ladder_treats_dust_quotes_as_unknown(self):
+        from unittest.mock import MagicMock
+        from mm.sources import Jupiter
+        jup = Jupiter(MagicMock(), MagicMock(jupiter_base="http://x"))
+        # 1 unit out per 1e6 raw in at $10, then a broken route that returns dust at $40
+        jup.quote = MagicMock(side_effect=[{"outAmount": "1000000", "routePlan": []},
+                                           {"outAmount": "1", "routePlan": []}])
+        rows = jup.exit_ladder("mint", 6, 1.0, [40.0, 10.0])
+        self.assertEqual([r["size_usd"] for r in rows], [10.0, 40.0])
+        self.assertAlmostEqual(rows[0]["impact_pct"], 0.0)
+        self.assertIsNone(rows[1]["impact_pct"])
+        self.assertIsNone(impact_at_size(rows, 40.0))
+        self.assertAlmostEqual(impact_at_size(rows, 10.0), 0.0)
+
     def test_transfer_fee_reads_newest_schedule(self):
         self.assertEqual(transfer_fee_bps({"transferFeeConfig": {"olderTransferFee": {"transferFeeBasisPoints": 50},
                                                                  "newerTransferFee": {"transferFeeBasisPoints": 75}}}), 75)
