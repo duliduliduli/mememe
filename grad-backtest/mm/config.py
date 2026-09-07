@@ -34,7 +34,13 @@ def _int(name: str, default: int) -> int:
 
 
 def _pct(name: str, default: float) -> float:
-    value = _float(name, default)
+    """Percent from the environment; a fraction (0 < v <= 1) is read as a percent, so
+    MM_X_PCT=0.5 means 50%. Defaults are already percents and are never rescaled: 0.10
+    means 0.10%, not 10%."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    value = float(raw)
     return value * 100 if 0 < value <= 1 else value
 
 

@@ -200,5 +200,21 @@ class AccountingTests(unittest.TestCase):
         self.assertEqual(report["ranking"][0], max(report["strategies"], key=lambda k: report["strategies"][k]["final_nlv"]))
 
 
+class ConfigTests(unittest.TestCase):
+    def test_percent_defaults_are_not_rescaled(self):
+        import os
+        for key in ("MM_MODEL_ERROR_PCT", "MM_ROUTINE_EXIT_IMPACT_PCT"):
+            os.environ.pop(key, None)
+        cfg = MMConfig.from_env()
+        self.assertAlmostEqual(cfg.model_error_pct, MMConfig().model_error_pct)
+        self.assertAlmostEqual(cfg.routine_exit_impact_pct, MMConfig().routine_exit_impact_pct)
+        self.assertLess(cfg.model_error_pct, 1.0)
+        os.environ["MM_MODEL_ERROR_PCT"] = "0.5"
+        try:
+            self.assertAlmostEqual(MMConfig.from_env().model_error_pct, 50.0)
+        finally:
+            os.environ.pop("MM_MODEL_ERROR_PCT", None)
+
+
 if __name__ == "__main__":
     unittest.main()

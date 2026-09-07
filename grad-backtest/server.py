@@ -593,6 +593,22 @@ def sniper_stop(request: Request) -> JSONResponse:
     return JSONResponse({"stopped": True})
 
 
+@app.post("/api/sniper/test")
+async def sniper_test(request: Request) -> JSONResponse:
+    """Queue a dry-run exercise of the buy path for the given text (address extraction,
+    chain detection, quote). The lane picks it up on its next poll and logs the outcome."""
+    _require_admin(request)
+    body = await request.json()
+    text = str((body or {}).get("text") or "").strip()
+    if not text:
+        raise HTTPException(400, "body must be {\"text\": \"... contract address ...\"}")
+    if not _sniper_running():
+        raise HTTPException(409, "sniper not running")
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    (DATA_DIR / "sniper-test.json").write_text(json.dumps({"text": text}))
+    return JSONResponse({"queued": True, "note": "watch the log for [test] lines within one poll"})
+
+
 @app.on_event("startup")
 def maybe_autostart_sniper() -> None:
     if _sniper_autostart() and not _sniper_running():
