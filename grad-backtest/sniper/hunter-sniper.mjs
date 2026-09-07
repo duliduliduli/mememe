@@ -36,6 +36,19 @@ const flag = (k, d) => { const v = env(k, '').trim().toLowerCase(); return v ===
 const DATA_DIR = env('DATA_DIR', path.resolve('data'));
 const BS58 = bs58.default || bs58;
 
+/** RPC endpoints to try for an EVM chain, best first: an explicit variable, then the same
+ *  Alchemy app the Solana lanes already use (Alchemy keys work across chains; only the
+ *  subdomain changes), then a public endpoint. The first one that answers with the right
+ *  chain id wins at startup. */
+function evmRpcCandidates(chainId) {
+  const explicit = env(chainId === 8453 ? 'BASE_RPC' : 'ETH_RPC').trim();
+  const out = explicit ? [explicit] : [];
+  const solanaRpc = (env('RPC_URLS') || env('RPC_URL') || '').split(/[,\n]/).map((s) => s.trim()).find((u) => /solana-mainnet\.g\.alchemy\.com/.test(u));
+  if (solanaRpc) out.push(solanaRpc.replace('solana-mainnet.g.alchemy.com', chainId === 8453 ? 'base-mainnet.g.alchemy.com' : 'eth-mainnet.g.alchemy.com'));
+  out.push(chainId === 8453 ? 'https://mainnet.base.org' : 'https://ethereum-rpc.publicnode.com');
+  return [...new Set(out)];
+}
+
 const CFG = {
   handle: env('SNIPER_TARGET', env('TARGET_USERNAME', 'hunterbiden')).replace(/^@/, '').toLowerCase(),
   pollMs: Math.max(3000, num('SNIPER_POLL_MS', num('POLL_MS', 10000))),
@@ -57,9 +70,9 @@ const CFG = {
   evm: {
     key: env('SNIPER_EVM_PRIVATE_KEY', env('PRIVATE_KEY')).trim(),
     spendEth: env('SNIPER_SPEND_ETH', env('SPEND_ETH', '0.1')),
-    zeroExKey: env('ZEROEX_API_KEY').trim(),
+    zeroExKey: env('ZEROEX_API_KEY').trim(),                    // optional: 0x is tried first when present
     priorityGwei: num('SNIPER_PRIORITY_FEE_GWEI', num('PRIORITY_FEE_GWEI', 3)),
-    rpcs: { 8453: env('BASE_RPC', 'https://mainnet.base.org'), 1: env('ETH_RPC', 'https://ethereum-rpc.publicnode.com') },
+    rpcs: { 8453: evmRpcCandidates(8453), 1: evmRpcCandidates(1) },
   },
   sol: {
     key: env('SNIPER_SOL_PRIVATE_KEY', env('WALLET_PRIVATE_KEY')).trim(),
@@ -127,12 +140,26 @@ async function fetchJson(url, opts = {}, timeoutMs = 30000) {
 // ---------------------------------------------------------------------------------------
 // Wallets
 // ---------------------------------------------------------------------------------------
-const evm = { providers: {}, wallets: {} };
-if (CFG.evm.key) {
-  for (const [id, url] of Object.entries(CFG.evm.rpcs)) {
+const evm = { providers: {}, wallets: {}, rpc: {} };
+async function connectEvm() {
+  if (!CFG.evm.key) return;
+  for (const [id, candidates] of Object.entries(CFG.evm.rpcs)) {
     const chainId = Number(id);
-    evm.providers[chainId] = new ethers.JsonRpcProvider(url, chainId, { staticNetwork: true });
-    evm.wallets[chainId] = new ethers.Wallet(CFG.evm.key, evm.providers[chainId]);
+    for (const url of candidates) {
+      const provider = new ethers.JsonRpcProvider(url, chainId, { staticNetwork: true });
+      try {
+        const ctl = new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 8000));
+        await Promise.race([provider.getBlockNumber(), ctl]);
+        evm.providers[chainId] = provider;
+        evm.wallets[chainId] = new ethers.Wallet(CFG.evm.key, provider);
+        evm.rpc[chainId] = url;
+        break;
+      } catch (e) {
+        log(`[rpc] ${CHAIN_NAMES[chainId]} endpoint ${redact(url)} unusable (${e.message}); trying next`);
+        provider.destroy();
+      }
+    }
+    if (!evm.providers[chainId]) log(`[rpc] no working ${CHAIN_NAMES[chainId]} endpoint; ${CHAIN_NAMES[chainId]} buys are off`);
   }
 }
 const sol = { connection: null, keypair: null };
@@ -140,7 +167,7 @@ if (CFG.sol.key) {
   sol.keypair = Keypair.fromSecretKey(BS58.decode(CFG.sol.key));
   sol.connection = new Connection(CFG.sol.rpc, { commitment: 'confirmed' });
 }
-const evmEnabled = () => Boolean(CFG.evm.key && CFG.evm.zeroExKey);
+const evmEnabled = () => Boolean(CFG.evm.key && Object.keys(evm.providers).length);
 const solEnabled = () => Boolean(sol.keypair);
 
 // ---------------------------------------------------------------------------------------
@@ -341,7 +368,7 @@ async function resolveTarget(blob) {
     if (!ethers.isAddress(a)) continue;
     const chainId = evmEnabled() ? await detectEvm(a) : null;
     if (chainId) return { chain: chainId, address: ethers.getAddress(a) };
-    if (!evmEnabled()) log(`[detect] EVM address ${a} seen but EVM buying is not configured (SNIPER_EVM_PRIVATE_KEY + ZEROEX_API_KEY)`);
+    if (!evmEnabled()) log(`[detect] EVM address ${a} seen but EVM buying is not configured (SNIPER_EVM_PRIVATE_KEY)`);
   }
   for (const m of solAddrs) {
     if (m === WSOL) continue;
@@ -381,34 +408,68 @@ async function withRouteRetry(fn, label) {
   }
 }
 
+const KYBER_CHAINS = { 8453: 'base', 1: 'ethereum' };
+
+/** 0x Swap API v2 (needs ZEROEX_API_KEY). Returns {to, data, value, gas, buyAmount, via}. */
+async function quote0x(chainId, tokenAddr, sellAmount, taker, slippageBps) {
+  const q = new URLSearchParams({ chainId: String(chainId), sellToken: NATIVE_ETH, buyToken: tokenAddr, sellAmount, taker, slippageBps: String(slippageBps) });
+  const r = await fetchJson(`https://api.0x.org/swap/allowance-holder/quote?${q}`, { headers: { '0x-api-key': CFG.evm.zeroExKey, '0x-version': 'v2' } }, 15000);
+  if (!r.ok) throw new Error(`0x quote ${r.status}: ${r.text.slice(0, 300)}`);
+  const quote = r.json || {};
+  if (quote.liquidityAvailable === false || !quote.transaction) throw new Error(`no route: 0x ${r.text.slice(0, 200)}`);
+  return { to: quote.transaction.to, data: quote.transaction.data, value: BigInt(quote.transaction.value || sellAmount), gas: BigInt(quote.transaction.gas || 0), buyAmount: quote.buyAmount, via: '0x' };
+}
+
+/** KyberSwap aggregator (no key): routes across Uniswap v2/v3/v4, Aerodrome and the rest. */
+async function quoteKyber(chainId, tokenAddr, sellAmount, taker, slippageBps) {
+  const chain = KYBER_CHAINS[chainId];
+  const headers = { 'x-client-id': 'mememe-sniper', 'Content-Type': 'application/json' };
+  const q = new URLSearchParams({ tokenIn: NATIVE_ETH, tokenOut: tokenAddr, amountIn: sellAmount, gasInclude: 'true' });
+  const r = await fetchJson(`https://aggregator-api.kyberswap.com/${chain}/api/v1/routes?${q}`, { headers }, 15000);
+  const summary = r.json?.data?.routeSummary;
+  if (!r.ok || !summary || !r.json?.data?.routerAddress) throw new Error(`no route: kyber routes ${r.status} ${r.text.slice(0, 200)}`);
+  const build = await fetchJson(`https://aggregator-api.kyberswap.com/${chain}/api/v1/route/build`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ routeSummary: summary, sender: taker, recipient: taker, slippageTolerance: slippageBps, deadline: Math.floor(Date.now() / 1000) + 120, source: 'mememe-sniper', enableGasEstimation: false }),
+  }, 15000);
+  const d = build.json?.data;
+  if (!build.ok || !d?.data || !d?.routerAddress) throw new Error(`kyber build ${build.status}: ${build.text.slice(0, 300)}`);
+  return { to: d.routerAddress, data: d.data, value: BigInt(d.amountIn || sellAmount), gas: BigInt(d.gas || 0), buyAmount: d.amountOut || summary.amountOut, via: 'kyberswap' };
+}
+
 async function buyEvm(chainId, tokenAddr) {
   const wallet = evm.wallets[chainId];
   const provider = evm.providers[chainId];
   const sellAmount = ethers.parseEther(CFG.evm.spendEth).toString();
-  return withRouteRetry(async (slippageBps) => {
-    const q = new URLSearchParams({ chainId: String(chainId), sellToken: NATIVE_ETH, buyToken: tokenAddr, sellAmount, taker: wallet.address, slippageBps: String(slippageBps) });
-    const r = await fetchJson(`https://api.0x.org/swap/allowance-holder/quote?${q}`, { headers: { '0x-api-key': CFG.evm.zeroExKey, '0x-version': 'v2' } }, 15000);
-    if (!r.ok) throw new Error(`0x quote ${r.status}: ${r.text.slice(0, 300)}`);
-    const quote = r.json || {};
-    if (quote.liquidityAvailable === false || !quote.transaction) throw new Error(`no route: ${r.text.slice(0, 200)}`);
+  const aggregators = [...(CFG.evm.zeroExKey ? [quote0x] : []), quoteKyber];
+  return withRouteRetry(async (slippageBps, attempt) => {
+    let quote = null;
+    const errors = [];
+    for (const agg of aggregators) {
+      try { quote = await agg(chainId, tokenAddr, sellAmount, wallet.address, slippageBps); break; } catch (e) { errors.push(e.message); }
+    }
+    if (!quote) throw new Error(errors.join(' | '));
     const fee = await provider.getFeeData();
     const priority = ethers.parseUnits(String(CFG.evm.priorityGwei), 'gwei');
     const base = fee.maxFeePerGas || fee.gasPrice || priority;
-    const tx = {
-      to: quote.transaction.to, data: quote.transaction.data, value: BigInt(quote.transaction.value || sellAmount),
-      gasLimit: BigInt(quote.transaction.gas || 600000) * 13n / 10n, maxPriorityFeePerGas: priority, maxFeePerGas: base * 2n + priority, chainId,
-    };
+    let gasLimit = quote.gas > 0n ? quote.gas * 13n / 10n : 0n;
+    if (gasLimit === 0n) {
+      try { gasLimit = (await provider.estimateGas({ to: quote.to, data: quote.data, value: quote.value, from: wallet.address })) * 13n / 10n; } catch (e) {
+        throw new Error(`no route: simulation failed via ${quote.via}: ${String(e.shortMessage || e.message).slice(0, 160)}`);
+      }
+    }
+    const tx = { to: quote.to, data: quote.data, value: quote.value, gasLimit, maxPriorityFeePerGas: priority, maxFeePerGas: base * 2n + priority, chainId };
     if (CFG.dryRun) {
-      log(`[DRY RUN] would buy ${tokenAddr} on ${CHAIN_NAMES[chainId]} for ${CFG.evm.spendEth} ETH; est. out ${quote.buyAmount}`);
+      log(`[DRY RUN] would buy ${tokenAddr} on ${CHAIN_NAMES[chainId]} for ${CFG.evm.spendEth} ETH via ${quote.via}; est. out ${quote.buyAmount} (attempt ${attempt})`);
       return { hash: 'DRY_RUN', chain: CHAIN_NAMES[chainId], spend: `${CFG.evm.spendEth} ETH` };
     }
     const sent = await wallet.sendTransaction(tx);
-    log(`[buy] ${CHAIN_NAMES[chainId]} tx sent ${sent.hash}`);
+    log(`[buy] ${CHAIN_NAMES[chainId]} tx sent ${sent.hash} via ${quote.via}`);
     const receipt = await sent.wait(1);
     if (receipt.status !== 1) throw new Error(`tx ${sent.hash} reverted`);
     log(`[buy] confirmed in block ${receipt.blockNumber}`);
     return { hash: sent.hash, chain: CHAIN_NAMES[chainId], spend: `${CFG.evm.spendEth} ETH` };
-  }, `0x:${CHAIN_NAMES[chainId]}`);
+  }, `swap:${CHAIN_NAMES[chainId]}`);
 }
 
 async function buySolana(mint) {
@@ -535,14 +596,15 @@ async function tick() {
 
 async function main() {
   if (!CFG.xaiKey && !CFG.bearer) { log('no source configured: set XAI_API_KEY (Grok x_search) or TWITTER_BEARER_TOKEN (X API v2)'); process.exit(1); }
-  if (!evmEnabled() && !solEnabled()) { log('no wallet configured: set WALLET_PRIVATE_KEY (Solana) and/or SNIPER_EVM_PRIVATE_KEY + ZEROEX_API_KEY (Base/Ethereum)'); process.exit(1); }
   log(`watching @${CFG.handle} every ${CFG.pollMs / 1000}s via ${[CFG.bearer && 'X API', CFG.xaiKey && `Grok ${CFG.xaiModel}`].filter(Boolean).join(' + ')}; `
     + `dryRun=${CFG.dryRun} verify=${CFG.verify} routeWait=${CFG.routeWaitS}s slippage=${CFG.slippageBps}-${CFG.maxSlippageBps}bps`);
+  await connectEvm();
+  if (!evmEnabled() && !solEnabled()) { log('no wallet configured: set WALLET_PRIVATE_KEY (Solana) and/or SNIPER_EVM_PRIVATE_KEY (Base/Ethereum)'); process.exit(1); }
   if (evmEnabled()) {
-    const addr = evm.wallets[1].address;
+    const addr = Object.values(evm.wallets)[0].address;
     const bals = await Promise.all(Object.entries(evm.providers).map(async ([id, p]) => { try { return `${CHAIN_NAMES[id]} ${ethers.formatEther(await p.getBalance(addr))} ETH`; } catch { return `${CHAIN_NAMES[id]} ?`; } }));
-    log(`EVM wallet ${addr}: ${bals.join(', ')}; spend cap ${CFG.evm.spendEth} ETH per buy`);
-  } else log('EVM buying off (needs SNIPER_EVM_PRIVATE_KEY + ZEROEX_API_KEY)');
+    log(`EVM wallet ${addr}: ${bals.join(', ')}; spend cap ${CFG.evm.spendEth} ETH per buy; router ${CFG.evm.zeroExKey ? '0x then KyberSwap' : 'KyberSwap'}; rpc ${Object.entries(evm.rpc).map(([id, u]) => `${CHAIN_NAMES[id]}=${redact(u).replace(/\/v2\/.*/, '/v2/***')}`).join(' ')}`);
+  } else log('EVM buying off (needs SNIPER_EVM_PRIVATE_KEY: a burner Base wallet private key)');
   if (solEnabled()) {
     let bal = '?';
     try { bal = ((await sol.connection.getBalance(sol.keypair.publicKey)) / LAMPORTS_PER_SOL).toFixed(4); } catch { /* keep ? */ }
