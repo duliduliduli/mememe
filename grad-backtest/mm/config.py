@@ -75,6 +75,7 @@ class MMConfig:
 
     # Strategy
     horizon_hours: float = 6.0
+    why_out_interval_minutes: float = 15.0  # how often the live candidate logs why it holds nothing
     range_width_sigma: float = 2.0            # half-width = sigma_hourly * sqrt(horizon) * this
     min_range_half_width_pct: float = 3.0
     max_range_half_width_pct: float = 25.0
@@ -141,6 +142,7 @@ class MMConfig:
         cfg.emergency_exit_impact_pct = _pct("MM_EMERGENCY_EXIT_IMPACT_PCT", cfg.emergency_exit_impact_pct)
         cfg.exit_depth_multiple = _float("MM_EXIT_DEPTH_MULTIPLE", cfg.exit_depth_multiple)
         cfg.horizon_hours = _float("MM_HORIZON_HOURS", cfg.horizon_hours)
+        cfg.why_out_interval_minutes = _float("MM_WHY_OUT_INTERVAL_MINUTES", cfg.why_out_interval_minutes)
         cfg.range_width_sigma = _float("MM_RANGE_WIDTH_SIGMA", cfg.range_width_sigma)
         cfg.min_range_half_width_pct = _pct("MM_MIN_RANGE_HALF_WIDTH_PCT", cfg.min_range_half_width_pct)
         cfg.max_range_half_width_pct = _pct("MM_MAX_RANGE_HALF_WIDTH_PCT", cfg.max_range_half_width_pct)

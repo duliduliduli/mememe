@@ -119,6 +119,26 @@ class RiskControllerTests(unittest.TestCase):
         p.daily_pnl = -self.cfg.daily_loss_limit_usd
         self.assertIn("daily loss limit", rc.stops(row(0, 1.0), Regime(SIDEWAYS), p, {}))
 
+    def test_missing_exit_quote_blocks_entry_but_does_not_force_exit(self):
+        rc = RiskController(self.cfg)
+        p = AdaptiveDLMM(self.cfg, 87.0).portfolio
+        r = row(0, 1.0, impact=None, errors="exit ladder returned no usable quote")
+        self.assertEqual(rc.stops(r, Regime(SIDEWAYS), p, {}), [])
+        self.assertIn("no exit quote", rc.entry_blocks(r, Regime(SIDEWAYS), p, {}, 40.0))
+        r = row(0, 1.0, impact=None, errors="exit ladder: 429; rpc down")
+        self.assertTrue(any("rpc down" in s and "exit ladder" not in s for s in rc.stops(r, Regime(SIDEWAYS), p, {})))
+
+    def test_adaptive_explains_why_it_stays_out(self):
+        strat = AdaptiveDLMM(self.cfg, 87.0)
+        self.assertIsNone(strat.why_out())
+        # 50%/h realized vol: the drift term swamps any fee yield, so the gate says no.
+        strat.step(row(0, 1.0, impact=0.05), Regime(SIDEWAYS, sigma_hourly=0.5), {})
+        line = strat.why_out()
+        self.assertIsNotNone(line)
+        self.assertIn("STAY_OUT best", line)
+        self.assertIn("drift", line)
+        self.assertEqual(strat.portfolio.lp, {})
+
     def test_emergency_withdraw_on_stop(self):
         cfg = MMConfig(data_dir=Path(tempfile.mkdtemp()), reentry_cooldown_minutes=0, model_error_pct=0.0)
         strat = AdaptiveDLMM(cfg, 87.0)

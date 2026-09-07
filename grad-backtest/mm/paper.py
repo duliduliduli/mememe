@@ -42,6 +42,7 @@ class PaperEngine:
         self.universe_refreshed = cfg.universe_file.stat().st_mtime if self.universe else 0.0
         self.events_written = {s.name: len(s.portfolio.events) for s in self.engine.strategies}
         self.wallet_sol: float | None = None
+        self.last_why_out = 0.0
 
     @property
     def out_dir(self) -> Path:
@@ -122,6 +123,21 @@ class PaperEngine:
         self.save()
         summary = ", ".join(f"{n}={v:.2f}" for n, v in marks.items())
         self.log(f"tick: {len(rows)} snapshots; NLV {summary}")
+        self.log_why_out(now)
+
+    def log_why_out(self, now: float) -> None:
+        """Every why_out_interval, say why the adaptive strategy holds no position, so a quiet
+        log reads as a decision rather than a stall."""
+        if now - self.last_why_out < self.cfg.why_out_interval_minutes * 60:
+            return
+        for strategy in self.engine.strategies:
+            why = getattr(strategy, "why_out", None)
+            if why is None or strategy.portfolio.lp or strategy.portfolio.spot:
+                continue
+            line = why()
+            if line:
+                self.log(f"[{strategy.name}] {line}")
+        self.last_why_out = now
 
     def run(self, hours: float) -> None:
         deadline = time.time() + hours * 3600
