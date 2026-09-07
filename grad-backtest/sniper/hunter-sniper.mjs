@@ -185,9 +185,9 @@ const GROK_SYSTEM = 'You are a monitoring tool, not a chat assistant. You answer
   + 'Never invent, paraphrase or summarize posts: copy their text verbatim, including every URL and every token contract address. '
   + 'If you cannot find a matching post with certainty, return [].';
 
-async function grokRequest(userPrompt, timeoutMs = 45000) {
+async function grokRequest(userPrompt, timeoutMs = 45000, fromDate = null) {
   const today = new Date();
-  const fromDate = new Date(today.getTime() - 24 * 3600 * 1000).toISOString().slice(0, 10);
+  fromDate = fromDate || new Date(today.getTime() - 24 * 3600 * 1000).toISOString().slice(0, 10);
   // Citations are returned by default on the Responses API; optional arguments are dropped
   // one by one if the API says it does not support them, so a schema change never stalls us.
   const body = {
@@ -214,6 +214,23 @@ async function grokRequest(userPrompt, timeoutMs = 45000) {
     if (!r.ok) throw new Error(`xAI ${r.status}: ${r.text.slice(0, 300)}`);
     return collectResponseText(r.json ?? {});
   }
+}
+
+/** One-time startup read of the account's latest post, any age: proves the model can see
+ *  the account before we rely on it. Never acted on (it is older than the start). */
+async function grokProbe() {
+  const prompt = `Using x_search, find the single most recent post published by @${CFG.handle} (any date within the last 30 days). `
+    + 'Reply with ONLY a JSON array with that one post, no prose, no markdown: '
+    + '[{"id":"<numeric status id>","url":"https://x.com/' + CFG.handle + '/status/<id>","created_at":"<ISO 8601 UTC>","text":"<full verbatim text>"}]. Return [] if none.';
+  const fromDate = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString().slice(0, 10);
+  const { text, urls } = await grokRequest(prompt, 60000, fromDate);
+  const rows = parseTweetsJson(text);
+  const row = rows[0] || (statusRefs(urls.join(' ')).find((r) => r.handle === CFG.handle) ? { id: statusRefs(urls.join(' ')).find((r) => r.handle === CFG.handle).id, text: '' } : null);
+  if (!row) { log(`[probe] Grok returned no post for @${CFG.handle}; raw: ${text.replace(/\s+/g, ' ').slice(0, 200)}`); return; }
+  const ageMin = ((Date.now() - (tweetTimeMs(row) ?? Date.now())) / 60000).toFixed(0);
+  log(`[probe] Grok can read @${CFG.handle}: latest post ${row.id} (${ageMin} min old): ${(row.text || '').replace(/\s+/g, ' ').slice(0, 140)}`);
+  // Only an old post is retired here; a post fresh enough to act on stays for the poll loop.
+  if (Number(ageMin) * 60 > CFG.maxAgeS && !state.seen.includes(row.id)) { state.seen.push(row.id); saveState(state); }
 }
 
 async function grokTweets() {
@@ -470,17 +487,31 @@ async function handleTweet(tweet) {
 }
 
 let backoffMs = 0;
+const stats = { polls: 0, ok: 0, errors: 0, posts: 0, lastHeartbeat: Date.now() };
+const HEARTBEAT_MS = Math.max(60000, num('SNIPER_HEARTBEAT_MS', 300000));
+
+function heartbeat() {
+  if (Date.now() - stats.lastHeartbeat < HEARTBEAT_MS) return;
+  stats.lastHeartbeat = Date.now();
+  log(`[heartbeat] ${stats.polls} polls, ${stats.ok} ok, ${stats.errors} errors, ${stats.posts} posts seen, `
+    + `${Object.keys(state.pending).length} pending; dryRun=${CFG.dryRun} bought=${state.bought}`);
+}
+
 async function tick() {
   const tweets = [];
+  stats.polls += 1;
   if (CFG.bearer) {
-    try { tweets.push(...await xApiTweets()); } catch (e) { log(`[x] ${e.message}`); }
+    try { tweets.push(...await xApiTweets()); stats.ok += 1; } catch (e) { stats.errors += 1; log(`[x] ${e.message}`); }
   }
   if (CFG.xaiKey && (!CFG.bearer || tweets.length === 0)) {
-    try { tweets.push(...await grokTweets()); backoffMs = 0; } catch (e) {
+    try { tweets.push(...await grokTweets()); backoffMs = 0; stats.ok += 1; } catch (e) {
+      stats.errors += 1;
       backoffMs = e.retryAfterMs || Math.min(60000, (backoffMs || 5000) * 2);
       log(`[grok] ${e.message} (backing off ${backoffMs / 1000}s)`);
     }
   }
+  stats.posts += tweets.filter((t) => !state.seen.includes(t.id)).length;
+  heartbeat();
   // Retry posts that were seen but not settled (unverified, no route yet, buy failed).
   for (const [id, entry] of Object.entries(state.pending)) {
     if (!tweets.some((t) => t.id === id)) tweets.push(entry.tweet);
@@ -519,6 +550,9 @@ async function main() {
   } else log('Solana buying off (needs WALLET_PRIVATE_KEY)');
   if (state.bought) log(`already bought once: ${JSON.stringify(state.buy)} — delete ${CFG.stateFile} to arm again`);
   if (CFG.dryRun) log('DRY RUN: nothing will be sent. Set SNIPER_DRY_RUN=false to go live.');
+  if (CFG.xaiKey) {
+    try { await grokProbe(); } catch (e) { log(`[probe] Grok read failed: ${e.message}`); }
+  }
   for (;;) {
     try { await tick(); } catch (e) { log(`[tick] ${e.message}`); }
     await sleep(CFG.pollMs + backoffMs);
