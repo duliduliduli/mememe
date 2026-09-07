@@ -570,6 +570,7 @@ def sniper_status() -> JSONResponse:
         "buy": state.get("buy"),
         "seen_posts": len(state.get("seen") or []),
         "pending_posts": len(state.get("pending") or {}),
+        "position": state.get("position"),
     })
 
 
@@ -607,6 +608,19 @@ async def sniper_test(request: Request) -> JSONResponse:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     (DATA_DIR / "sniper-test.json").write_text(json.dumps({"text": text}))
     return JSONResponse({"queued": True, "note": "watch the log for [test] lines within one poll"})
+
+
+@app.post("/api/sniper/sell")
+def sniper_sell(request: Request) -> JSONResponse:
+    """Sell the sniped bag now at whatever it fetches, instead of waiting for take profit."""
+    _require_admin(request)
+    if not _sniper_running():
+        raise HTTPException(409, "sniper not running")
+    if not _sniper_state().get("position"):
+        raise HTTPException(409, "no position to sell")
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    (DATA_DIR / "sniper-sell.json").write_text(json.dumps({"requested_at": datetime.now(timezone.utc).isoformat()}))
+    return JSONResponse({"queued": True, "note": "sold on the next check; watch the log for [tp] lines"})
 
 
 @app.on_event("startup")

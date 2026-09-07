@@ -430,21 +430,28 @@ async function withRouteRetry(fn, label) {
 
 const KYBER_CHAINS = { 8453: 'base', 1: 'ethereum' };
 
+const ERC20_ABI = [
+  'function balanceOf(address) view returns (uint256)',
+  'function allowance(address,address) view returns (uint256)',
+  'function approve(address,uint256) returns (bool)',
+];
+
 /** 0x Swap API v2 (needs ZEROEX_API_KEY). Returns {to, data, value, gas, buyAmount, via}. */
-async function quote0x(chainId, tokenAddr, sellAmount, taker, slippageBps) {
-  const q = new URLSearchParams({ chainId: String(chainId), sellToken: NATIVE_ETH, buyToken: tokenAddr, sellAmount, taker, slippageBps: String(slippageBps) });
+async function quote0x(chainId, tokenIn, tokenOut, sellAmount, taker, slippageBps) {
+  const q = new URLSearchParams({ chainId: String(chainId), sellToken: tokenIn, buyToken: tokenOut, sellAmount, taker, slippageBps: String(slippageBps) });
   const r = await fetchJson(`https://api.0x.org/swap/allowance-holder/quote?${q}`, { headers: { '0x-api-key': CFG.evm.zeroExKey, '0x-version': 'v2' } }, 15000);
   if (!r.ok) throw new Error(`0x quote ${r.status}: ${r.text.slice(0, 300)}`);
   const quote = r.json || {};
   if (quote.liquidityAvailable === false || !quote.transaction) throw new Error(`no route: 0x ${r.text.slice(0, 200)}`);
-  return { to: quote.transaction.to, data: quote.transaction.data, value: BigInt(quote.transaction.value || sellAmount), gas: BigInt(quote.transaction.gas || 0), buyAmount: quote.buyAmount, via: '0x' };
+  const spender = quote.issues?.allowance?.spender || quote.transaction.to;
+  return { to: quote.transaction.to, data: quote.transaction.data, value: tokenIn === NATIVE_ETH ? BigInt(quote.transaction.value || sellAmount) : 0n, gas: BigInt(quote.transaction.gas || 0), buyAmount: quote.buyAmount, spender, via: '0x' };
 }
 
 /** KyberSwap aggregator (no key): routes across Uniswap v2/v3/v4, Aerodrome and the rest. */
-async function quoteKyber(chainId, tokenAddr, sellAmount, taker, slippageBps) {
+async function quoteKyber(chainId, tokenIn, tokenOut, sellAmount, taker, slippageBps) {
   const chain = KYBER_CHAINS[chainId];
   const headers = { 'x-client-id': 'mememe-sniper', 'Content-Type': 'application/json' };
-  const q = new URLSearchParams({ tokenIn: NATIVE_ETH, tokenOut: tokenAddr, amountIn: sellAmount, gasInclude: 'true' });
+  const q = new URLSearchParams({ tokenIn, tokenOut, amountIn: sellAmount, gasInclude: 'true' });
   const r = await fetchJson(`https://aggregator-api.kyberswap.com/${chain}/api/v1/routes?${q}`, { headers }, 15000);
   const summary = r.json?.data?.routeSummary;
   if (!r.ok || !summary || !r.json?.data?.routerAddress) throw new Error(`no route: kyber routes ${r.status} ${r.text.slice(0, 200)}`);
@@ -454,77 +461,270 @@ async function quoteKyber(chainId, tokenAddr, sellAmount, taker, slippageBps) {
   }, 15000);
   const d = build.json?.data;
   if (!build.ok || !d?.data || !d?.routerAddress) throw new Error(`kyber build ${build.status}: ${build.text.slice(0, 300)}`);
-  return { to: d.routerAddress, data: d.data, value: BigInt(d.amountIn || sellAmount), gas: BigInt(d.gas || 0), buyAmount: d.amountOut || summary.amountOut, via: 'kyberswap' };
+  return { to: d.routerAddress, data: d.data, value: tokenIn === NATIVE_ETH ? BigInt(d.amountIn || sellAmount) : 0n, gas: BigInt(d.gas || 0), buyAmount: d.amountOut || summary.amountOut, spender: d.routerAddress, via: 'kyberswap' };
+}
+
+async function quoteEvm(chainId, tokenIn, tokenOut, sellAmount, taker, slippageBps) {
+  const aggregators = [...(CFG.evm.zeroExKey ? [quote0x] : []), quoteKyber];
+  const errors = [];
+  for (const agg of aggregators) {
+    try { return await agg(chainId, tokenIn, tokenOut, sellAmount, taker, slippageBps); } catch (e) { errors.push(e.message); }
+  }
+  throw new Error(errors.join(' | '));
+}
+
+/** Sign and send an aggregator transaction; returns the receipt. Approves the spender first
+ *  when the input is an ERC20 the router may not pull yet. */
+async function sendEvmSwap(chainId, tokenIn, sellAmount, quote, label) {
+  const wallet = evm.wallets[chainId];
+  const provider = evm.providers[chainId];
+  const fee = await provider.getFeeData();
+  const priority = ethers.parseUnits(String(CFG.evm.priorityGwei), 'gwei');
+  const base = fee.maxFeePerGas || fee.gasPrice || priority;
+  const gasFields = { maxPriorityFeePerGas: priority, maxFeePerGas: base * 2n + priority, chainId };
+  if (tokenIn !== NATIVE_ETH) {
+    const erc20 = new ethers.Contract(tokenIn, ERC20_ABI, wallet);
+    const allowance = await erc20.allowance(wallet.address, quote.spender);
+    if (allowance < BigInt(sellAmount)) {
+      const approval = await erc20.approve(quote.spender, ethers.MaxUint256, gasFields);
+      log(`[${label}] approving ${quote.spender} to spend the token: ${approval.hash}`);
+      const rc = await approval.wait(1);
+      if (rc.status !== 1) throw new Error(`approve ${approval.hash} reverted`);
+    }
+  }
+  let gasLimit = quote.gas > 0n ? quote.gas * 13n / 10n : 0n;
+  if (gasLimit === 0n) {
+    try { gasLimit = (await provider.estimateGas({ to: quote.to, data: quote.data, value: quote.value, from: wallet.address })) * 13n / 10n; } catch (e) {
+      throw new Error(`no route: simulation failed via ${quote.via}: ${String(e.shortMessage || e.message).slice(0, 160)}`);
+    }
+  }
+  const sent = await wallet.sendTransaction({ to: quote.to, data: quote.data, value: quote.value, gasLimit, ...gasFields });
+  log(`[${label}] ${CHAIN_NAMES[chainId]} tx sent ${sent.hash} via ${quote.via}`);
+  const receipt = await sent.wait(1);
+  if (receipt.status !== 1) throw new Error(`tx ${sent.hash} reverted`);
+  log(`[${label}] confirmed in block ${receipt.blockNumber}`);
+  return { hash: sent.hash, receipt };
 }
 
 async function buyEvm(chainId, tokenAddr) {
   const wallet = evm.wallets[chainId];
-  const provider = evm.providers[chainId];
   const sellAmount = ethers.parseEther(CFG.evm.spendEth).toString();
-  const aggregators = [...(CFG.evm.zeroExKey ? [quote0x] : []), quoteKyber];
   return withRouteRetry(async (slippageBps, attempt) => {
-    let quote = null;
-    const errors = [];
-    for (const agg of aggregators) {
-      try { quote = await agg(chainId, tokenAddr, sellAmount, wallet.address, slippageBps); break; } catch (e) { errors.push(e.message); }
-    }
-    if (!quote) throw new Error(errors.join(' | '));
-    const fee = await provider.getFeeData();
-    const priority = ethers.parseUnits(String(CFG.evm.priorityGwei), 'gwei');
-    const base = fee.maxFeePerGas || fee.gasPrice || priority;
-    let gasLimit = quote.gas > 0n ? quote.gas * 13n / 10n : 0n;
-    if (gasLimit === 0n) {
-      try { gasLimit = (await provider.estimateGas({ to: quote.to, data: quote.data, value: quote.value, from: wallet.address })) * 13n / 10n; } catch (e) {
-        throw new Error(`no route: simulation failed via ${quote.via}: ${String(e.shortMessage || e.message).slice(0, 160)}`);
-      }
-    }
-    const tx = { to: quote.to, data: quote.data, value: quote.value, gasLimit, maxPriorityFeePerGas: priority, maxFeePerGas: base * 2n + priority, chainId };
+    const quote = await quoteEvm(chainId, NATIVE_ETH, tokenAddr, sellAmount, wallet.address, slippageBps);
     if (CFG.dryRun) {
       log(`[DRY RUN] would buy ${tokenAddr} on ${CHAIN_NAMES[chainId]} for ${CFG.evm.spendEth} ETH via ${quote.via}; est. out ${quote.buyAmount} (attempt ${attempt})`);
-      return { hash: 'DRY_RUN', chain: CHAIN_NAMES[chainId], spend: `${CFG.evm.spendEth} ETH` };
+      return { hash: 'DRY_RUN', chain: CHAIN_NAMES[chainId], spend: `${CFG.evm.spendEth} ETH`, spentRaw: sellAmount };
     }
-    const sent = await wallet.sendTransaction(tx);
-    log(`[buy] ${CHAIN_NAMES[chainId]} tx sent ${sent.hash} via ${quote.via}`);
-    const receipt = await sent.wait(1);
-    if (receipt.status !== 1) throw new Error(`tx ${sent.hash} reverted`);
-    log(`[buy] confirmed in block ${receipt.blockNumber}`);
-    return { hash: sent.hash, chain: CHAIN_NAMES[chainId], spend: `${CFG.evm.spendEth} ETH` };
+    const { hash } = await sendEvmSwap(chainId, NATIVE_ETH, sellAmount, quote, 'buy');
+    return { hash, chain: CHAIN_NAMES[chainId], spend: `${CFG.evm.spendEth} ETH`, spentRaw: sellAmount };
   }, `swap:${CHAIN_NAMES[chainId]}`);
+}
+
+async function sellEvm(pos, amountRaw) {
+  const wallet = evm.wallets[pos.chain];
+  return withRouteRetry(async (slippageBps) => {
+    const quote = await quoteEvm(pos.chain, pos.address, NATIVE_ETH, amountRaw.toString(), wallet.address, slippageBps);
+    const { hash } = await sendEvmSwap(pos.chain, pos.address, amountRaw.toString(), quote, 'sell');
+    return { hash, outRaw: String(quote.buyAmount), via: quote.via };
+  }, `sell:${CHAIN_NAMES[pos.chain]}`);
+}
+
+async function jupiterQuote(inputMint, outputMint, amountRaw, slippageBps) {
+  const q = new URLSearchParams({ inputMint, outputMint, amount: String(amountRaw), slippageBps: String(slippageBps), restrictIntermediateTokens: 'true' });
+  const quote = await fetchJson(`${CFG.sol.jupiter}/quote?${q}`, {}, 12000);
+  if (!quote.ok || !quote.json?.outAmount) throw new Error(`no route: jupiter quote ${quote.status} ${quote.text.slice(0, 200)}`);
+  return quote.json;
+}
+
+async function jupiterSend(quoteJson, label, attempt) {
+  const swap = await fetchJson(`${CFG.sol.jupiter}/swap`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      quoteResponse: quoteJson, userPublicKey: sol.keypair.publicKey.toBase58(), wrapAndUnwrapSol: true,
+      dynamicComputeUnitLimit: true, dynamicSlippage: false,
+      prioritizationFeeLamports: { priorityLevelWithMaxLamports: { maxLamports: CFG.sol.priorityLamports, priorityLevel: 'veryHigh' } },
+    }),
+  }, 15000);
+  if (!swap.ok || !swap.json?.swapTransaction) throw new Error(`jupiter swap ${swap.status}: ${swap.text.slice(0, 200)}`);
+  const tx = VersionedTransaction.deserialize(Buffer.from(swap.json.swapTransaction, 'base64'));
+  tx.sign([sol.keypair]);
+  const sig = await sol.connection.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 3 });
+  log(`[${label}] Solana tx sent ${sig} (attempt ${attempt})`);
+  const conf = await sol.connection.confirmTransaction({ signature: sig, blockhash: tx.message.recentBlockhash, lastValidBlockHeight: swap.json.lastValidBlockHeight }, 'confirmed');
+  if (conf.value.err) throw new Error(`tx ${sig} failed: ${JSON.stringify(conf.value.err)}`);
+  log(`[${label}] confirmed ${sig}`);
+  return sig;
 }
 
 async function buySolana(mint) {
   const lamports = Math.floor(CFG.sol.spendSol * LAMPORTS_PER_SOL);
   return withRouteRetry(async (slippageBps, attempt) => {
-    const q = new URLSearchParams({ inputMint: WSOL, outputMint: mint, amount: String(lamports), slippageBps: String(slippageBps), restrictIntermediateTokens: 'true' });
-    const quote = await fetchJson(`${CFG.sol.jupiter}/quote?${q}`, {}, 12000);
-    if (!quote.ok || !quote.json?.outAmount) throw new Error(`no route: jupiter quote ${quote.status} ${quote.text.slice(0, 200)}`);
+    const quote = await jupiterQuote(WSOL, mint, lamports, slippageBps);
     if (CFG.dryRun) {
-      log(`[DRY RUN] would buy ${mint} on Solana for ${CFG.sol.spendSol} SOL; est. out ${quote.json.outAmount} (raw) via ${(quote.json.routePlan || []).map((p) => p.swapInfo?.label).join('>')}`);
-      return { hash: 'DRY_RUN', chain: 'Solana', spend: `${CFG.sol.spendSol} SOL` };
+      log(`[DRY RUN] would buy ${mint} on Solana for ${CFG.sol.spendSol} SOL; est. out ${quote.outAmount} (raw) via ${(quote.routePlan || []).map((p) => p.swapInfo?.label).join('>')}`);
+      return { hash: 'DRY_RUN', chain: 'Solana', spend: `${CFG.sol.spendSol} SOL`, spentRaw: String(lamports) };
     }
-    const swap = await fetchJson(`${CFG.sol.jupiter}/swap`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        quoteResponse: quote.json, userPublicKey: sol.keypair.publicKey.toBase58(), wrapAndUnwrapSol: true,
-        dynamicComputeUnitLimit: true, dynamicSlippage: false,
-        prioritizationFeeLamports: { priorityLevelWithMaxLamports: { maxLamports: CFG.sol.priorityLamports, priorityLevel: 'veryHigh' } },
-      }),
-    }, 15000);
-    if (!swap.ok || !swap.json?.swapTransaction) throw new Error(`jupiter swap ${swap.status}: ${swap.text.slice(0, 200)}`);
-    const tx = VersionedTransaction.deserialize(Buffer.from(swap.json.swapTransaction, 'base64'));
-    tx.sign([sol.keypair]);
-    const sig = await sol.connection.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 3 });
-    log(`[buy] Solana tx sent ${sig} (attempt ${attempt})`);
-    const height = swap.json.lastValidBlockHeight;
-    const conf = await sol.connection.confirmTransaction({ signature: sig, blockhash: tx.message.recentBlockhash, lastValidBlockHeight: height }, 'confirmed');
-    if (conf.value.err) throw new Error(`tx ${sig} failed: ${JSON.stringify(conf.value.err)}`);
-    log(`[buy] confirmed ${sig}`);
-    return { hash: sig, chain: 'Solana', spend: `${CFG.sol.spendSol} SOL` };
+    const sig = await jupiterSend(quote, 'buy', attempt);
+    return { hash: sig, chain: 'Solana', spend: `${CFG.sol.spendSol} SOL`, spentRaw: String(lamports) };
   }, 'jupiter');
+}
+
+async function sellSolana(pos, amountRaw) {
+  return withRouteRetry(async (slippageBps, attempt) => {
+    const quote = await jupiterQuote(pos.address, WSOL, amountRaw, slippageBps);
+    const sig = await jupiterSend(quote, 'sell', attempt);
+    return { hash: sig, outRaw: String(quote.outAmount), via: 'jupiter' };
+  }, 'jupiter-sell');
 }
 
 async function buy(target) {
   return target.chain === 'sol' ? buySolana(target.address) : buyEvm(target.chain, target.address);
+}
+
+// ---------------------------------------------------------------------------------------
+// Take profit: after the buy, watch the token's price against the entry and sell in stages.
+// SNIPER_TAKE_PROFIT_LADDER = "5:initial,10:80" means: at 5x sell just enough to get the
+// initial spend back, at 10x sell 80% of what is left, then let the rest ride. Rungs are
+// "<multiple>:<initial|percent>", comma separated, ascending. Price multiple = executable
+// sell value of the current bag per token / entry price per token, so impact is included.
+// $DATA_DIR/sniper-sell.json (POST /api/sniper/sell) sells everything left at any price.
+// ---------------------------------------------------------------------------------------
+function parseLadder(spec) {
+  const rungs = [];
+  for (const part of String(spec || '').split(',')) {
+    const m = part.trim().match(/^(\d+(?:\.\d+)?)\s*[:x@]\s*(initial|\d+(?:\.\d+)?%?)$/i);
+    if (!m) continue;
+    const x = Number(m[1]);
+    const sell = /^initial$/i.test(m[2]) ? 'initial' : Math.min(100, Math.max(1, Number(m[2].replace('%', ''))));
+    if (x > 1) rungs.push({ x, sell });
+  }
+  return rungs.sort((a, b) => a.x - b.x);
+}
+const TAKE_PROFIT_LADDER = parseLadder(env('SNIPER_TAKE_PROFIT_LADDER', '5:initial,10:80'));
+if (!TAKE_PROFIT_LADDER.length) TAKE_PROFIT_LADDER.push({ x: 5, sell: 'initial' }, { x: 10, sell: 80 });
+const TP_CHECK_MS = Math.max(5000, num('SNIPER_TP_CHECK_MS', 15000));
+const SELL_FILE = path.join(DATA_DIR, 'sniper-sell.json');
+const tp = { lastCheck: 0, lastLogged: null, multiple: null, quoteErrors: 0 };
+
+function describeLadder(rungs) {
+  return rungs.map((r) => `at ${r.x}x sell ${r.sell === 'initial' ? 'the initial stake back' : `${r.sell}% of what is left`}`).join(', ') + ', then let the rest ride';
+}
+
+async function tokenBalance(pos) {
+  if (pos.chain === 'sol') {
+    const accounts = await sol.connection.getParsedTokenAccountsByOwner(sol.keypair.publicKey, { mint: new PublicKey(pos.address) });
+    return accounts.value.reduce((s, a) => s + BigInt(a.account.data.parsed?.info?.tokenAmount?.amount || 0), 0n);
+  }
+  const erc20 = new ethers.Contract(pos.address, ERC20_ABI, evm.providers[pos.chain]);
+  return BigInt(await erc20.balanceOf(evm.wallets[pos.chain].address));
+}
+
+async function sellValueRaw(pos, amountRaw) {
+  if (pos.chain === 'sol') return BigInt((await jupiterQuote(pos.address, WSOL, amountRaw, CFG.slippageBps)).outAmount);
+  const wallet = evm.wallets[pos.chain];
+  return BigInt((await quoteEvm(pos.chain, pos.address, NATIVE_ETH, amountRaw.toString(), wallet.address, CFG.slippageBps)).buyAmount);
+}
+
+function openPosition(target, res, tweetId) {
+  state.position = {
+    chain: target.chain, chainName: CHAIN_NAMES[target.chain], address: target.address, spentRaw: String(res.spentRaw), spend: res.spend,
+    buyHash: res.hash, tweet: tweetId, openedAt: new Date().toISOString(),
+    ladder: TAKE_PROFIT_LADDER.map((r) => ({ ...r, done: null })), initialBalanceRaw: null, sales: [], sold: null,
+  };
+  saveState(state);
+  log(`[tp] watching ${target.address} on ${CHAIN_NAMES[target.chain]}: ${describeLadder(TAKE_PROFIT_LADDER)}`);
+}
+
+/** The token amount the buy produced, read from the wallet (retried: balances can lag a
+ *  block or two). Needed to turn bag value into a per-token price multiple. */
+async function ensureInitialBalance(pos) {
+  if (pos.initialBalanceRaw) return BigInt(pos.initialBalanceRaw);
+  for (let i = 0; i < 6; i++) {
+    try {
+      const bal = await tokenBalance(pos);
+      if (bal > 0n) { pos.initialBalanceRaw = bal.toString(); saveState(state); log(`[tp] entry: ${bal} raw tokens for ${pos.spend}`); return bal; }
+    } catch { /* retry */ }
+    await sleep(2000);
+  }
+  return null;
+}
+
+function fmtNative(pos, raw) {
+  return pos.chain === 'sol' ? `${(Number(raw) / LAMPORTS_PER_SOL).toFixed(4)} SOL` : `${Number(ethers.formatEther(raw)).toFixed(5)} ETH`;
+}
+
+async function checkTakeProfit() {
+  const pos = state.position;
+  if (!pos) return;
+  const manual = fs.existsSync(SELL_FILE);
+  if (pos.sold) { if (manual) { try { fs.unlinkSync(SELL_FILE); } catch { /* gone */ } } return; }
+  if (!pos.ladder) pos.ladder = TAKE_PROFIT_LADDER.map((r) => ({ ...r, done: null }));
+  const pending = pos.ladder.filter((r) => !r.done);
+  // Every rung done and no manual request: the rest rides untouched.
+  if (!pending.length && !manual) return;
+  if (!manual && Date.now() - tp.lastCheck < TP_CHECK_MS) return;
+  tp.lastCheck = Date.now();
+  if (pos.chain === 'sol' ? !solEnabled() : !evm.providers[pos.chain]) return;
+  const initial = await ensureInitialBalance(pos);
+  let balance;
+  try { balance = await tokenBalance(pos); } catch (e) { log(`[tp] balance read failed: ${String(e.message).slice(0, 120)}`); return; }
+  if (balance <= 0n) {
+    log(`[tp] wallet no longer holds ${pos.address}; the bag was sold or moved outside this bot. Watch ends.`);
+    pos.sold = { hash: 'external', at: new Date().toISOString() }; saveState(state);
+    if (manual) { try { fs.unlinkSync(SELL_FILE); } catch { /* gone */ } }
+    return;
+  }
+  let value;
+  try { value = await sellValueRaw(pos, balance); tp.quoteErrors = 0; } catch (e) {
+    tp.quoteErrors += 1;
+    if (tp.quoteErrors === 1 || tp.quoteErrors % 20 === 0) log(`[tp] no sell quote yet (${tp.quoteErrors}x): ${String(e.message).slice(0, 160)}`);
+    if (!manual) return;
+  }
+  let rung = null;
+  if (value !== undefined && initial) {
+    // Price multiple per token: (value / balance) / (spent / initial balance).
+    tp.multiple = (Number(value) / Number(balance)) / (Number(pos.spentRaw) / Number(initial));
+    const next = pending[0];
+    if (tp.lastLogged === null || Math.abs(tp.multiple - tp.lastLogged) >= Math.max(0.25, tp.lastLogged * 0.25)) {
+      log(`[tp] ${pos.address.slice(0, 10)} at ${tp.multiple.toFixed(2)}x entry; bag sells for ${fmtNative(pos, value)}`
+        + (next ? `; next rung ${next.x}x (${next.sell === 'initial' ? 'initial back' : `${next.sell}%`})` : '; all rungs done, rest rides'));
+      tp.lastLogged = tp.multiple;
+    }
+    // Take the highest rung the price has crossed; skipped lower rungs are folded into it.
+    for (const r of pending) if (tp.multiple >= r.x) rung = r;
+  }
+  if (!manual && !rung) return;
+  let amount;
+  let label;
+  if (manual) { amount = balance; label = 'everything left'; }
+  else if (rung.sell === 'initial') {
+    // Tokens whose sale returns the initial spend, from the executable quote of the whole bag.
+    amount = balance * BigInt(pos.spentRaw) / value;
+    amount = amount > balance ? balance : amount;
+    label = `the initial stake (${(Number(amount) * 100 / Number(balance)).toFixed(1)}% of the bag)`;
+  } else {
+    amount = balance * BigInt(Math.round(rung.sell * 100)) / 10000n;
+    label = `${rung.sell}% of what is left`;
+  }
+  if (amount <= 0n) { if (manual) { try { fs.unlinkSync(SELL_FILE); } catch { /* gone */ } } return; }
+  const why = manual ? 'manual sell requested' : `${tp.multiple.toFixed(2)}x >= ${rung.x}x rung`;
+  await notify(`💰 SELLING ${label} of ${pos.address} on ${pos.chainName}: ${why}`);
+  try {
+    const res = pos.chain === 'sol' ? await sellSolana(pos, amount) : await sellEvm(pos, amount);
+    const sale = { hash: res.hash, outRaw: res.outRaw, amountRaw: amount.toString(), at: new Date().toISOString(), why, rung: rung ? rung.x : 'manual' };
+    pos.sales.push(sale);
+    if (manual) pos.sold = { ...sale, remainderRaw: '0' };
+    else for (const r of pending) if (tp.multiple >= r.x) r.done = sale;
+    saveState(state);
+    const left = balance - amount;
+    const recovered = pos.sales.reduce((s, x) => s + BigInt(x.outRaw || 0), 0n);
+    await notify(`✅ SOLD ${label} of ${pos.address} on ${pos.chainName} for about ${fmtNative(pos, res.outRaw)}: ${res.hash}. `
+      + `Cashed out so far ${fmtNative(pos, recovered)} against ${pos.spend} spent; ${left > 0n ? `${(Number(left) * 100 / Number(initial || balance)).toFixed(1)}% of the original bag still riding` : 'nothing left'}.`);
+  } catch (e) {
+    await notify(`❌ Sell failed for ${pos.address}: ${String(e.message || e).slice(0, 300)}; will retry next check`);
+  } finally {
+    if (manual) { try { fs.unlinkSync(SELL_FILE); } catch { /* gone */ } }
+  }
 }
 
 /** Buy-once guard that survives a lost state file: the wallet already holding the token
@@ -603,12 +803,19 @@ async function handleTweet(tweet) {
     state.bought = true; state.buy = { hash: 'already-held', address: target.address, chain: CHAIN_NAMES[target.chain], tweet: tweet.id, at: new Date().toISOString() };
     saveState(state);
     await notify(`Wallet already holds ${target.address} on ${CHAIN_NAMES[target.chain]}; treating it as bought and not buying again.`);
+    if (!state.position) {
+      const spentRaw = target.chain === 'sol' ? String(Math.floor(CFG.sol.spendSol * LAMPORTS_PER_SOL)) : ethers.parseEther(CFG.evm.spendEth).toString();
+      openPosition(target, { hash: 'already-held', spentRaw, spend: target.chain === 'sol' ? `${CFG.sol.spendSol} SOL` : `${CFG.evm.spendEth} ETH` }, tweet.id);
+    }
     return true;
   }
   await notify(`🚨 SNIPING ${target.address} on ${CHAIN_NAMES[target.chain]} from post ${tweet.url || tweet.id}${CFG.dryRun ? ' (DRY RUN)' : ''}`);
   try {
     const res = await buy(target);
-    if (!CFG.dryRun) { state.bought = true; state.buy = { ...res, address: target.address, tweet: tweet.id, at: new Date().toISOString() }; saveState(state); }
+    if (!CFG.dryRun) {
+      state.bought = true; state.buy = { ...res, address: target.address, tweet: tweet.id, at: new Date().toISOString() }; saveState(state);
+      openPosition(target, res, tweet.id);
+    }
     await notify(`✅ ${CFG.dryRun ? 'DRY RUN ' : ''}bought ${target.address} on ${res.chain} for ${res.spend}: ${res.hash}`);
   } catch (e) {
     await notify(`❌ Buy failed for ${target.address} on ${CHAIN_NAMES[target.chain]}: ${String(e.message || e).slice(0, 300)}`);
@@ -624,12 +831,17 @@ const HEARTBEAT_MS = Math.max(60000, num('SNIPER_HEARTBEAT_MS', 300000));
 function heartbeat() {
   if (Date.now() - stats.lastHeartbeat < HEARTBEAT_MS) return;
   stats.lastHeartbeat = Date.now();
+  const pos = state.position;
+  const rungsDone = pos?.ladder ? pos.ladder.filter((r) => r.done).length : 0;
+  const posNote = pos ? (pos.sold ? `; ${pos.address.slice(0, 10)} fully sold (${pos.sold.hash})`
+    : `; holding ${pos.address.slice(0, 10)} on ${pos.chainName} at ${tp.multiple == null ? '?' : tp.multiple.toFixed(2) + 'x'} entry, ${rungsDone}/${pos.ladder ? pos.ladder.length : 0} rungs taken`) : '';
   log(`[heartbeat] ${stats.polls} polls, ${stats.ok} ok, ${stats.errors} errors, ${stats.posts} posts seen, `
-    + `${Object.keys(state.pending).length} pending; dryRun=${CFG.dryRun} bought=${state.bought}`);
+    + `${Object.keys(state.pending).length} pending; dryRun=${CFG.dryRun} bought=${state.bought}${posNote}`);
 }
 
 async function tick() {
   await runQueuedTest();
+  try { await checkTakeProfit(); } catch (e) { log(`[tp] ${String(e.message || e).slice(0, 200)}`); }
   const tweets = [];
   stats.polls += 1;
   if (CFG.bearer) {
@@ -682,6 +894,8 @@ async function main() {
     log(`Solana wallet ${sol.keypair.publicKey.toBase58()}: ${bal} SOL; spend cap ${CFG.sol.spendSol} SOL per buy`);
   } else log('Solana buying off (needs WALLET_PRIVATE_KEY)');
   if (state.bought) log(`already bought once: ${JSON.stringify(state.buy)} — delete ${CFG.stateFile} to arm again`);
+  if (state.position && !state.position.sold) log(`[tp] resuming watch on ${state.position.address} (${state.position.chainName}): ${describeLadder(state.position.ladder || TAKE_PROFIT_LADDER)}`);
+  log(`take profit ladder: ${describeLadder(TAKE_PROFIT_LADDER)}; checked every ${TP_CHECK_MS / 1000}s; POST /api/sniper/sell sells everything left`);
   if (CFG.dryRun) log('DRY RUN: nothing will be sent. Set SNIPER_DRY_RUN=false to go live.');
   if (CFG.xaiKey) {
     try { await grokProbe(); } catch (e) { log(`[probe] Grok read failed: ${e.message}`); }
