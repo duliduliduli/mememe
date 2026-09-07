@@ -522,6 +522,50 @@ async function buy(target) {
   return target.chain === 'sol' ? buySolana(target.address) : buyEvm(target.chain, target.address);
 }
 
+/** Buy-once guard that survives a lost state file: the wallet already holding the token
+ *  means it was bought. Unknown (RPC error) counts as not held. */
+async function alreadyHolds(target) {
+  try {
+    if (target.chain === 'sol') {
+      const accounts = await sol.connection.getParsedTokenAccountsByOwner(sol.keypair.publicKey, { mint: new PublicKey(target.address) });
+      return accounts.value.some((a) => Number(a.account.data.parsed?.info?.tokenAmount?.amount || 0) > 0);
+    }
+    const erc20 = new ethers.Contract(target.address, ['function balanceOf(address) view returns (uint256)'], evm.providers[target.chain]);
+    return (await erc20.balanceOf(evm.wallets[target.chain].address)) > 0n;
+  } catch (e) { log(`[buy] holdings check failed (${String(e.message).slice(0, 120)}); continuing`); return false; }
+}
+
+/** Run the whole buy path for a piece of text (address extraction, chain detection, quote)
+ *  in DRY RUN, whatever the live setting. Triggered by SNIPER_TEST_TEXT at startup or by
+ *  POST /api/sniper/test, which drops $DATA_DIR/sniper-test.json for the next poll. */
+async function runTest(text, origin) {
+  log(`[test] ${origin}: exercising the buy path in DRY RUN for: ${String(text).replace(/\s+/g, ' ').slice(0, 160)}`);
+  const cands = extractCandidates(text);
+  if (!cands.evm.length && !cands.solana.length) { log('[test] FAILED: no contract address found in that text'); return; }
+  const target = await resolveTarget(text);
+  if (!target) { log(`[test] FAILED: not a live contract on any configured chain: ${[...cands.evm, ...cands.solana].join(', ')}`); return; }
+  log(`[test] resolved ${target.address} on ${CHAIN_NAMES[target.chain]}; requesting a quote for ${target.chain === 'sol' ? `${CFG.sol.spendSol} SOL` : `${CFG.evm.spendEth} ETH`}`);
+  const saved = { dryRun: CFG.dryRun, routeWaitS: CFG.routeWaitS };
+  CFG.dryRun = true; CFG.routeWaitS = 20;
+  try {
+    const res = await buy(target);
+    log(`[test] OK: ${res.chain} buy path works end to end (would spend ${res.spend}); nothing was sent`);
+  } catch (e) {
+    log(`[test] FAILED at the quote/transaction step: ${String(e.message || e).slice(0, 300)}`);
+  } finally { CFG.dryRun = saved.dryRun; CFG.routeWaitS = saved.routeWaitS; }
+}
+
+const TEST_FILE = path.join(DATA_DIR, 'sniper-test.json');
+async function runQueuedTest() {
+  let text = null;
+  try {
+    if (!fs.existsSync(TEST_FILE)) return;
+    text = JSON.parse(fs.readFileSync(TEST_FILE, 'utf8')).text;
+    fs.unlinkSync(TEST_FILE);
+  } catch (e) { log(`[test] could not read ${TEST_FILE}: ${e.message}`); try { fs.unlinkSync(TEST_FILE); } catch { /* gone */ } return; }
+  if (text) await runTest(text, 'api');
+}
+
 // ---------------------------------------------------------------------------------------
 // Main loop
 // ---------------------------------------------------------------------------------------
@@ -550,6 +594,12 @@ async function handleTweet(tweet) {
     await notify(`Address in @${CFG.handle} post ${tweet.id} (${[...cands.evm, ...cands.solana].join(', ')}) is not a live contract on Base/Ethereum/Solana yet. Will keep checking.`);
     return false;
   }
+  if (!CFG.dryRun && await alreadyHolds(target)) {
+    state.bought = true; state.buy = { hash: 'already-held', address: target.address, chain: CHAIN_NAMES[target.chain], tweet: tweet.id, at: new Date().toISOString() };
+    saveState(state);
+    await notify(`Wallet already holds ${target.address} on ${CHAIN_NAMES[target.chain]}; treating it as bought and not buying again.`);
+    return true;
+  }
   await notify(`🚨 SNIPING ${target.address} on ${CHAIN_NAMES[target.chain]} from post ${tweet.url || tweet.id}${CFG.dryRun ? ' (DRY RUN)' : ''}`);
   try {
     const res = await buy(target);
@@ -574,6 +624,7 @@ function heartbeat() {
 }
 
 async function tick() {
+  await runQueuedTest();
   const tweets = [];
   stats.polls += 1;
   if (CFG.bearer) {
@@ -630,6 +681,7 @@ async function main() {
   if (CFG.xaiKey) {
     try { await grokProbe(); } catch (e) { log(`[probe] Grok read failed: ${e.message}`); }
   }
+  if (env('SNIPER_TEST_TEXT').trim()) await runTest(env('SNIPER_TEST_TEXT'), 'SNIPER_TEST_TEXT');
   for (;;) {
     try { await tick(); } catch (e) { log(`[tick] ${e.message}`); }
     await sleep(CFG.pollMs + backoffMs);
