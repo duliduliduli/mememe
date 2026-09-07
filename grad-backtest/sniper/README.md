@@ -23,6 +23,9 @@ post source key is present, so on Railway it needs no separate service.
    ones. Only a live contract or mint is bought. A post whose address is not live yet is
    retried every poll for `SNIPER_ROUTE_WAIT_S`.
 4. **Buy.** A market buy for the fixed spend cap (`SNIPER_SPEND_SOL` / `SNIPER_SPEND_ETH`).
+   Base and Ethereum route through the KyberSwap aggregator (no key; Uniswap v2/v3/v4,
+   Aerodrome and the rest), with 0x tried first when `ZEROEX_API_KEY` is set. RPC comes
+   from `BASE_RPC`/`ETH_RPC`, else the Alchemy app behind `RPC_URL`, else a public node.
    "No route yet" is retried for `SNIPER_ROUTE_WAIT_S`; slippage failures step the
    tolerance up by 5% at a time to `SNIPER_MAX_SLIPPAGE_BPS`. The first confirmed buy
    writes `bought: true` to the state file and the lane never buys again until that file
@@ -36,7 +39,7 @@ dry runs go through the whole pipeline including quotes and log what they would 
 
 See `.env.example` (section "Launch sniper lane"). Minimum to go live on Solana with the
 wallet this service already uses: `XAI_API_KEY`, `SNIPER_DRY_RUN=false`. Add
-`SNIPER_EVM_PRIVATE_KEY` (a burner) and `ZEROEX_API_KEY` for Base and Ethereum.
+`SNIPER_EVM_PRIVATE_KEY` (a burner wallet's key) for Base and Ethereum.
 
 ## Endpoints and logs
 
