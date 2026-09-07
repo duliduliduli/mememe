@@ -587,6 +587,8 @@ async function buy(target) {
 // $DATA_DIR/sniper-sell.json (POST /api/sniper/sell) forces the sale at any price.
 // ---------------------------------------------------------------------------------------
 const TAKE_PROFIT_X = num('SNIPER_TAKE_PROFIT_X', 10);
+// Share of the bag sold when take profit hits; the rest stays in the wallet as a moon bag.
+const TAKE_PROFIT_SELL_PCT = Math.min(100, Math.max(1, num('SNIPER_TAKE_PROFIT_SELL_PCT', 80)));
 const TP_CHECK_MS = Math.max(5000, num('SNIPER_TP_CHECK_MS', 15000));
 const SELL_FILE = path.join(DATA_DIR, 'sniper-sell.json');
 const tp = { lastCheck: 0, lastLogged: null, multiple: null, quoteErrors: 0 };
@@ -609,10 +611,10 @@ async function sellValueRaw(pos, amountRaw) {
 function openPosition(target, res, tweetId) {
   state.position = {
     chain: target.chain, chainName: CHAIN_NAMES[target.chain], address: target.address, spentRaw: String(res.spentRaw), spend: res.spend,
-    buyHash: res.hash, tweet: tweetId, openedAt: new Date().toISOString(), takeProfitX: TAKE_PROFIT_X, sold: null,
+    buyHash: res.hash, tweet: tweetId, openedAt: new Date().toISOString(), takeProfitX: TAKE_PROFIT_X, sellPct: TAKE_PROFIT_SELL_PCT, sold: null,
   };
   saveState(state);
-  log(`[tp] watching ${target.address} on ${CHAIN_NAMES[target.chain]}: sell everything at ${TAKE_PROFIT_X}x of ${res.spend}`);
+  log(`[tp] watching ${target.address} on ${CHAIN_NAMES[target.chain]}: sell ${TAKE_PROFIT_SELL_PCT}% at ${TAKE_PROFIT_X}x of ${res.spend}, keep the rest`);
 }
 
 function fmtNative(pos, raw) {
@@ -621,8 +623,11 @@ function fmtNative(pos, raw) {
 
 async function checkTakeProfit() {
   const pos = state.position;
-  if (!pos || pos.sold) return;
+  if (!pos) return;
   const manual = fs.existsSync(SELL_FILE);
+  // After take profit only a manual request touches the moon bag.
+  if (pos.sold && !manual) return;
+  if (pos.sold && pos.sold.hash === 'external') { if (manual) { try { fs.unlinkSync(SELL_FILE); } catch { /* gone */ } } return; }
   if (!manual && Date.now() - tp.lastCheck < TP_CHECK_MS) return;
   tp.lastCheck = Date.now();
   if (pos.chain === 'sol' ? !solEnabled() : !evm.providers[pos.chain]) return;
@@ -648,13 +653,19 @@ async function checkTakeProfit() {
     }
   }
   if (!manual && !(tp.multiple >= pos.takeProfitX)) return;
+  // Take profit sells the configured share; a manual sell dumps whatever is left.
+  const pct = manual ? 100 : (pos.sellPct ?? TAKE_PROFIT_SELL_PCT);
+  const amount = pct >= 100 ? balance : balance * BigInt(Math.round(pct * 100)) / 10000n;
+  if (amount <= 0n) return;
   const why = manual ? 'manual sell requested' : `${tp.multiple.toFixed(2)}x >= ${pos.takeProfitX}x take profit`;
-  await notify(`💰 SELLING all ${pos.address} on ${pos.chainName}: ${why}`);
+  await notify(`💰 SELLING ${pct}% of ${pos.address} on ${pos.chainName}: ${why}`);
   try {
-    const res = pos.chain === 'sol' ? await sellSolana(pos, balance) : await sellEvm(pos, balance);
-    pos.sold = { hash: res.hash, outRaw: res.outRaw, multiple: Number(res.outRaw) / Number(pos.spentRaw), at: new Date().toISOString(), why };
+    const res = pos.chain === 'sol' ? await sellSolana(pos, amount) : await sellEvm(pos, amount);
+    const multiple = Number(res.outRaw) / Number(pos.spentRaw);
+    pos.sold = { hash: res.hash, outRaw: res.outRaw, pct, multiple, at: new Date().toISOString(), why, remainderRaw: (balance - amount).toString() };
     saveState(state);
-    await notify(`✅ SOLD ${pos.address} on ${pos.chainName} for about ${fmtNative(pos, res.outRaw)} (${pos.sold.multiple.toFixed(2)}x): ${res.hash}`);
+    const kept = pct < 100 ? `; keeping ${100 - pct}% as a moon bag (sell it any time with POST /api/sniper/sell)` : '';
+    await notify(`✅ SOLD ${pct}% of ${pos.address} on ${pos.chainName} for about ${fmtNative(pos, res.outRaw)} (${multiple.toFixed(2)}x the spend): ${res.hash}${kept}`);
   } catch (e) {
     await notify(`❌ Sell failed for ${pos.address}: ${String(e.message || e).slice(0, 300)}; will retry next check`);
   } finally {
@@ -767,8 +778,8 @@ function heartbeat() {
   if (Date.now() - stats.lastHeartbeat < HEARTBEAT_MS) return;
   stats.lastHeartbeat = Date.now();
   const pos = state.position;
-  const posNote = pos ? (pos.sold ? `; sold ${pos.address.slice(0, 10)} at ${pos.sold.multiple ? pos.sold.multiple.toFixed(2) + 'x' : pos.sold.hash}`
-    : `; holding ${pos.address.slice(0, 10)} on ${pos.chainName} at ${tp.multiple == null ? '?' : tp.multiple.toFixed(2) + 'x'} (sell at ${pos.takeProfitX}x)`) : '';
+  const posNote = pos ? (pos.sold ? `; sold ${pos.sold.pct ?? 100}% of ${pos.address.slice(0, 10)} at ${pos.sold.multiple ? pos.sold.multiple.toFixed(2) + 'x' : pos.sold.hash}${pos.sold.pct && pos.sold.pct < 100 ? ', moon bag kept' : ''}`
+    : `; holding ${pos.address.slice(0, 10)} on ${pos.chainName} at ${tp.multiple == null ? '?' : tp.multiple.toFixed(2) + 'x'} (sell ${pos.sellPct ?? TAKE_PROFIT_SELL_PCT}% at ${pos.takeProfitX}x)`) : '';
   log(`[heartbeat] ${stats.polls} polls, ${stats.ok} ok, ${stats.errors} errors, ${stats.posts} posts seen, `
     + `${Object.keys(state.pending).length} pending; dryRun=${CFG.dryRun} bought=${state.bought}${posNote}`);
 }
@@ -828,8 +839,8 @@ async function main() {
     log(`Solana wallet ${sol.keypair.publicKey.toBase58()}: ${bal} SOL; spend cap ${CFG.sol.spendSol} SOL per buy`);
   } else log('Solana buying off (needs WALLET_PRIVATE_KEY)');
   if (state.bought) log(`already bought once: ${JSON.stringify(state.buy)} — delete ${CFG.stateFile} to arm again`);
-  if (state.position && !state.position.sold) log(`[tp] resuming watch on ${state.position.address} (${state.position.chainName}); sell everything at ${state.position.takeProfitX}x of ${state.position.spend}`);
-  log(`take profit: sell all at ${TAKE_PROFIT_X}x, checked every ${TP_CHECK_MS / 1000}s; POST /api/sniper/sell forces a sale`);
+  if (state.position && !state.position.sold) log(`[tp] resuming watch on ${state.position.address} (${state.position.chainName}); sell ${state.position.sellPct ?? TAKE_PROFIT_SELL_PCT}% at ${state.position.takeProfitX}x of ${state.position.spend}`);
+  log(`take profit: sell ${TAKE_PROFIT_SELL_PCT}% at ${TAKE_PROFIT_X}x and keep the rest, checked every ${TP_CHECK_MS / 1000}s; POST /api/sniper/sell sells everything left`);
   if (CFG.dryRun) log('DRY RUN: nothing will be sent. Set SNIPER_DRY_RUN=false to go live.');
   if (CFG.xaiKey) {
     try { await grokProbe(); } catch (e) { log(`[probe] Grok read failed: ${e.message}`); }
