@@ -141,8 +141,23 @@ async function fetchJson(url, opts = {}, timeoutMs = 30000) {
 // Wallets
 // ---------------------------------------------------------------------------------------
 const evm = { providers: {}, wallets: {}, rpc: {} };
+
+/** Accepts a hex private key or a 12/24-word secret recovery phrase (MetaMask's first
+ *  account, derivation m/44'/60'/0'/0/N with N from SNIPER_EVM_ACCOUNT_INDEX, default 0). */
+function evmSigner() {
+  const raw = CFG.evm.key.replace(/^["']|["']$/g, '').trim();
+  const words = raw.split(/\s+/);
+  if (words.length >= 12 && !/^0x/i.test(raw)) {
+    const index = num('SNIPER_EVM_ACCOUNT_INDEX', 0);
+    return ethers.HDNodeWallet.fromPhrase(words.join(' ').toLowerCase(), undefined, `m/44'/60'/0'/0/${index}`);
+  }
+  return new ethers.Wallet(/^0x/i.test(raw) ? raw : `0x${raw}`);
+}
+
 async function connectEvm() {
   if (!CFG.evm.key) return;
+  let signer;
+  try { signer = evmSigner(); } catch (e) { log(`[rpc] SNIPER_EVM_PRIVATE_KEY is not a valid private key or recovery phrase (${e.shortMessage || e.message}); EVM buys are off`); return; }
   for (const [id, candidates] of Object.entries(CFG.evm.rpcs)) {
     const chainId = Number(id);
     for (const url of candidates) {
@@ -151,7 +166,7 @@ async function connectEvm() {
         const ctl = new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 8000));
         await Promise.race([provider.getBlockNumber(), ctl]);
         evm.providers[chainId] = provider;
-        evm.wallets[chainId] = new ethers.Wallet(CFG.evm.key, provider);
+        evm.wallets[chainId] = signer.connect(provider);
         evm.rpc[chainId] = url;
         break;
       } catch (e) {
