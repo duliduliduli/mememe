@@ -429,6 +429,21 @@ def _mm_running() -> bool:
     return _mm_proc is not None and _mm_proc.poll() is None
 
 
+def _mm_mode() -> str:
+    """MM_MODE wins. Otherwise the lane follows the executor: a live executor with a wallet
+    means a live market-making lane; anything else shadows on paper."""
+    explicit = os.getenv("MM_MODE", "").strip().lower()
+    if explicit in ("live", "paper"):
+        return explicit
+    if os.getenv("EXECUTOR_MODE", "").strip().lower() == "live" and os.getenv("WALLET_PRIVATE_KEY"):
+        return "live"
+    return "paper"
+
+
+def _mm_autostart() -> bool:
+    return os.getenv("MM_AUTOSTART", "1") != "0"
+
+
 def _start_mm(mode: str) -> None:
     """Market-making lane (mm package): `paper` shadows only, `live` trades through the DLMM
     sidecar and Jupiter with the same wallet as the executor. Stdout stays inherited so its
@@ -440,8 +455,7 @@ def _start_mm(mode: str) -> None:
 
 
 def _mm_tail(name: str, limit: int) -> list[dict[str, Any]]:
-    mode = os.getenv("MM_MODE", "paper")
-    path = DATA_DIR / ("mm_live" if mode == "live" else "mm_paper") / name
+    path = DATA_DIR / ("mm_live" if _mm_mode() == "live" else "mm_paper") / name
     if not path.exists():
         return []
     try:
@@ -455,8 +469,8 @@ def _mm_tail(name: str, limit: int) -> list[dict[str, Any]]:
 def mm_status() -> JSONResponse:
     nlv = _mm_tail("nlv.csv", 6)
     return JSONResponse({
-        "mode": os.getenv("MM_MODE", "paper"),
-        "autostart": os.getenv("MM_AUTOSTART", "0") == "1",
+        "mode": _mm_mode(),
+        "autostart": _mm_autostart(),
         "running": _mm_running(),
         "draining": (DATA_DIR / "mm.stop").exists(),
         "latest_nlv": nlv,
@@ -469,7 +483,7 @@ def mm_start(request: Request) -> JSONResponse:
     _require_admin(request)
     if _mm_running():
         raise HTTPException(409, "mm already running")
-    mode = os.getenv("MM_MODE", "paper")
+    mode = _mm_mode()
     _start_mm(mode)
     return JSONResponse({"started": True, "mode": mode})
 
@@ -490,10 +504,12 @@ def mm_panic(request: Request) -> JSONResponse:
 
 @app.on_event("startup")
 def maybe_autostart_mm() -> None:
-    if os.getenv("MM_AUTOSTART", "0") == "1" and not _mm_running():
-        mode = os.getenv("MM_MODE", "paper")
+    if _mm_autostart() and not _mm_running():
+        mode = _mm_mode()
         _start_mm(mode)
         print(f"[server] MM autostart: launched market-making lane in {mode} mode", flush=True)
+    elif not _mm_autostart():
+        print("[server] MM_AUTOSTART=0: market-making lane NOT started", flush=True)
 
 
 @app.on_event("startup")
