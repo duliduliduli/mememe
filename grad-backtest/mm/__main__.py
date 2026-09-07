@@ -11,7 +11,7 @@ from .costs import break_even_gain, net_pnl, round_trip_multiplier
 
 
 def log(message: str, cfg: MMConfig | None = None) -> None:
-    line = f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {message}"
+    line = f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} MM {message}"
     print(line, flush=True)
     if cfg is not None:
         cfg.data_dir.mkdir(parents=True, exist_ok=True)

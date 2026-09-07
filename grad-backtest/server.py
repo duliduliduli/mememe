@@ -184,20 +184,27 @@ def runtime_logs(request: Request, hours: float = 6, q: str = "", limit: int = 2
     hours = max(0.25, min(float(hours), 24 * 7))
     limit = max(1, min(int(limit), 20_000))
     max_bytes = max(1_000_000, min(int(os.getenv("LOG_VIEWER_MAX_BYTES", "12000000")), 50_000_000))
-    raw = b""
     truncated = False
-    if EXECUTOR_LOG.exists():
-        size = EXECUTOR_LOG.stat().st_size
-        with EXECUTOR_LOG.open("rb") as handle:
+    lines: list[str] = []
+    # The executor and the market-making lane (mm.log) share one view, merged by timestamp.
+    for path in (EXECUTOR_LOG, DATA_DIR / "mm.log"):
+        if not path.exists():
+            continue
+        size = path.stat().st_size
+        with path.open("rb") as handle:
             if size > max_bytes:
                 handle.seek(-max_bytes, os.SEEK_END)
                 handle.readline()
                 truncated = True
-            raw = handle.read()
+            lines.extend(handle.read().decode("utf-8", errors="replace").splitlines())
+    def stamp(line: str) -> str:
+        match = LOG_TIMESTAMP.match(line)
+        return match.group(1) if match else ""
+    lines.sort(key=stamp)
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     terms = [term.casefold() for term in q.split() if term]
     selected: list[str] = []
-    for line in raw.decode("utf-8", errors="replace").splitlines():
+    for line in lines:
         match = LOG_TIMESTAMP.match(line)
         if match:
             try:
