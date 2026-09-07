@@ -14,6 +14,7 @@ import requests
 from .config import MMConfig, QUOTE_MINTS, TOKEN_2022_PROGRAM, WSOL
 
 BACKOFF = (1.0, 2.0, 4.0, 8.0, 16.0)
+MAX_CREDIBLE_IMPACT_PCT = 90.0  # ladder impacts above this are treated as unreadable quotes
 
 
 class HttpError(RuntimeError):
@@ -192,6 +193,11 @@ class Jupiter:
             if reference is None:
                 reference = unit
             impact = max(0.0, (1 - unit / reference) * 100) if reference else None
+            if impact is not None and impact > MAX_CREDIBLE_IMPACT_PCT:
+                # A route that returns almost nothing is a broken quote (stale route,
+                # dust output), not a measurement: report it as unknown rather than
+                # let it read as a 100% exit cost.
+                impact = None
             ladder.append({"size_usd": size, "impact_pct": impact, "out_raw": int(quote["outAmount"]),
                            "unit_out": unit, "routes": [p.get("swapInfo", {}).get("label") for p in quote.get("routePlan", [])]})
         return ladder
@@ -218,6 +224,10 @@ def depth_at_impact(ladder: list[dict[str, Any]], impact_pct: float) -> float | 
 
 
 def impact_at_size(ladder: list[dict[str, Any]], size_usd: float) -> float | None:
+    """Measured impact at `size_usd`, interpolated between rungs. An unreadable rung at or
+    below the size makes the answer unknown rather than an extrapolation from smaller rungs."""
+    if any(r.get("impact_pct") is None and r["size_usd"] <= size_usd for r in ladder):
+        return None
     rows = [r for r in ladder if r.get("impact_pct") is not None]
     if not rows:
         return None
