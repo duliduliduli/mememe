@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .config import MMConfig
-from .costs import RangePosition, in_range_probability, projected_lp_edge, symmetric_range
+from .costs import RangePosition, in_range_probability, loss_versus_rebalancing_rate, projected_lp_edge, symmetric_range
 from .execution import Broker, PaperBroker
 from .regime import CRASH, DECAY, LIQUIDITY_WITHDRAWAL, STALE, Regime
 
@@ -171,6 +171,17 @@ def interval_fee_yield(prev: dict[str, Any] | None, row: dict[str, Any]) -> floa
     return fees_1h * max(dt, 0.0) / 3600.0 / tvl
 
 
+SOFT_ERROR_PREFIXES = ("exit ladder",)
+
+
+def hard_data_errors(row: dict[str, Any]) -> list[str]:
+    """Snapshot errors that mean the row cannot be trusted. A missing exit quote is not one
+    of them: it blocks new entries (the exit cost is unknown) but a position is not dumped
+    at market because one quote request failed."""
+    raw = str(row.get("errors") or "")
+    return [e.strip() for e in raw.split(";") if e.strip() and not e.strip().startswith(SOFT_ERROR_PREFIXES)]
+
+
 def exit_cost_pct(row: dict[str, Any], cfg: MMConfig, size_usd: float | None = None) -> float:
     """Impact plus one swap fee for liquidating `size_usd` of the token right now."""
     impact = _f(row, "impact_at_max_position_pct")
@@ -196,8 +207,9 @@ class RiskController:
             reasons.append("stale data")
         if not _f(row, "price_usd"):
             reasons.append("no price")
-        if row.get("errors"):
-            reasons.append(f"data errors: {row['errors']}")
+        hard = hard_data_errors(row)
+        if hard:
+            reasons.append(f"data errors: {'; '.join(hard)}")
         if regime.label == LIQUIDITY_WITHDRAWAL:
             reasons.append("liquidity withdrawal")
         if regime.label == CRASH:
@@ -221,7 +233,9 @@ class RiskController:
         if size_usd * cfg.target_token_fraction > cfg.max_token_exposure_usd:
             reasons.append("token exposure cap")
         impact = _f(row, "impact_at_max_position_pct")
-        if impact is not None and impact > cfg.routine_exit_impact_pct:
+        if impact is None:
+            reasons.append("no exit quote")
+        elif impact > cfg.routine_exit_impact_pct:
             reasons.append(f"routine exit impact {impact:.2f}% > {cfg.routine_exit_impact_pct:.2f}%")
         if not regime.allows_entry:
             reasons.append(f"regime {regime.label}")
@@ -268,6 +282,7 @@ class AdaptiveDLMM(Strategy):
         self.risk = RiskController(cfg)
         self.fixed_half_width = half_width_pct / 100 if half_width_pct else None
         self.adaptive = adaptive
+        self.last_eval: dict[str, dict[str, Any]] = {}
 
     def half_width(self, regime: Regime) -> float:
         if self.fixed_half_width is not None:
@@ -276,7 +291,10 @@ class AdaptiveDLMM(Strategy):
         raw = cfg.range_width_sigma * regime.sigma_hourly * math.sqrt(cfg.horizon_hours)
         return min(cfg.max_range_half_width_pct / 100, max(cfg.min_range_half_width_pct / 100, raw))
 
-    def projected_edge(self, row: dict[str, Any], regime: Regime, half_width: float, size: float) -> float:
+    def edge_components(self, row: dict[str, Any], regime: Regime, half_width: float, size: float) -> dict[str, float]:
+        """The edge gate's terms as fractions of position value: fees earned in range, the
+        loss-versus-rebalancing drift cost, fixed costs (setup, exit impact, opening swap)
+        and the model-error haircut. edge = fees - drift - fixed - model."""
         cfg = self.cfg
         # Meteora reports fee_tvl_ratio in percent (0.2177 == 0.2177% per day).
         fee_yield_hour = (_f(row, "dlmm_fee_tvl_24h") or 0.0) / 100.0 / 24.0
@@ -284,8 +302,36 @@ class AdaptiveDLMM(Strategy):
         fixed = cfg.tx_fee_usd * cfg.lp_setup_transactions
         fixed += size * cfg.target_token_fraction * exit_cost_pct(row, cfg, size * cfg.target_token_fraction) / 100
         fixed += size * 0.5 * (_f(row, "dlmm_base_fee_pct") or cfg.momentum_fee_pct_each_side) / 100  # opening swap
-        return projected_lp_edge(fee_yield_hour, lp_share_of_fees(row, cfg), regime.sigma_hourly, cfg.horizon_hours,
-                                 p_in, fixed, size, cfg.model_error_pct / 100)
+        fees = fee_yield_hour * lp_share_of_fees(row, cfg) * cfg.horizon_hours * p_in
+        drift = loss_versus_rebalancing_rate(regime.sigma_hourly) * cfg.horizon_hours
+        fixed_frac = fixed / size if size > 0 else math.inf
+        model = cfg.model_error_pct / 100
+        return {"edge": fees - drift - fixed_frac - model, "fees": fees, "drift": drift, "fixed": fixed_frac,
+                "model": model, "p_in": p_in, "half_width": half_width, "size": size}
+
+    def projected_edge(self, row: dict[str, Any], regime: Regime, half_width: float, size: float) -> float:
+        return self.edge_components(row, regime, half_width, size)["edge"]
+
+    def why_out(self) -> str | None:
+        """One line explaining the current stay-out decision: the token with the best edge, its
+        gate terms, and the blockers on every evaluated token. None when nothing was evaluated."""
+        if not self.last_eval:
+            return None
+        best_mint, best = max(self.last_eval.items(), key=lambda kv: kv[1].get("edge", -math.inf))
+        blocks: dict[str, int] = {}
+        for ev in self.last_eval.values():
+            for b in ev.get("blocks", []):
+                key = b.split(" ")[0] if b.startswith(("regime", "routine", "exit")) else b
+                blocks[key] = blocks.get(key, 0) + 1
+        parts = [f"STAY_OUT best {best_mint[:8]} edge {best['edge'] * 100:+.2f}%/{self.cfg.horizon_hours:.0f}h"]
+        if "fees" in best:
+            parts.append(f"(fees {best['fees'] * 100:+.2f} drift {-best['drift'] * 100:+.2f} fixed {-best['fixed'] * 100:+.2f} "
+                         f"model {-best['model'] * 100:+.2f}; p_in {best['p_in']:.2f} half_width {best['half_width']:.1%} "
+                         f"sigma_h {best['sigma_hourly']:.2%} regime {best['regime']})")
+        if blocks:
+            parts.append("blocked: " + ", ".join(f"{k}x{v}" for k, v in sorted(blocks.items(), key=lambda kv: -kv[1])))
+        parts.append(f"tokens {len(self.last_eval)}, positive edge {sum(1 for e in self.last_eval.values() if e.get('edge', 0) > 0)}")
+        return " ".join(parts)
 
     def _accrue(self, pos: LpPosition, prev: dict[str, Any] | None, row: dict[str, Any], price: float) -> None:
         ts, prev_ts = _f(row, "ts") or 0.0, _f(prev or {}, "ts") or (_f(row, "ts") or 0.0)
@@ -355,14 +401,21 @@ class AdaptiveDLMM(Strategy):
                 self.state[mint] = PROVIDE
         else:
             self.state[mint] = STAY_OUT if stops else OBSERVE
+            ev: dict[str, Any] = {"regime": regime.label, "sigma_hourly": regime.sigma_hourly, "blocks": list(stops)}
+            if not self.adaptive_ok(row):
+                ev["blocks"].append("no DLMM pool" if not row.get("dlmm_pool") else "pool liquidity")
+            elif ts < self.cooldown_until.get(mint, 0.0):
+                ev["blocks"].append("cooldown")
             if not stops and price > 0 and ts >= self.cooldown_until.get(mint, 0.0) and self.adaptive_ok(row):
                 size = min(cfg.max_position_usd, self.portfolio.cash * 0.95)
                 blocks = self.risk.entry_blocks(row, regime, self.portfolio, prices, size)
-                if not blocks and size >= 1.0:
+                ev["blocks"] = list(blocks)
+                if size >= 1.0:
                     hw = self.half_width(regime)
-                    edge = self.projected_edge(row, regime, hw, size)
-                    if edge > 0:
-                        self._open(row, price, hw, size, edge)
+                    ev.update(self.edge_components(row, regime, hw, size))
+                    if not blocks and ev["edge"] > 0:
+                        self._open(row, price, hw, size, ev["edge"])
+            self.last_eval[mint] = ev
         self.prev[mint] = row
 
     def adaptive_ok(self, row: dict[str, Any]) -> bool:
