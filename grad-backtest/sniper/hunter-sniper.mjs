@@ -582,16 +582,33 @@ async function buy(target) {
 }
 
 // ---------------------------------------------------------------------------------------
-// Take profit: after the buy, watch what the whole bag sells for and exit everything at
-// SNIPER_TAKE_PROFIT_X times the spend (quote net of impact, so the number is executable).
-// $DATA_DIR/sniper-sell.json (POST /api/sniper/sell) forces the sale at any price.
+// Take profit: after the buy, watch the token's price against the entry and sell in stages.
+// SNIPER_TAKE_PROFIT_LADDER = "5:initial,10:80" means: at 5x sell just enough to get the
+// initial spend back, at 10x sell 80% of what is left, then let the rest ride. Rungs are
+// "<multiple>:<initial|percent>", comma separated, ascending. Price multiple = executable
+// sell value of the current bag per token / entry price per token, so impact is included.
+// $DATA_DIR/sniper-sell.json (POST /api/sniper/sell) sells everything left at any price.
 // ---------------------------------------------------------------------------------------
-const TAKE_PROFIT_X = num('SNIPER_TAKE_PROFIT_X', 10);
-// Share of the bag sold when take profit hits; the rest stays in the wallet as a moon bag.
-const TAKE_PROFIT_SELL_PCT = Math.min(100, Math.max(1, num('SNIPER_TAKE_PROFIT_SELL_PCT', 80)));
+function parseLadder(spec) {
+  const rungs = [];
+  for (const part of String(spec || '').split(',')) {
+    const m = part.trim().match(/^(\d+(?:\.\d+)?)\s*[:x@]\s*(initial|\d+(?:\.\d+)?%?)$/i);
+    if (!m) continue;
+    const x = Number(m[1]);
+    const sell = /^initial$/i.test(m[2]) ? 'initial' : Math.min(100, Math.max(1, Number(m[2].replace('%', ''))));
+    if (x > 1) rungs.push({ x, sell });
+  }
+  return rungs.sort((a, b) => a.x - b.x);
+}
+const TAKE_PROFIT_LADDER = parseLadder(env('SNIPER_TAKE_PROFIT_LADDER', '5:initial,10:80'));
+if (!TAKE_PROFIT_LADDER.length) TAKE_PROFIT_LADDER.push({ x: 5, sell: 'initial' }, { x: 10, sell: 80 });
 const TP_CHECK_MS = Math.max(5000, num('SNIPER_TP_CHECK_MS', 15000));
 const SELL_FILE = path.join(DATA_DIR, 'sniper-sell.json');
 const tp = { lastCheck: 0, lastLogged: null, multiple: null, quoteErrors: 0 };
+
+function describeLadder(rungs) {
+  return rungs.map((r) => `at ${r.x}x sell ${r.sell === 'initial' ? 'the initial stake back' : `${r.sell}% of what is left`}`).join(', ') + ', then let the rest ride';
+}
 
 async function tokenBalance(pos) {
   if (pos.chain === 'sol') {
@@ -611,10 +628,25 @@ async function sellValueRaw(pos, amountRaw) {
 function openPosition(target, res, tweetId) {
   state.position = {
     chain: target.chain, chainName: CHAIN_NAMES[target.chain], address: target.address, spentRaw: String(res.spentRaw), spend: res.spend,
-    buyHash: res.hash, tweet: tweetId, openedAt: new Date().toISOString(), takeProfitX: TAKE_PROFIT_X, sellPct: TAKE_PROFIT_SELL_PCT, sold: null,
+    buyHash: res.hash, tweet: tweetId, openedAt: new Date().toISOString(),
+    ladder: TAKE_PROFIT_LADDER.map((r) => ({ ...r, done: null })), initialBalanceRaw: null, sales: [], sold: null,
   };
   saveState(state);
-  log(`[tp] watching ${target.address} on ${CHAIN_NAMES[target.chain]}: sell ${TAKE_PROFIT_SELL_PCT}% at ${TAKE_PROFIT_X}x of ${res.spend}, keep the rest`);
+  log(`[tp] watching ${target.address} on ${CHAIN_NAMES[target.chain]}: ${describeLadder(TAKE_PROFIT_LADDER)}`);
+}
+
+/** The token amount the buy produced, read from the wallet (retried: balances can lag a
+ *  block or two). Needed to turn bag value into a per-token price multiple. */
+async function ensureInitialBalance(pos) {
+  if (pos.initialBalanceRaw) return BigInt(pos.initialBalanceRaw);
+  for (let i = 0; i < 6; i++) {
+    try {
+      const bal = await tokenBalance(pos);
+      if (bal > 0n) { pos.initialBalanceRaw = bal.toString(); saveState(state); log(`[tp] entry: ${bal} raw tokens for ${pos.spend}`); return bal; }
+    } catch { /* retry */ }
+    await sleep(2000);
+  }
+  return null;
 }
 
 function fmtNative(pos, raw) {
@@ -625,12 +657,15 @@ async function checkTakeProfit() {
   const pos = state.position;
   if (!pos) return;
   const manual = fs.existsSync(SELL_FILE);
-  // After take profit only a manual request touches the moon bag.
-  if (pos.sold && !manual) return;
-  if (pos.sold && pos.sold.hash === 'external') { if (manual) { try { fs.unlinkSync(SELL_FILE); } catch { /* gone */ } } return; }
+  if (pos.sold) { if (manual) { try { fs.unlinkSync(SELL_FILE); } catch { /* gone */ } } return; }
+  if (!pos.ladder) pos.ladder = TAKE_PROFIT_LADDER.map((r) => ({ ...r, done: null }));
+  const pending = pos.ladder.filter((r) => !r.done);
+  // Every rung done and no manual request: the rest rides untouched.
+  if (!pending.length && !manual) return;
   if (!manual && Date.now() - tp.lastCheck < TP_CHECK_MS) return;
   tp.lastCheck = Date.now();
   if (pos.chain === 'sol' ? !solEnabled() : !evm.providers[pos.chain]) return;
+  const initial = await ensureInitialBalance(pos);
   let balance;
   try { balance = await tokenBalance(pos); } catch (e) { log(`[tp] balance read failed: ${String(e.message).slice(0, 120)}`); return; }
   if (balance <= 0n) {
@@ -645,27 +680,46 @@ async function checkTakeProfit() {
     if (tp.quoteErrors === 1 || tp.quoteErrors % 20 === 0) log(`[tp] no sell quote yet (${tp.quoteErrors}x): ${String(e.message).slice(0, 160)}`);
     if (!manual) return;
   }
-  if (value !== undefined) {
-    tp.multiple = Number(value) / Number(pos.spentRaw);
+  let rung = null;
+  if (value !== undefined && initial) {
+    // Price multiple per token: (value / balance) / (spent / initial balance).
+    tp.multiple = (Number(value) / Number(balance)) / (Number(pos.spentRaw) / Number(initial));
+    const next = pending[0];
     if (tp.lastLogged === null || Math.abs(tp.multiple - tp.lastLogged) >= Math.max(0.25, tp.lastLogged * 0.25)) {
-      log(`[tp] ${pos.address.slice(0, 10)} bag sells for ${fmtNative(pos, value)} = ${tp.multiple.toFixed(2)}x of ${pos.spend} (target ${pos.takeProfitX}x)`);
+      log(`[tp] ${pos.address.slice(0, 10)} at ${tp.multiple.toFixed(2)}x entry; bag sells for ${fmtNative(pos, value)}`
+        + (next ? `; next rung ${next.x}x (${next.sell === 'initial' ? 'initial back' : `${next.sell}%`})` : '; all rungs done, rest rides'));
       tp.lastLogged = tp.multiple;
     }
+    // Take the highest rung the price has crossed; skipped lower rungs are folded into it.
+    for (const r of pending) if (tp.multiple >= r.x) rung = r;
   }
-  if (!manual && !(tp.multiple >= pos.takeProfitX)) return;
-  // Take profit sells the configured share; a manual sell dumps whatever is left.
-  const pct = manual ? 100 : (pos.sellPct ?? TAKE_PROFIT_SELL_PCT);
-  const amount = pct >= 100 ? balance : balance * BigInt(Math.round(pct * 100)) / 10000n;
-  if (amount <= 0n) return;
-  const why = manual ? 'manual sell requested' : `${tp.multiple.toFixed(2)}x >= ${pos.takeProfitX}x take profit`;
-  await notify(`💰 SELLING ${pct}% of ${pos.address} on ${pos.chainName}: ${why}`);
+  if (!manual && !rung) return;
+  let amount;
+  let label;
+  if (manual) { amount = balance; label = 'everything left'; }
+  else if (rung.sell === 'initial') {
+    // Tokens whose sale returns the initial spend, from the executable quote of the whole bag.
+    amount = balance * BigInt(pos.spentRaw) / value;
+    amount = amount > balance ? balance : amount;
+    label = `the initial stake (${(Number(amount) * 100 / Number(balance)).toFixed(1)}% of the bag)`;
+  } else {
+    amount = balance * BigInt(Math.round(rung.sell * 100)) / 10000n;
+    label = `${rung.sell}% of what is left`;
+  }
+  if (amount <= 0n) { if (manual) { try { fs.unlinkSync(SELL_FILE); } catch { /* gone */ } } return; }
+  const why = manual ? 'manual sell requested' : `${tp.multiple.toFixed(2)}x >= ${rung.x}x rung`;
+  await notify(`💰 SELLING ${label} of ${pos.address} on ${pos.chainName}: ${why}`);
   try {
     const res = pos.chain === 'sol' ? await sellSolana(pos, amount) : await sellEvm(pos, amount);
-    const multiple = Number(res.outRaw) / Number(pos.spentRaw);
-    pos.sold = { hash: res.hash, outRaw: res.outRaw, pct, multiple, at: new Date().toISOString(), why, remainderRaw: (balance - amount).toString() };
+    const sale = { hash: res.hash, outRaw: res.outRaw, amountRaw: amount.toString(), at: new Date().toISOString(), why, rung: rung ? rung.x : 'manual' };
+    pos.sales.push(sale);
+    if (manual) pos.sold = { ...sale, remainderRaw: '0' };
+    else for (const r of pending) if (tp.multiple >= r.x) r.done = sale;
     saveState(state);
-    const kept = pct < 100 ? `; keeping ${100 - pct}% as a moon bag (sell it any time with POST /api/sniper/sell)` : '';
-    await notify(`✅ SOLD ${pct}% of ${pos.address} on ${pos.chainName} for about ${fmtNative(pos, res.outRaw)} (${multiple.toFixed(2)}x the spend): ${res.hash}${kept}`);
+    const left = balance - amount;
+    const recovered = pos.sales.reduce((s, x) => s + BigInt(x.outRaw || 0), 0n);
+    await notify(`✅ SOLD ${label} of ${pos.address} on ${pos.chainName} for about ${fmtNative(pos, res.outRaw)}: ${res.hash}. `
+      + `Cashed out so far ${fmtNative(pos, recovered)} against ${pos.spend} spent; ${left > 0n ? `${(Number(left) * 100 / Number(initial || balance)).toFixed(1)}% of the original bag still riding` : 'nothing left'}.`);
   } catch (e) {
     await notify(`❌ Sell failed for ${pos.address}: ${String(e.message || e).slice(0, 300)}; will retry next check`);
   } finally {
@@ -778,8 +832,9 @@ function heartbeat() {
   if (Date.now() - stats.lastHeartbeat < HEARTBEAT_MS) return;
   stats.lastHeartbeat = Date.now();
   const pos = state.position;
-  const posNote = pos ? (pos.sold ? `; sold ${pos.sold.pct ?? 100}% of ${pos.address.slice(0, 10)} at ${pos.sold.multiple ? pos.sold.multiple.toFixed(2) + 'x' : pos.sold.hash}${pos.sold.pct && pos.sold.pct < 100 ? ', moon bag kept' : ''}`
-    : `; holding ${pos.address.slice(0, 10)} on ${pos.chainName} at ${tp.multiple == null ? '?' : tp.multiple.toFixed(2) + 'x'} (sell ${pos.sellPct ?? TAKE_PROFIT_SELL_PCT}% at ${pos.takeProfitX}x)`) : '';
+  const rungsDone = pos?.ladder ? pos.ladder.filter((r) => r.done).length : 0;
+  const posNote = pos ? (pos.sold ? `; ${pos.address.slice(0, 10)} fully sold (${pos.sold.hash})`
+    : `; holding ${pos.address.slice(0, 10)} on ${pos.chainName} at ${tp.multiple == null ? '?' : tp.multiple.toFixed(2) + 'x'} entry, ${rungsDone}/${pos.ladder ? pos.ladder.length : 0} rungs taken`) : '';
   log(`[heartbeat] ${stats.polls} polls, ${stats.ok} ok, ${stats.errors} errors, ${stats.posts} posts seen, `
     + `${Object.keys(state.pending).length} pending; dryRun=${CFG.dryRun} bought=${state.bought}${posNote}`);
 }
@@ -839,8 +894,8 @@ async function main() {
     log(`Solana wallet ${sol.keypair.publicKey.toBase58()}: ${bal} SOL; spend cap ${CFG.sol.spendSol} SOL per buy`);
   } else log('Solana buying off (needs WALLET_PRIVATE_KEY)');
   if (state.bought) log(`already bought once: ${JSON.stringify(state.buy)} — delete ${CFG.stateFile} to arm again`);
-  if (state.position && !state.position.sold) log(`[tp] resuming watch on ${state.position.address} (${state.position.chainName}); sell ${state.position.sellPct ?? TAKE_PROFIT_SELL_PCT}% at ${state.position.takeProfitX}x of ${state.position.spend}`);
-  log(`take profit: sell ${TAKE_PROFIT_SELL_PCT}% at ${TAKE_PROFIT_X}x and keep the rest, checked every ${TP_CHECK_MS / 1000}s; POST /api/sniper/sell sells everything left`);
+  if (state.position && !state.position.sold) log(`[tp] resuming watch on ${state.position.address} (${state.position.chainName}): ${describeLadder(state.position.ladder || TAKE_PROFIT_LADDER)}`);
+  log(`take profit ladder: ${describeLadder(TAKE_PROFIT_LADDER)}; checked every ${TP_CHECK_MS / 1000}s; POST /api/sniper/sell sells everything left`);
   if (CFG.dryRun) log('DRY RUN: nothing will be sent. Set SNIPER_DRY_RUN=false to go live.');
   if (CFG.xaiKey) {
     try { await grokProbe(); } catch (e) { log(`[probe] Grok read failed: ${e.message}`); }
