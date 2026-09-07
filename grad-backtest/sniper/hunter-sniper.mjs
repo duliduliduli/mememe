@@ -188,22 +188,32 @@ const GROK_SYSTEM = 'You are a monitoring tool, not a chat assistant. You answer
 async function grokRequest(userPrompt, timeoutMs = 45000) {
   const today = new Date();
   const fromDate = new Date(today.getTime() - 24 * 3600 * 1000).toISOString().slice(0, 10);
+  // Citations are returned by default on the Responses API; optional arguments are dropped
+  // one by one if the API says it does not support them, so a schema change never stalls us.
   const body = {
     model: CFG.xaiModel,
     input: [{ role: 'system', content: GROK_SYSTEM }, { role: 'user', content: userPrompt }],
     tools: [{ type: 'x_search', allowed_x_handles: [CFG.handle], from_date: fromDate }],
-    include: ['inline_citations'],
     temperature: 0,
     store: false,
   };
-  const r = await fetchJson(`${CFG.xaiBase}/v1/responses`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${CFG.xaiKey}` },
-    body: JSON.stringify(body),
-  }, timeoutMs);
-  if (r.status === 429) throw Object.assign(new Error('xAI rate limited'), { retryAfterMs: 20000 });
-  if (!r.ok) throw new Error(`xAI ${r.status}: ${r.text.slice(0, 300)}`);
-  return collectResponseText(r.json ?? {});
+  const optional = ['temperature', 'store'];
+  for (;;) {
+    const r = await fetchJson(`${CFG.xaiBase}/v1/responses`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${CFG.xaiKey}` },
+      body: JSON.stringify(body),
+    }, timeoutMs);
+    if (r.status === 429) throw Object.assign(new Error('xAI rate limited'), { retryAfterMs: 20000 });
+    if (r.status === 400 && /not supported/i.test(r.text)) {
+      const culprit = optional.find((k) => k in body && new RegExp(`"${k}"`).test(r.text))
+        || (/"from_date"|"allowed_x_handles"/.test(r.text) ? 'tool-args' : null);
+      if (culprit === 'tool-args' && body.tools[0].from_date) { delete body.tools[0].from_date; log('[grok] API rejected from_date; retrying without it'); continue; }
+      if (culprit && culprit !== 'tool-args') { delete body[culprit]; log(`[grok] API rejected "${culprit}"; retrying without it`); continue; }
+    }
+    if (!r.ok) throw new Error(`xAI ${r.status}: ${r.text.slice(0, 300)}`);
+    return collectResponseText(r.json ?? {});
+  }
 }
 
 async function grokTweets() {
