@@ -18,11 +18,12 @@ from pathlib import Path
 from typing import Any
 
 from .config import MMConfig
+from .costs import RangePosition
 from .execution import LiveBroker, Sidecar, Signer
 from .paper import PaperEngine
 from .replay import ReplayEngine
 from .sources import HttpError, Sources
-from .strategy import AdaptiveDLMM, Momentum, default_strategies
+from .strategy import PROVIDE, AdaptiveDLMM, LpPosition, Momentum, default_strategies
 
 SIDECAR_DIR = Path(__file__).resolve().parent / "sidecar"
 
@@ -144,18 +145,63 @@ class LiveEngine(PaperEngine):
             self.log(f"[live] wallet {self.signer.pubkey} holds {sol:.4f} SOL; live capital deployed ${deployed:.2f} of ${self.cfg.bankroll_usd:.2f} bankroll")
         except Exception as exc:  # noqa: BLE001
             self.log(f"[live] wallet balance unavailable: {exc}")
+        self.adopt_untracked()
+
+    def adopt_untracked(self) -> None:
+        """Find DLMM positions this wallet holds in universe pools that no live strategy
+        knows about (state lost on a redeploy, or opened by hand) and hand them to
+        adaptive_dlmm at their current on-chain value, so they are managed and closed like
+        any other position instead of sitting orphaned."""
+        if not self.universe:
+            return
+        owner = next((s for s in self.live_strategies() if isinstance(s, AdaptiveDLMM)), None)
+        if owner is None:
+            return
+        known = {pos.position_key for s in self.live_strategies() for pos in s.portfolio.lp.values()}
+        sol_usd = None
         for entry in self.universe:
-            pool = entry.get("dlmm_pool")
-            if not pool:
+            pool, mint = entry.get("dlmm_pool"), entry.get("mint")
+            if not pool or not mint:
                 continue
             try:
                 view = self.sidecar.get("/positions", address=pool, discover="1")
             except Exception:  # noqa: BLE001
                 continue
-            known = {pos.position_key for s in self.live_strategies() for pos in s.portfolio.lp.values()}
+            if view.get("discoverError"):
+                self.log(f"[live] position discovery unavailable for pool {pool[:8]}: {view['discoverError']}")
+                continue
             for found in view.get("discovered") or []:
-                if found.get("position") not in known:
-                    self.log(f"[live] untracked DLMM position {found['position']} in pool {pool[:8]} (not managed by this engine)")
+                key = found.get("position")
+                if not key or key in known:
+                    continue
+                try:
+                    if sol_usd is None:
+                        sol_usd = self.broker.sol_price()
+                    info = self.sidecar.get("/pool", address=pool)
+                    token = int(found.get("tokenAmountRaw") or 0) / 10 ** int(info["decimalsX"])
+                    quote_sol = int(found.get("quoteAmountRaw") or 0) / 1e9
+                    price_usd = float(info["price"]) * sol_usd
+                    value_usd = token * price_usd + quote_sol * sol_usd
+                    lower, upper = float(found["lowerPrice"]) * sol_usd, float(found["upperPrice"]) * sol_usd
+                    rng = RangePosition.open(value_usd, price_usd, lower, upper)
+                except Exception as exc:  # noqa: BLE001
+                    self.log(f"[live] untracked DLMM position {key} in pool {pool[:8]} could not be valued ({exc}); not managed")
+                    continue
+                if mint in owner.portfolio.lp:
+                    self.log(f"[live] untracked DLMM position {key} in pool {pool[:8]} skipped: adaptive_dlmm already holds {mint[:8]}")
+                    continue
+                pos = LpPosition(mint, time.time(), rng, value_usd, price_usd, last_price=price_usd, peak_value=value_usd,
+                                 position_key=key, pool=pool, rent_sol=self.cfg.lp_position_rent_sol)
+                owner.portfolio.lp[mint] = pos
+                owner.portfolio.cash -= value_usd
+                owner.state[mint] = PROVIDE
+                owner.portfolio.log(time.time(), mint, "ADOPTED", "untracked on-chain position taken over at current value",
+                                    price_usd, value_usd, f"position={key} range=[{lower:.6g},{upper:.6g}]")
+                self.broker.deployed_usd += value_usd
+                known.add(key)
+                self.log(f"[live] adopted untracked DLMM position {key} in pool {pool[:8]} ({mint[:8]}): "
+                         f"${value_usd:.2f} at ${price_usd:.6g}, range [{lower:.6g}, {upper:.6g}]; adaptive_dlmm now manages it")
+        self.save()
 
     # -- control -----------------------------------------------------------------------
     def check_flags(self) -> None:
@@ -178,6 +224,16 @@ class LiveEngine(PaperEngine):
             self.draining = draining
             self.log("[live] STOP flag: draining, no new entries" if draining else "[live] stop flag cleared: entries enabled")
         self.broker.draining = draining
+
+    def refresh_universe(self, force: bool = False) -> None:
+        before = self.universe_refreshed
+        super().refresh_universe(force)
+        if self.universe_refreshed != before:
+            # A fresh universe is the moment to look for positions nobody is managing.
+            try:
+                self.adopt_untracked()
+            except Exception as exc:  # noqa: BLE001
+                self.log(f"[live] untracked position scan failed: {exc}")
 
     def tick(self) -> None:
         self.check_flags()

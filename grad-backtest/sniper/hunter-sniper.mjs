@@ -792,6 +792,53 @@ async function runTest(text, origin) {
   } finally { CFG.dryRun = saved.dryRun; CFG.routeWaitS = saved.routeWaitS; }
 }
 
+/** State-file loss (a redeploy without a persistent volume) must not strand a bag: rebuild the
+ *  position from chain history. Alchemy's asset-transfer index lists ERC20 tokens this
+ *  wallet received; a token we still hold that arrived in a transaction we sent with ETH
+ *  attached is our buy, and that ETH is the spend. Rungs already taken are inferred from
+ *  how much of the original bag is left. */
+async function recoverEvmPosition() {
+  for (const [id, provider] of Object.entries(evm.providers)) {
+    const chainId = Number(id);
+    if (!/alchemy\.com/.test(evm.rpc[chainId] || '')) continue;
+    const wallet = evm.wallets[chainId].address;
+    let res;
+    try {
+      res = await provider.send('alchemy_getAssetTransfers', [{ fromBlock: '0x0', toAddress: wallet, category: ['erc20'], order: 'desc', maxCount: '0x19', withMetadata: true }]);
+    } catch (e) { log(`[tp] chain history unavailable on ${CHAIN_NAMES[chainId]} (${String(e.message).slice(0, 100)}); no position recovery`); continue; }
+    for (const t of res?.transfers || []) {
+      const token = t.rawContract?.address;
+      if (!token || !ethers.isAddress(token)) continue;
+      const when = Date.parse(t.metadata?.blockTimestamp || '');
+      if (when && Date.now() - when > 14 * 24 * 3600 * 1000) break;
+      const address = ethers.getAddress(token);
+      let balance;
+      try { balance = await tokenBalance({ chain: chainId, address }); } catch { continue; }
+      if (balance <= 0n) continue;
+      let tx;
+      try { tx = await provider.getTransaction(t.hash); } catch { tx = null; }
+      if (!tx || tx.from.toLowerCase() !== wallet.toLowerCase() || tx.value <= 0n) continue;
+      const initial = BigInt(t.rawContract.value || '0x0');
+      const ladder = TAKE_PROFIT_LADDER.map((r) => ({ ...r, done: null }));
+      const leftFrac = initial > 0n ? Number(balance) / Number(initial) : 1;
+      // Infer rungs already taken: the initial-back rung leaves ~80% at 5x, the 80% rung far less.
+      if (leftFrac < 0.9 && ladder[0]) ladder[0].done = { hash: 'inferred', why: `only ${(leftFrac * 100).toFixed(0)}% of the original bag remains` };
+      if (leftFrac < 0.4 && ladder[1]) ladder[1].done = { hash: 'inferred', why: `only ${(leftFrac * 100).toFixed(0)}% of the original bag remains` };
+      const spend = `${Number(ethers.formatEther(tx.value)).toFixed(5)} ETH`;
+      state.position = {
+        chain: chainId, chainName: CHAIN_NAMES[chainId], address, spentRaw: tx.value.toString(), spend, buyHash: t.hash, tweet: 'recovered',
+        openedAt: t.metadata?.blockTimestamp || new Date().toISOString(), ladder, initialBalanceRaw: initial > 0n ? initial.toString() : null, sales: [], sold: null,
+      };
+      state.bought = true;
+      state.buy = { hash: t.hash, chain: CHAIN_NAMES[chainId], address, spend, at: state.position.openedAt, recovered: true };
+      saveState(state);
+      log(`[tp] recovered position from chain history: ${address} on ${CHAIN_NAMES[chainId]}, bought for ${spend} in ${t.hash}; `
+        + `${(leftFrac * 100).toFixed(0)}% of the original bag held; rungs already taken: ${ladder.filter((r) => r.done).length}/${ladder.length}`);
+      return;
+    }
+  }
+}
+
 const TEST_FILE = path.join(DATA_DIR, 'sniper-test.json');
 async function runQueuedTest() {
   let text = null;
@@ -933,6 +980,9 @@ async function main() {
     log(`Solana wallet ${sol.keypair.publicKey.toBase58()}: ${bal} SOL; spend rule ${spendRule()} = right now ${now}`);
   } else log('Solana buying off (needs WALLET_PRIVATE_KEY)');
   if (state.bought) log(`already bought once: ${JSON.stringify(state.buy)} — delete ${CFG.stateFile} to arm again`);
+  if (!state.position && evmEnabled()) {
+    try { await recoverEvmPosition(); } catch (e) { log(`[tp] position recovery failed: ${String(e.message).slice(0, 160)}`); }
+  }
   if (state.position && !state.position.sold) log(`[tp] resuming watch on ${state.position.address} (${state.position.chainName}): ${describeLadder(state.position.ladder || TAKE_PROFIT_LADDER)}`);
   log(`take profit ladder: ${describeLadder(TAKE_PROFIT_LADDER)}; checked every ${TP_CHECK_MS / 1000}s; POST /api/sniper/sell sells everything left`);
   if (CFG.dryRun) log('DRY RUN: nothing will be sent. Set SNIPER_DRY_RUN=false to go live.');
