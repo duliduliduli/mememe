@@ -235,7 +235,8 @@ async function grokRequest(userPrompt, timeoutMs = 45000, fromDate = null) {
   const body = {
     model: CFG.xaiModel,
     input: [{ role: 'system', content: GROK_SYSTEM }, { role: 'user', content: userPrompt }],
-    tools: [{ type: 'x_search', allowed_x_handles: [CFG.handle], from_date: fromDate }],
+    // Image understanding: a contract address posted as a screenshot still gets read.
+    tools: [{ type: 'x_search', allowed_x_handles: [CFG.handle], from_date: fromDate, enable_image_understanding: true }],
     temperature: 0,
     store: false,
   };
@@ -249,7 +250,10 @@ async function grokRequest(userPrompt, timeoutMs = 45000, fromDate = null) {
     if (r.status === 429) throw Object.assign(new Error('xAI rate limited'), { retryAfterMs: 20000 });
     if (r.status === 400 && /not supported/i.test(r.text)) {
       const culprit = optional.find((k) => k in body && new RegExp(`"${k}"`).test(r.text))
-        || (/"from_date"|"allowed_x_handles"/.test(r.text) ? 'tool-args' : null);
+        || (/"from_date"|"allowed_x_handles"|"enable_image_understanding"/.test(r.text) ? 'tool-args' : null);
+      if (culprit === 'tool-args' && /"enable_image_understanding"/.test(r.text) && body.tools[0].enable_image_understanding !== undefined) {
+        delete body.tools[0].enable_image_understanding; log('[grok] API rejected enable_image_understanding; retrying without it'); continue;
+      }
       if (culprit === 'tool-args' && body.tools[0].from_date) { delete body.tools[0].from_date; log('[grok] API rejected from_date; retrying without it'); continue; }
       if (culprit && culprit !== 'tool-args') { delete body[culprit]; log(`[grok] API rejected "${culprit}"; retrying without it`); continue; }
     }
@@ -280,6 +284,7 @@ async function grokTweets() {
   const prompt = `Using x_search, find every post published by @${CFG.handle} after ${sinceIso} (UTC), newest first, at most 10. `
     + 'Reply with ONLY a JSON array, no prose, no markdown: '
     + '[{"id":"<numeric status id>","url":"https://x.com/' + CFG.handle + '/status/<id>","created_at":"<ISO 8601 UTC>","text":"<full verbatim post text with every URL and address exactly as written>"}]. '
+    + 'If a post shows a contract address only inside an attached image, append that address to the text field exactly as it appears. '
     + 'Return [] if there are none.';
   const { text, urls } = await grokRequest(prompt);
   const tweets = parseTweetsJson(text).filter((t) => !t.handle || t.handle === CFG.handle);
