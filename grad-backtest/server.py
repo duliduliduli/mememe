@@ -186,8 +186,9 @@ def runtime_logs(request: Request, hours: float = 6, q: str = "", limit: int = 2
     max_bytes = max(1_000_000, min(int(os.getenv("LOG_VIEWER_MAX_BYTES", "12000000")), 50_000_000))
     truncated = False
     lines: list[str] = []
-    # The executor and the market-making lane (mm.log) share one view, merged by timestamp.
-    for path in (EXECUTOR_LOG, DATA_DIR / "mm.log"):
+    # The executor, the market-making lane (mm.log) and the launch sniper (sniper.log)
+    # share one view, merged by timestamp.
+    for path in (EXECUTOR_LOG, DATA_DIR / "mm.log", DATA_DIR / "sniper.log"):
         if not path.exists():
             continue
         size = path.stat().st_size
@@ -510,6 +511,97 @@ def maybe_autostart_mm() -> None:
         print(f"[server] MM autostart: launched market-making lane in {mode} mode", flush=True)
     elif not _mm_autostart():
         print("[server] MM_AUTOSTART=0: market-making lane NOT started", flush=True)
+
+
+# --- Launch sniper lane (sniper/hunter-sniper.mjs) -------------------------------------
+
+_sniper_proc: subprocess.Popen | None = None
+
+
+def _sniper_running() -> bool:
+    return _sniper_proc is not None and _sniper_proc.poll() is None
+
+
+def _sniper_source() -> str:
+    if os.getenv("TWITTER_BEARER_TOKEN"):
+        return "x-api"
+    if os.getenv("XAI_API_KEY"):
+        return "grok"
+    return ""
+
+
+def _sniper_autostart() -> bool:
+    """SNIPER_AUTOSTART=1/0 wins; otherwise the lane starts whenever a post source key is set."""
+    explicit = os.getenv("SNIPER_AUTOSTART", "").strip()
+    if explicit in ("0", "1"):
+        return explicit == "1"
+    return bool(_sniper_source())
+
+
+def _sniper_dry_run() -> bool:
+    value = os.getenv("SNIPER_DRY_RUN", os.getenv("DRY_RUN", "true")).strip().lower()
+    return value not in ("false", "0")
+
+
+def _start_sniper() -> None:
+    global _sniper_proc
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _sniper_proc = subprocess.Popen(["node", "sniper/hunter-sniper.mjs"], cwd=Path(__file__).parent)
+
+
+def _sniper_state() -> dict[str, Any]:
+    path = Path(os.getenv("SNIPER_STATE_FILE", str(DATA_DIR / "sniper-state.json")))
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+@app.get("/api/sniper/status")
+def sniper_status() -> JSONResponse:
+    state = _sniper_state()
+    return JSONResponse({
+        "running": _sniper_running(),
+        "autostart": _sniper_autostart(),
+        "source": _sniper_source() or None,
+        "target": os.getenv("SNIPER_TARGET", os.getenv("TARGET_USERNAME", "hunterbiden")).lstrip("@").lower(),
+        "dry_run": _sniper_dry_run(),
+        "bought": bool(state.get("bought")),
+        "buy": state.get("buy"),
+        "seen_posts": len(state.get("seen") or []),
+        "pending_posts": len(state.get("pending") or {}),
+    })
+
+
+@app.post("/api/sniper/start")
+def sniper_start(request: Request) -> JSONResponse:
+    _require_admin(request)
+    if _sniper_running():
+        raise HTTPException(409, "sniper already running")
+    if not _sniper_source():
+        raise HTTPException(400, "set XAI_API_KEY or TWITTER_BEARER_TOKEN first")
+    _start_sniper()
+    return JSONResponse({"started": True, "dry_run": _sniper_dry_run()})
+
+
+@app.post("/api/sniper/stop")
+def sniper_stop(request: Request) -> JSONResponse:
+    _require_admin(request)
+    if not _sniper_running():
+        return JSONResponse({"stopped": False, "note": "sniper not running"})
+    _sniper_proc.terminate()
+    return JSONResponse({"stopped": True})
+
+
+@app.on_event("startup")
+def maybe_autostart_sniper() -> None:
+    if _sniper_autostart() and not _sniper_running():
+        _start_sniper()
+        print(f"[server] sniper autostart: watching X via {_sniper_source()} (dry_run={_sniper_dry_run()})", flush=True)
+    elif not _sniper_source():
+        print("[server] sniper NOT started: set XAI_API_KEY (Grok) or TWITTER_BEARER_TOKEN (X API) to arm it", flush=True)
+    else:
+        print("[server] SNIPER_AUTOSTART=0: sniper NOT started", flush=True)
 
 
 def _mm_owns_wallet() -> bool:
