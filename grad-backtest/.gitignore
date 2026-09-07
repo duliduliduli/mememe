@@ -1,6 +1,7 @@
 .env
 .venv/
 __pycache__/
+node_modules
 .pytest_cache/
 data/cache/
 data/*.csv

@@ -415,6 +415,80 @@ def executor_panic(request: Request) -> JSONResponse:
     return JSONResponse({"panic": True, "note": "selling all open positions at market, then draining"})
 
 
+_mm_proc: subprocess.Popen | None = None
+
+
+def _mm_running() -> bool:
+    return _mm_proc is not None and _mm_proc.poll() is None
+
+
+def _start_mm(mode: str) -> None:
+    """Market-making lane (mm package): `paper` shadows only, `live` trades through the DLMM
+    sidecar and Jupiter with the same wallet as the executor. Stdout stays inherited so its
+    lines land in the container log next to the executor's."""
+    global _mm_proc
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    (DATA_DIR / "mm.stop").unlink(missing_ok=True)
+    _mm_proc = subprocess.Popen([sys.executable, "-m", "mm", mode, "--hours", "876000"], cwd=Path(__file__).parent)
+
+
+def _mm_tail(name: str, limit: int) -> list[dict[str, Any]]:
+    mode = os.getenv("MM_MODE", "paper")
+    path = DATA_DIR / ("mm_live" if mode == "live" else "mm_paper") / name
+    if not path.exists():
+        return []
+    try:
+        frame = pd.read_csv(path)
+    except Exception:  # noqa: BLE001
+        return []
+    return frame.tail(limit).to_dict(orient="records")
+
+
+@app.get("/api/mm/status")
+def mm_status() -> JSONResponse:
+    nlv = _mm_tail("nlv.csv", 6)
+    return JSONResponse({
+        "mode": os.getenv("MM_MODE", "paper"),
+        "autostart": os.getenv("MM_AUTOSTART", "0") == "1",
+        "running": _mm_running(),
+        "draining": (DATA_DIR / "mm.stop").exists(),
+        "latest_nlv": nlv,
+        "recent_events": _mm_tail("events.csv", 20),
+    })
+
+
+@app.post("/api/mm/start")
+def mm_start(request: Request) -> JSONResponse:
+    _require_admin(request)
+    if _mm_running():
+        raise HTTPException(409, "mm already running")
+    mode = os.getenv("MM_MODE", "paper")
+    _start_mm(mode)
+    return JSONResponse({"started": True, "mode": mode})
+
+
+@app.post("/api/mm/stop")
+def mm_stop(request: Request) -> JSONResponse:
+    _require_admin(request)
+    (DATA_DIR / "mm.stop").touch()
+    return JSONResponse({"draining": True, "note": "no new mm entries; open positions still managed"})
+
+
+@app.post("/api/mm/panic")
+def mm_panic(request: Request) -> JSONResponse:
+    _require_admin(request)
+    (DATA_DIR / "mm.panic").touch()
+    return JSONResponse({"panic": True, "note": "closing every live mm position at market, then draining"})
+
+
+@app.on_event("startup")
+def maybe_autostart_mm() -> None:
+    if os.getenv("MM_AUTOSTART", "0") == "1" and not _mm_running():
+        mode = os.getenv("MM_MODE", "paper")
+        _start_mm(mode)
+        print(f"[server] MM autostart: launched market-making lane in {mode} mode", flush=True)
+
+
 @app.on_event("startup")
 def maybe_autostart_executor() -> None:
     autostart = os.getenv("EXECUTOR_AUTOSTART", "0") == "1"
