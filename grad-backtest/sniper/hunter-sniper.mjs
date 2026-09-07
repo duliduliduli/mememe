@@ -67,9 +67,13 @@ const CFG = {
   webhook: env('DISCORD_WEBHOOK').trim(),
   stateFile: env('SNIPER_STATE_FILE', path.join(DATA_DIR, 'sniper-state.json')),
   logFile: env('SNIPER_LOG_FILE', path.join(DATA_DIR, 'sniper.log')),
+  // Spend = this share of the wallet's native balance at buy time, leaving the reserve for
+  // gas. 0 switches to the fixed SNIPER_SPEND_ETH / SNIPER_SPEND_SOL amounts instead.
+  spendPct: Math.min(100, Math.max(0, num('SNIPER_SPEND_PCT', 90))),
   evm: {
     key: env('SNIPER_EVM_PRIVATE_KEY', env('PRIVATE_KEY')).trim(),
     spendEth: env('SNIPER_SPEND_ETH', env('SPEND_ETH', '0.1')),
+    gasReserveEth: env('SNIPER_GAS_RESERVE_ETH', '0.002'),
     zeroExKey: env('ZEROEX_API_KEY').trim(),                    // optional: 0x is tried first when present
     priorityGwei: num('SNIPER_PRIORITY_FEE_GWEI', num('PRIORITY_FEE_GWEI', 3)),
     rpcs: { 8453: evmRpcCandidates(8453), 1: evmRpcCandidates(1) },
@@ -77,6 +81,7 @@ const CFG = {
   sol: {
     key: env('SNIPER_SOL_PRIVATE_KEY', env('WALLET_PRIVATE_KEY')).trim(),
     spendSol: num('SNIPER_SPEND_SOL', 0.3),
+    reserveSol: num('SNIPER_SOL_RESERVE', 0.03),
     rpc: (env('SNIPER_SOL_RPC') || env('RPC_URLS') || env('RPC_URL') || 'https://api.mainnet-beta.solana.com').split(/[,\n]/)[0].trim(),
     jupiter: env('JUPITER_BASE_URL', 'https://lite-api.jup.ag/swap/v1').replace(/\/$/, ''),
     priorityLamports: num('SNIPER_SOL_PRIORITY_LAMPORTS', 1_000_000),
@@ -506,17 +511,43 @@ async function sendEvmSwap(chainId, tokenIn, sellAmount, quote, label) {
   return { hash: sent.hash, receipt };
 }
 
+/** Wei to spend on an EVM buy right now: SNIPER_SPEND_PCT of the live balance, capped so the
+ *  gas reserve stays; or the fixed SNIPER_SPEND_ETH when the percent is 0. */
+async function evmSpendWei(chainId) {
+  if (CFG.spendPct <= 0) return ethers.parseEther(CFG.evm.spendEth);
+  const balance = await evm.providers[chainId].getBalance(evm.wallets[chainId].address);
+  const reserve = ethers.parseEther(CFG.evm.gasReserveEth);
+  const byPct = balance * BigInt(Math.round(CFG.spendPct * 100)) / 10000n;
+  const spend = byPct < balance - reserve ? byPct : balance - reserve;
+  if (spend <= 0n) throw new Error(`wallet holds ${ethers.formatEther(balance)} ETH on ${CHAIN_NAMES[chainId]}, below the ${CFG.evm.gasReserveEth} ETH gas reserve`);
+  return spend;
+}
+
+async function solSpendLamports() {
+  if (CFG.spendPct <= 0) return Math.floor(CFG.sol.spendSol * LAMPORTS_PER_SOL);
+  const balance = await sol.connection.getBalance(sol.keypair.publicKey);
+  const reserve = Math.floor(CFG.sol.reserveSol * LAMPORTS_PER_SOL);
+  const spend = Math.min(Math.floor(balance * CFG.spendPct / 100), balance - reserve);
+  if (spend <= 0) throw new Error(`wallet holds ${(balance / LAMPORTS_PER_SOL).toFixed(4)} SOL, below the ${CFG.sol.reserveSol} SOL reserve`);
+  return spend;
+}
+
+function spendRule() {
+  return CFG.spendPct > 0 ? `${CFG.spendPct}% of the wallet balance at buy time` : `fixed ${CFG.evm.spendEth} ETH / ${CFG.sol.spendSol} SOL`;
+}
+
 async function buyEvm(chainId, tokenAddr) {
   const wallet = evm.wallets[chainId];
-  const sellAmount = ethers.parseEther(CFG.evm.spendEth).toString();
+  const sellAmount = (await evmSpendWei(chainId)).toString();
+  const spend = `${Number(ethers.formatEther(sellAmount)).toFixed(5)} ETH`;
   return withRouteRetry(async (slippageBps, attempt) => {
     const quote = await quoteEvm(chainId, NATIVE_ETH, tokenAddr, sellAmount, wallet.address, slippageBps);
     if (CFG.dryRun) {
-      log(`[DRY RUN] would buy ${tokenAddr} on ${CHAIN_NAMES[chainId]} for ${CFG.evm.spendEth} ETH via ${quote.via}; est. out ${quote.buyAmount} (attempt ${attempt})`);
-      return { hash: 'DRY_RUN', chain: CHAIN_NAMES[chainId], spend: `${CFG.evm.spendEth} ETH`, spentRaw: sellAmount };
+      log(`[DRY RUN] would buy ${tokenAddr} on ${CHAIN_NAMES[chainId]} for ${spend} via ${quote.via}; est. out ${quote.buyAmount} (attempt ${attempt})`);
+      return { hash: 'DRY_RUN', chain: CHAIN_NAMES[chainId], spend, spentRaw: sellAmount };
     }
     const { hash } = await sendEvmSwap(chainId, NATIVE_ETH, sellAmount, quote, 'buy');
-    return { hash, chain: CHAIN_NAMES[chainId], spend: `${CFG.evm.spendEth} ETH`, spentRaw: sellAmount };
+    return { hash, chain: CHAIN_NAMES[chainId], spend, spentRaw: sellAmount };
   }, `swap:${CHAIN_NAMES[chainId]}`);
 }
 
@@ -557,15 +588,16 @@ async function jupiterSend(quoteJson, label, attempt) {
 }
 
 async function buySolana(mint) {
-  const lamports = Math.floor(CFG.sol.spendSol * LAMPORTS_PER_SOL);
+  const lamports = await solSpendLamports();
+  const spend = `${(lamports / LAMPORTS_PER_SOL).toFixed(4)} SOL`;
   return withRouteRetry(async (slippageBps, attempt) => {
     const quote = await jupiterQuote(WSOL, mint, lamports, slippageBps);
     if (CFG.dryRun) {
-      log(`[DRY RUN] would buy ${mint} on Solana for ${CFG.sol.spendSol} SOL; est. out ${quote.outAmount} (raw) via ${(quote.routePlan || []).map((p) => p.swapInfo?.label).join('>')}`);
-      return { hash: 'DRY_RUN', chain: 'Solana', spend: `${CFG.sol.spendSol} SOL`, spentRaw: String(lamports) };
+      log(`[DRY RUN] would buy ${mint} on Solana for ${spend}; est. out ${quote.outAmount} (raw) via ${(quote.routePlan || []).map((p) => p.swapInfo?.label).join('>')}`);
+      return { hash: 'DRY_RUN', chain: 'Solana', spend, spentRaw: String(lamports) };
     }
     const sig = await jupiterSend(quote, 'buy', attempt);
-    return { hash: sig, chain: 'Solana', spend: `${CFG.sol.spendSol} SOL`, spentRaw: String(lamports) };
+    return { hash: sig, chain: 'Solana', spend, spentRaw: String(lamports) };
   }, 'jupiter');
 }
 
@@ -749,7 +781,7 @@ async function runTest(text, origin) {
   if (!cands.evm.length && !cands.solana.length) { log('[test] FAILED: no contract address found in that text'); return; }
   const target = await resolveTarget(text);
   if (!target) { log(`[test] FAILED: not a live contract on any configured chain: ${[...cands.evm, ...cands.solana].join(', ')}`); return; }
-  log(`[test] resolved ${target.address} on ${CHAIN_NAMES[target.chain]}; requesting a quote for ${target.chain === 'sol' ? `${CFG.sol.spendSol} SOL` : `${CFG.evm.spendEth} ETH`}`);
+  log(`[test] resolved ${target.address} on ${CHAIN_NAMES[target.chain]}; requesting a quote (spend rule: ${spendRule()})`);
   const saved = { dryRun: CFG.dryRun, routeWaitS: CFG.routeWaitS };
   CFG.dryRun = true; CFG.routeWaitS = 20;
   try {
@@ -804,8 +836,11 @@ async function handleTweet(tweet) {
     saveState(state);
     await notify(`Wallet already holds ${target.address} on ${CHAIN_NAMES[target.chain]}; treating it as bought and not buying again.`);
     if (!state.position) {
-      const spentRaw = target.chain === 'sol' ? String(Math.floor(CFG.sol.spendSol * LAMPORTS_PER_SOL)) : ethers.parseEther(CFG.evm.spendEth).toString();
-      openPosition(target, { hash: 'already-held', spentRaw, spend: target.chain === 'sol' ? `${CFG.sol.spendSol} SOL` : `${CFG.evm.spendEth} ETH` }, tweet.id);
+      // The spend is unknown here (bought outside this run); assume the rule would have applied.
+      let spentRaw;
+      try { spentRaw = target.chain === 'sol' ? String(await solSpendLamports()) : (await evmSpendWei(target.chain)).toString(); } catch { spentRaw = target.chain === 'sol' ? String(Math.floor(CFG.sol.spendSol * LAMPORTS_PER_SOL)) : ethers.parseEther(CFG.evm.spendEth).toString(); }
+      const spend = target.chain === 'sol' ? `${(Number(spentRaw) / LAMPORTS_PER_SOL).toFixed(4)} SOL` : `${Number(ethers.formatEther(spentRaw)).toFixed(5)} ETH`;
+      openPosition(target, { hash: 'already-held', spentRaw, spend }, tweet.id);
     }
     return true;
   }
@@ -886,12 +921,16 @@ async function main() {
   if (evmEnabled()) {
     const addr = Object.values(evm.wallets)[0].address;
     const bals = await Promise.all(Object.entries(evm.providers).map(async ([id, p]) => { try { return `${CHAIN_NAMES[id]} ${ethers.formatEther(await p.getBalance(addr))} ETH`; } catch { return `${CHAIN_NAMES[id]} ?`; } }));
-    log(`EVM wallet ${addr}: ${bals.join(', ')}; spend cap ${CFG.evm.spendEth} ETH per buy; router ${CFG.evm.zeroExKey ? '0x then KyberSwap' : 'KyberSwap'}; rpc ${Object.entries(evm.rpc).map(([id, u]) => `${CHAIN_NAMES[id]}=${redact(u).replace(/\/v2\/.*/, '/v2/***')}`).join(' ')}`);
+    const now = [];
+    for (const id of Object.keys(evm.providers)) { try { now.push(`${CHAIN_NAMES[id]} ${Number(ethers.formatEther(await evmSpendWei(Number(id)))).toFixed(5)} ETH`); } catch (e) { now.push(`${CHAIN_NAMES[id]} none (${e.message})`); } }
+    log(`EVM wallet ${addr}: ${bals.join(', ')}; spend rule ${spendRule()} = right now ${now.join(', ')}; router ${CFG.evm.zeroExKey ? '0x then KyberSwap' : 'KyberSwap'}; rpc ${Object.entries(evm.rpc).map(([id, u]) => `${CHAIN_NAMES[id]}=${redact(u).replace(/\/v2\/.*/, '/v2/***')}`).join(' ')}`);
   } else log('EVM buying off (needs SNIPER_EVM_PRIVATE_KEY: a burner Base wallet private key)');
   if (solEnabled()) {
     let bal = '?';
     try { bal = ((await sol.connection.getBalance(sol.keypair.publicKey)) / LAMPORTS_PER_SOL).toFixed(4); } catch { /* keep ? */ }
-    log(`Solana wallet ${sol.keypair.publicKey.toBase58()}: ${bal} SOL; spend cap ${CFG.sol.spendSol} SOL per buy`);
+    let now = '?';
+    try { now = `${((await solSpendLamports()) / LAMPORTS_PER_SOL).toFixed(4)} SOL`; } catch (e) { now = `none (${e.message})`; }
+    log(`Solana wallet ${sol.keypair.publicKey.toBase58()}: ${bal} SOL; spend rule ${spendRule()} = right now ${now}`);
   } else log('Solana buying off (needs WALLET_PRIVATE_KEY)');
   if (state.bought) log(`already bought once: ${JSON.stringify(state.buy)} — delete ${CFG.stateFile} to arm again`);
   if (state.position && !state.position.sold) log(`[tp] resuming watch on ${state.position.address} (${state.position.chainName}): ${describeLadder(state.position.ladder || TAKE_PROFIT_LADDER)}`);
