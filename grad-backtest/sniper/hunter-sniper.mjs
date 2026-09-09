@@ -73,6 +73,14 @@ const CFG = {
   maxSlippageBps: num('SNIPER_MAX_SLIPPAGE_BPS', 3000),
   webhook: env('DISCORD_WEBHOOK').trim(),
   stateFile: env('SNIPER_STATE_FILE', path.join(DATA_DIR, 'sniper-state.json')),
+  // A known contract (scheduled TGE): buy the instant a route exists, no post needed. Posts
+  // naming any other address are then ignored. SNIPER_LAUNCH_AT (ISO time) only tunes the
+  // cadence: slow polls until SNIPER_LAUNCH_LEAD_S before it, fast polls from then on.
+  targetContract: env('SNIPER_TARGET_CONTRACT').trim(),
+  launchAt: Date.parse(env('SNIPER_LAUNCH_AT').trim()) || null,
+  launchLeadS: num('SNIPER_LAUNCH_LEAD_S', 600),
+  launchPollMs: Math.max(1000, num('SNIPER_LAUNCH_POLL_MS', 2000)),
+  targetIdlePollMs: Math.max(5000, num('SNIPER_TARGET_IDLE_POLL_MS', 10000)),
   logFile: env('SNIPER_LOG_FILE', path.join(DATA_DIR, 'sniper.log')),
   // Spend = this share of the wallet's native balance at buy time, leaving the reserve for
   // gas. 0 switches to the fixed SNIPER_SPEND_ETH / SNIPER_SPEND_SOL amounts instead.
@@ -513,13 +521,76 @@ async function quoteKyber(chainId, tokenIn, tokenOut, sellAmount, taker, slippag
   return { to: d.routerAddress, data: d.data, value: tokenIn === NATIVE_ETH ? BigInt(d.amountIn || sellAmount) : 0n, gas: BigInt(d.gas || 0), buyAmount: d.amountOut || summary.amountOut, spender: d.routerAddress, via: 'kyberswap' };
 }
 
-async function quoteEvm(chainId, tokenIn, tokenOut, sellAmount, taker, slippageBps) {
-  const aggregators = [...(CFG.evm.zeroExKey ? [quote0x] : []), quoteKyber];
-  const errors = [];
-  for (const agg of aggregators) {
-    try { return await agg(chainId, tokenIn, tokenOut, sellAmount, taker, slippageBps); } catch (e) { errors.push(e.message); }
-  }
-  throw new Error(errors.join(' | '));
+// Direct DEX routers, for a pool so new that no aggregator has indexed it yet (ETH -> token
+// only; sells go through the aggregators, which have caught up by then). Base addresses are
+// the canonical deployments; override with SNIPER_DEX_* if needed.
+const DEX = {
+  8453: {
+    weth: env('SNIPER_DEX_WETH', '0x4200000000000000000000000000000000000006'),
+    v3Router: env('SNIPER_DEX_UNIV3_ROUTER', '0x2626664c2603336E57B271c5C0b26F421741e481'),
+    v3Quoter: env('SNIPER_DEX_UNIV3_QUOTER', '0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a'),
+    v2Router: env('SNIPER_DEX_UNIV2_ROUTER', '0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24'),
+    aeroRouter: env('SNIPER_DEX_AERO_ROUTER', '0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43'),
+    aeroFactory: env('SNIPER_DEX_AERO_FACTORY', '0x420DD381b31aEf6683db6B902084cB0FFECe40Da'),
+  },
+};
+const V3_QUOTER_ABI = ['function quoteExactInputSingle((address tokenIn,address tokenOut,uint256 amountIn,uint24 fee,uint160 sqrtPriceLimitX96)) returns (uint256 amountOut,uint160 sqrtPriceX96After,uint32 initializedTicksCrossed,uint256 gasEstimate)'];
+const V3_ROUTER_ABI = ['function exactInputSingle((address tokenIn,address tokenOut,uint24 fee,address recipient,uint256 amountIn,uint256 amountOutMinimum,uint160 sqrtPriceLimitX96)) payable returns (uint256 amountOut)'];
+const V2_ROUTER_ABI = [
+  'function getAmountsOut(uint256 amountIn,address[] path) view returns (uint256[] amounts)',
+  'function swapExactETHForTokensSupportingFeeOnTransferTokens(uint256 amountOutMin,address[] path,address to,uint256 deadline) payable',
+];
+const AERO_ROUTER_ABI = [
+  'function getAmountsOut(uint256 amountIn,(address from,address to,bool stable,address factory)[] routes) view returns (uint256[] amounts)',
+  'function swapExactETHForTokensSupportingFeeOnTransferTokens(uint256 amountOutMin,(address from,address to,bool stable,address factory)[] routes,address to,uint256 deadline) payable',
+];
+
+async function quoteDirect(chainId, tokenOut, sellAmount, taker, slippageBps) {
+  const dex = DEX[chainId];
+  if (!dex) throw new Error('no route: no direct DEX routers configured for this chain');
+  const provider = evm.providers[chainId];
+  const amountIn = BigInt(sellAmount);
+  const minOut = (out) => out * BigInt(10000 - slippageBps) / 10000n;
+  const deadline = Math.floor(Date.now() / 1000) + 90;
+  const candidates = [];
+  const quoter = new ethers.Contract(dex.v3Quoter, V3_QUOTER_ABI, provider);
+  const v3 = new ethers.Interface(V3_ROUTER_ABI);
+  await Promise.all([10000, 3000, 500, 100].map(async (fee) => {
+    try {
+      const [out] = await quoter.quoteExactInputSingle.staticCall({ tokenIn: dex.weth, tokenOut, amountIn, fee, sqrtPriceLimitX96: 0 });
+      if (out > 0n) candidates.push({ out, via: `uniswap-v3:${fee}`, to: dex.v3Router, data: v3.encodeFunctionData('exactInputSingle', [{ tokenIn: dex.weth, tokenOut, fee, recipient: taker, amountIn, amountOutMinimum: minOut(out), sqrtPriceLimitX96: 0 }]) });
+    } catch { /* no pool at this fee */ }
+  }));
+  try {
+    const v2 = new ethers.Contract(dex.v2Router, V2_ROUTER_ABI, provider);
+    const amounts = await v2.getAmountsOut(amountIn, [dex.weth, tokenOut]);
+    const out = amounts[amounts.length - 1];
+    if (out > 0n) candidates.push({ out, via: 'uniswap-v2', to: dex.v2Router, data: v2.interface.encodeFunctionData('swapExactETHForTokensSupportingFeeOnTransferTokens', [minOut(out), [dex.weth, tokenOut], taker, deadline]) });
+  } catch { /* no v2 pair */ }
+  try {
+    const aero = new ethers.Contract(dex.aeroRouter, AERO_ROUTER_ABI, provider);
+    const routes = [{ from: dex.weth, to: tokenOut, stable: false, factory: dex.aeroFactory }];
+    const amounts = await aero.getAmountsOut(amountIn, routes);
+    const out = amounts[amounts.length - 1];
+    if (out > 0n) candidates.push({ out, via: 'aerodrome', to: dex.aeroRouter, data: aero.interface.encodeFunctionData('swapExactETHForTokensSupportingFeeOnTransferTokens', [minOut(out), routes, taker, deadline]) });
+  } catch { /* no aero pool */ }
+  if (!candidates.length) throw new Error('no route: no direct pool on uniswap v3/v2 or aerodrome');
+  candidates.sort((a, b) => (a.out > b.out ? -1 : 1));
+  const best = candidates[0];
+  return { to: best.to, data: best.data, value: amountIn, gas: 0n, buyAmount: best.out.toString(), spender: null, via: best.via };
+}
+
+/** Best executable quote: aggregators first (0x when keyed, KyberSwap), direct routers for
+ *  ETH buys as well; the largest output wins so a brand-new pool is caught before the
+ *  aggregators index it. */
+async function quoteEvm(chainId, tokenIn, tokenOut, sellAmount, taker, slippageBps, opts = {}) {
+  const sources = opts.aggregators === false ? [] : [...(CFG.evm.zeroExKey ? [quote0x] : []), quoteKyber];
+  if (tokenIn === NATIVE_ETH && DEX[chainId]) sources.push((c, ti, to, amt, tk, sl) => quoteDirect(c, to, amt, tk, sl));
+  if (!sources.length) throw new Error('no route: no quote source for this pair');
+  const results = await Promise.all(sources.map((fn) => fn(chainId, tokenIn, tokenOut, sellAmount, taker, slippageBps).then((q) => ({ q }), (e) => ({ e: e.message }))));
+  const quotes = results.filter((r) => r.q).map((r) => r.q).sort((a, b) => (BigInt(a.buyAmount || 0) > BigInt(b.buyAmount || 0) ? -1 : 1));
+  if (!quotes.length) throw new Error(results.map((r) => r.e).join(' | '));
+  return quotes[0];
 }
 
 /** Sign and send an aggregator transaction; returns the receipt. Approves the spender first
@@ -676,8 +747,8 @@ function parseLadder(spec) {
   }
   return rungs.sort((a, b) => a.x - b.x);
 }
-const TAKE_PROFIT_LADDER = parseLadder(env('SNIPER_TAKE_PROFIT_LADDER', '5:initial,10:80'));
-if (!TAKE_PROFIT_LADDER.length) TAKE_PROFIT_LADDER.push({ x: 5, sell: 'initial' }, { x: 10, sell: 80 });
+const TAKE_PROFIT_LADDER = parseLadder(env('SNIPER_TAKE_PROFIT_LADDER', '3:initial,6:50,10:80'));
+if (!TAKE_PROFIT_LADDER.length) TAKE_PROFIT_LADDER.push({ x: 3, sell: 'initial' }, { x: 6, sell: 50 }, { x: 10, sell: 80 });
 const TP_CHECK_MS = Math.max(5000, num('SNIPER_TP_CHECK_MS', 15000));
 const SELL_FILE = path.join(DATA_DIR, 'sniper-sell.json');
 const tp = { lastCheck: 0, lastLogged: null, multiple: null, quoteErrors: 0 };
@@ -718,7 +789,22 @@ async function ensureInitialBalance(pos) {
   for (let i = 0; i < 6; i++) {
     try {
       const bal = await tokenBalance(pos);
-      if (bal > 0n) { pos.initialBalanceRaw = bal.toString(); saveState(state); log(`[tp] entry: ${bal} raw tokens for ${pos.spend}`); return bal; }
+      if (bal > 0n) {
+        pos.initialBalanceRaw = bal.toString(); saveState(state);
+        let detail = '';
+        if (pos.chain !== 'sol') {
+          try {
+            const erc20 = new ethers.Contract(pos.address, [...ERC20_ABI, 'function decimals() view returns (uint8)', 'function totalSupply() view returns (uint256)'], evm.providers[pos.chain]);
+            const [dec, supply] = await Promise.all([erc20.decimals(), erc20.totalSupply()]);
+            const tokens = Number(bal) / 10 ** Number(dec);
+            const priceEth = Number(ethers.formatEther(pos.spentRaw)) / tokens;
+            const fdvEth = priceEth * Number(supply) / 10 ** Number(dec);
+            detail = ` = ${tokens.toLocaleString('en-US', { maximumFractionDigits: 0 })} tokens; entry ${priceEth.toExponential(3)} ETH/token; FDV about ${fdvEth.toFixed(1)} ETH`;
+          } catch { /* cosmetic */ }
+        }
+        log(`[tp] entry: ${bal} raw tokens for ${pos.spend}${detail}`);
+        return bal;
+      }
     } catch { /* retry */ }
     await sleep(2000);
   }
@@ -883,6 +969,96 @@ async function recoverEvmPosition() {
   }
 }
 
+// ---------------------------------------------------------------------------------------
+// Launch watch: a known contract is bought the moment any venue quotes a route for it.
+// ---------------------------------------------------------------------------------------
+const launch = { target: null, info: '', attempts: 0, lastTry: 0, lastLog: 0, routeErrors: 0, lastAggregatorAt: 0 };
+
+async function resolveLaunchTarget() {
+  const addr = CFG.targetContract;
+  if (!addr) return;
+  if (ethers.isAddress(addr)) {
+    const chainId = await detectEvm(addr);
+    if (!chainId) { log(`[launch] ${addr} is not a contract on any configured EVM chain yet; will keep checking`); launch.target = { chain: null, address: ethers.getAddress(addr) }; return; }
+    launch.target = { chain: chainId, address: ethers.getAddress(addr) };
+    try {
+      const erc20 = new ethers.Contract(addr, ['function name() view returns (string)', 'function symbol() view returns (string)', 'function decimals() view returns (uint8)', 'function totalSupply() view returns (uint256)'], evm.providers[chainId]);
+      const [name, symbol, dec, supply] = await Promise.all([erc20.name(), erc20.symbol(), erc20.decimals(), erc20.totalSupply()]);
+      launch.info = `${name} (${symbol}), supply ${(Number(supply) / 10 ** Number(dec)).toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
+    } catch (e) { launch.info = `token details unreadable (${String(e.message).slice(0, 80)})`; }
+    log(`[launch] watching contract ${launch.target.address} on ${CHAIN_NAMES[chainId]}: ${launch.info}`);
+  } else if (solEnabled() && await detectSolanaMint(addr)) {
+    launch.target = { chain: 'sol', address: addr };
+    log(`[launch] watching mint ${addr} on Solana`);
+  } else {
+    log(`[launch] SNIPER_TARGET_CONTRACT ${addr} is neither an EVM address nor a live Solana mint; ignoring it`);
+  }
+}
+
+function launchWindowOpen() {
+  if (!CFG.launchAt) return true;
+  return Date.now() >= CFG.launchAt - CFG.launchLeadS * 1000;
+}
+
+/** True when the loop should run at the fast cadence. */
+function launchFastMode() {
+  return Boolean(launch.target && !state.bought && launchWindowOpen());
+}
+
+async function launchCheck() {
+  if (!launch.target || state.bought) return;
+  const every = launchWindowOpen() ? CFG.launchPollMs : CFG.targetIdlePollMs;
+  if (Date.now() - launch.lastTry < every) return;
+  launch.lastTry = Date.now();
+  launch.attempts += 1;
+  if (!launch.target.chain) {
+    const chainId = await detectEvm(launch.target.address);
+    if (!chainId) return;
+    launch.target.chain = chainId;
+    log(`[launch] contract ${launch.target.address} is now live on ${CHAIN_NAMES[chainId]}`);
+  }
+  const t = launch.target;
+  let quote = null;
+  try {
+    // Direct router reads are cheap RPC calls and run every check; the aggregator APIs are
+    // asked at most every 10 s so hours of fast polling cannot get this IP rate-limited.
+    const aggregators = !DEX[t.chain] || Date.now() - launch.lastAggregatorAt >= 10000;
+    if (aggregators) launch.lastAggregatorAt = Date.now();
+    if (t.chain === 'sol') quote = await jupiterQuote(WSOL, t.address, await solSpendLamports(), CFG.slippageBps);
+    else quote = await quoteEvm(t.chain, NATIVE_ETH, t.address, (await evmSpendWei(t.chain)).toString(), evm.wallets[t.chain].address, CFG.slippageBps, { aggregators });
+    launch.routeErrors = 0;
+  } catch (e) {
+    launch.routeErrors += 1;
+    if (Date.now() - launch.lastLog > 600000) {
+      launch.lastLog = Date.now();
+      log(`[launch] no route yet for ${t.address} (${launch.attempts} checks, every ${every / 1000}s): ${String(e.message).slice(0, 140)}`);
+    }
+    return;
+  }
+  const out = quote.buyAmount || quote.outAmount;
+  await notify(`🚀 LAUNCH: ${t.address} on ${CHAIN_NAMES[t.chain]} has a route (${quote.via || 'jupiter'}, est. ${out} raw out). Buying now${CFG.dryRun ? ' (DRY RUN)' : ''}.`);
+  if (!CFG.dryRun && await alreadyHolds(t)) {
+    state.bought = true; state.buy = { hash: 'already-held', address: t.address, chain: CHAIN_NAMES[t.chain], tweet: 'launch', at: new Date().toISOString() };
+    saveState(state);
+    if (!state.position) {
+      const spentRaw = t.chain === 'sol' ? String(await solSpendLamports()) : (await evmSpendWei(t.chain)).toString();
+      openPosition(t, { hash: 'already-held', spentRaw, spend: t.chain === 'sol' ? `${(Number(spentRaw) / LAMPORTS_PER_SOL).toFixed(4)} SOL` : `${Number(ethers.formatEther(spentRaw)).toFixed(5)} ETH` }, 'launch');
+    }
+    await notify(`Wallet already holds ${t.address}; not buying again.`);
+    return;
+  }
+  try {
+    const res = await buy(t);
+    if (!CFG.dryRun) {
+      state.bought = true; state.buy = { ...res, address: t.address, tweet: 'launch', at: new Date().toISOString() }; saveState(state);
+      openPosition(t, res, 'launch');
+    }
+    await notify(`✅ ${CFG.dryRun ? 'DRY RUN ' : ''}bought ${t.address} on ${res.chain} for ${res.spend}: ${res.hash}`);
+  } catch (e) {
+    await notify(`❌ Launch buy failed for ${t.address}: ${String(e.message || e).slice(0, 300)}; retrying on the next check`);
+  }
+}
+
 const TEST_FILE = path.join(DATA_DIR, 'sniper-test.json');
 async function runQueuedTest() {
   let text = null;
@@ -921,6 +1097,10 @@ async function handleTweet(tweet) {
   if (!target) {
     await notify(`Address in @${CFG.handle} post ${tweet.id} (${[...cands.evm, ...cands.solana].join(', ')}) is not a live contract on Base/Ethereum/Solana yet. Will keep checking.`);
     return false;
+  }
+  if (CFG.targetContract && target.address.toLowerCase() !== CFG.targetContract.toLowerCase()) {
+    await notify(`Post ${tweet.id} names ${target.address}, but the configured launch contract is ${CFG.targetContract}. Ignoring it; the launch watch buys only the configured contract.`);
+    return true;
   }
   if (!CFG.dryRun && await alreadyHolds(target)) {
     state.bought = true; state.buy = { hash: 'already-held', address: target.address, chain: CHAIN_NAMES[target.chain], tweet: tweet.id, at: new Date().toISOString() };
@@ -1065,9 +1245,17 @@ async function main() {
     try { await grokProbe(); } catch (e) { log(`[probe] Grok read failed: ${e.message}`); }
   }
   if (env('SNIPER_TEST_TEXT').trim()) await runTest(env('SNIPER_TEST_TEXT'), 'SNIPER_TEST_TEXT');
+  await resolveLaunchTarget();
+  if (launch.target) {
+    log(`[launch] cadence: every ${CFG.launchPollMs / 1000}s${CFG.launchAt ? ` from ${new Date(CFG.launchAt - CFG.launchLeadS * 1000).toISOString()} (launch ${new Date(CFG.launchAt).toISOString()}), every ${CFG.targetIdlePollMs / 1000}s before that` : ' from now'}; posts naming any other address are ignored`);
+  }
+  let lastTweetPoll = 0;
   for (;;) {
-    try { await tick(); } catch (e) { log(`[tick] ${e.message}`); }
-    await sleep(CFG.pollMs);
+    try {
+      await launchCheck();
+      if (Date.now() - lastTweetPoll >= CFG.pollMs) { lastTweetPoll = Date.now(); await tick(); }
+    } catch (e) { log(`[tick] ${e.message}`); }
+    await sleep(launchFastMode() ? CFG.launchPollMs : CFG.pollMs);
   }
 }
 
