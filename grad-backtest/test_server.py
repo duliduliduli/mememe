@@ -127,14 +127,16 @@ class AutostartTests(unittest.TestCase):
         return bool(started)
 
     def test_executor_stays_off_when_mm_lane_is_live(self):
-        self.assertFalse(self._run(EXECUTOR_AUTOSTART="1", EXECUTOR_MODE="live", WALLET_PRIVATE_KEY="k"))
+        self.assertFalse(self._run(EXECUTOR_AUTOSTART="1", EXECUTOR_MODE="live", WALLET_PRIVATE_KEY="k", MM_MODE="live"))
 
     def test_run_both_lanes_restores_executor(self):
         self.assertTrue(self._run(EXECUTOR_AUTOSTART="1", EXECUTOR_MODE="live", WALLET_PRIVATE_KEY="k",
-                                  RUN_BOTH_LANES="1"))
+                                  MM_MODE="live", RUN_BOTH_LANES="1"))
 
     def test_executor_runs_when_mm_lane_is_paper_or_off(self):
         self.assertTrue(self._run(EXECUTOR_AUTOSTART="1", EXECUTOR_MODE="paper"))
+        # A live executor with a wallet no longer promotes the mm lane to live by itself.
+        self.assertTrue(self._run(EXECUTOR_AUTOSTART="1", EXECUTOR_MODE="live", WALLET_PRIVATE_KEY="k"))
         self.assertTrue(self._run(EXECUTOR_AUTOSTART="1", EXECUTOR_MODE="live", WALLET_PRIVATE_KEY="k",
                                   MM_AUTOSTART="0"))
 
