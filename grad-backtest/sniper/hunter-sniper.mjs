@@ -247,7 +247,11 @@ async function xApiTweets() {
 }
 
 const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
-const synd = { ok: 0, errors: 0, lastOkAt: 0, lastError: '' };
+// X throttles the syndication feed per IP (HTTP 429): the interval doubles on a 429 up to
+// two minutes and eases back toward the poll interval on success, so the lane asks as
+// often as X allows instead of burning most polls on refusals.
+const synd = { ok: 0, errors: 0, lastOkAt: 0, lastError: '', lastTry: 0, intervalMs: 0 };
+const syndicationDue = () => Date.now() - synd.lastTry >= (synd.intervalMs || CFG.pollMs);
 
 /** Posts from X's public syndication timeline for the handle. Free, no key, X's own data. */
 async function syndicationTweets() {
@@ -256,18 +260,23 @@ async function syndicationTweets() {
     `https://syndication.twitter.com/srv/timeline-profile/screen-name/${CFG.handle}?showReplies=false`,
   ];
   let lastErr = 'no response';
+  synd.lastTry = Date.now();
+  let throttled = false;
   for (const url of urls) {
     let r;
     try { r = await fetchJson(url, { headers: { 'User-Agent': BROWSER_UA, Accept: 'text/html,*/*' } }, 10000); } catch (e) { lastErr = e.message; continue; }
+    if (r.status === 429) { throttled = true; lastErr = 'HTTP 429'; break; }
     if (!r.ok) { lastErr = `HTTP ${r.status}`; continue; }
     if (!/__NEXT_DATA__/.test(r.text)) { lastErr = 'no timeline data in response'; continue; }
     synd.ok += 1; synd.lastOkAt = Date.now();
+    synd.intervalMs = Math.max(CFG.pollMs, Math.floor((synd.intervalMs || CFG.pollMs) * 0.75));
     return parseSyndicationTimeline(r.text, CFG.handle).map((t) => ({ ...t, source: 'x-timeline', verified: true }));
   }
   synd.errors += 1; synd.lastError = lastErr;
+  if (throttled) synd.intervalMs = Math.min(120000, (synd.intervalMs || CFG.pollMs) * 2);
   throw new Error(lastErr);
 }
-const syndicationHealthy = () => synd.lastOkAt > 0 && Date.now() - synd.lastOkAt < 3 * CFG.pollMs + 5000;
+const syndicationHealthy = () => synd.lastOkAt > 0 && Date.now() - synd.lastOkAt < 3 * (synd.intervalMs || CFG.pollMs) + 5000;
 
 /** One post by id from X's tweet-result endpoint (also public): the verification used
  *  before the embed and the second Grok read. */
@@ -1182,7 +1191,7 @@ function heartbeat() {
   const rungsDone = pos?.ladder ? pos.ladder.filter((r) => r.done).length : 0;
   const posNote = pos ? (pos.sold ? `; ${pos.address.slice(0, 10)} fully sold (${pos.sold.hash})`
     : `; holding ${pos.address.slice(0, 10)} on ${pos.chainName} at ${tp.multiple == null ? '?' : tp.multiple.toFixed(2) + 'x'} entry, ${rungsDone}/${pos.ladder ? pos.ladder.length : 0} rungs taken`) : '';
-  const feed = CFG.syndication ? `free X feed ${syndicationHealthy() ? 'OK' : 'DOWN'} (${synd.ok} ok/${synd.errors} err), ` : '';
+  const feed = CFG.syndication ? `free X feed ${syndicationHealthy() ? 'OK' : 'DOWN'} (${synd.ok} ok/${synd.errors} err, every ${Math.round((synd.intervalMs || CFG.pollMs) / 1000)}s), ` : '';
   log(`[heartbeat] ${stats.polls} polls, ${stats.ok} ok, ${stats.errors} errors, ${stats.posts} posts seen, ${Object.keys(state.pending).length} pending; `
     + `${feed}Grok calls ${stats.grok}; dryRun=${CFG.dryRun} bought=${state.bought}${posNote}`);
 }
@@ -1197,9 +1206,13 @@ async function tick() {
     try { tweets.push(...await xApiTweets()); stats.ok += 1; freeOk = true; } catch (e) { stats.errors += 1; log(`[x] ${e.message}`); }
   }
   if (CFG.syndication && !freeOk) {
-    try { tweets.push(...await syndicationTweets()); stats.ok += 1; freeOk = true; } catch (e) {
-      stats.errors += 1;
-      if (synd.errors === 1 || synd.errors % 60 === 0) log(`[x-timeline] free feed unavailable (${e.message}); Grok covers every ${CFG.grokIntervalMs / 1000}s until it is back`);
+    if (!syndicationDue()) {
+      freeOk = syndicationHealthy();   // between allowed reads the feed still counts as watching
+    } else {
+      try { tweets.push(...await syndicationTweets()); stats.ok += 1; freeOk = true; } catch (e) {
+        stats.errors += 1;
+        if (synd.errors === 1 || synd.errors % 60 === 0) log(`[x-timeline] free feed refused (${e.message}); now asking every ${Math.round((synd.intervalMs || CFG.pollMs) / 1000)}s; Grok covers every ${CFG.grokIntervalMs / 1000}s while it is down`);
+      }
     }
   }
   // Grok is a paid search per call: a backup sweep when a free feed works, the only eyes
