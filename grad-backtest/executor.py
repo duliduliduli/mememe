@@ -25,6 +25,7 @@ about. This is experimental research software, not investment advice.
 from __future__ import annotations
 
 import base64
+import copy
 import csv
 import json
 import os
@@ -308,6 +309,28 @@ class Config:
         # into its own pool. SOLL: the creator sold 78% of supply 24s after migration and we bought
         # at a $450 cap. Overnight, sub-$30k entries went 1 for 7. 0 disables.
         self.min_entry_market_cap_usd = float(os.getenv("MIN_ENTRY_MARKET_CAP_USD", "25000"))
+        # Runner mode: swing-trade the graduations that prove themselves. Every graduation goes
+        # on a watchlist for RUNNER_WATCH_HOURS; its market cap is re-read every
+        # RUNNER_CHECK_SECONDS from Jupiter's batched price feed, and the bot enters once the cap
+        # is inside RUNNER_MIN..RUNNER_MAX_MARKET_CAP_USD (the $400k-$4M "sweet spot") and up at
+        # least RUNNER_MIN_GAIN_PCT from its low of the last RUNNER_MOMENTUM_MINUTES. Every other
+        # entry guard (impact, round trip, holders, bundles) still applies at that moment. Runner
+        # positions use their own take profit / stop / time stop. RUNNER_ONLY=1 turns the
+        # at-graduation entry off so only runners are traded.
+        self.runner_enabled = os.getenv("RUNNER_ENABLED", "1") == "1"
+        self.runner_only = os.getenv("RUNNER_ONLY", "0") == "1"
+        self.runner_min_market_cap_usd = float(os.getenv("RUNNER_MIN_MARKET_CAP_USD", "400000"))
+        self.runner_max_market_cap_usd = float(os.getenv("RUNNER_MAX_MARKET_CAP_USD", "4000000"))
+        self.runner_watch_hours = float(os.getenv("RUNNER_WATCH_HOURS", "6"))
+        self.runner_check_seconds = max(15.0, float(os.getenv("RUNNER_CHECK_SECONDS", "60")))
+        self.runner_min_gain_pct = float(os.getenv("RUNNER_MIN_GAIN_PCT", "10"))
+        self.runner_momentum_minutes = float(os.getenv("RUNNER_MOMENTUM_MINUTES", "15"))
+        self.runner_max_watch = int(os.getenv("RUNNER_MAX_WATCH", "100"))
+        self.runner_take_profit = float(os.getenv("RUNNER_TAKE_PROFIT", "1.0"))
+        self.runner_stop_loss = float(os.getenv("RUNNER_STOP_LOSS", "0.30"))
+        self.runner_trailing_stop = float(os.getenv("RUNNER_TRAILING_STOP", "0.25"))
+        self.runner_time_stop_minutes = float(os.getenv("RUNNER_TIME_STOP_MINUTES", "240"))
+        self.jupiter_price_url = os.getenv("JUPITER_PRICE_URL", "https://lite-api.jup.ag/price/v3").rstrip("/")
         # Bundle guards. A curve that fills in seconds was bought by one party (SOLL graduated 29s
         # after creation with six buyers), and a wallet holding a big slice of supply at entry is
         # the one that dumps on us (SOLL's creator held 59% at graduation). 0 disables either.
@@ -754,17 +777,26 @@ def entry_guard_reason(
     creator_hold_pct: float | None = None,
     early_sell_pct: float | None = None,
     early_seller: str | None = None,
+    runner: bool = False,
 ) -> str | None:
     """Reject entries that are no longer the trade the backtest models.
 
     Unknown inputs (None) never block: a failed metadata lookup is logged, not traded on.
-    The one exception is the bundle snapshot, which fails closed when BUNDLE_FAIL_CLOSED is set."""
-    lateness = now - (graduated_ts + cfg.entry_delay_seconds)
-    if lateness > cfg.max_entry_lateness_seconds:
-        return f"stale entry: {lateness:.0f}s past target"
+    The one exception is the bundle snapshot, which fails closed when BUNDLE_FAIL_CLOSED is set.
+    A runner entry (watchlist token that grew into the swing band) is late by design: it skips
+    the lateness check and uses the runner market-cap band instead of the graduation one."""
+    if not runner:
+        lateness = now - (graduated_ts + cfg.entry_delay_seconds)
+        if lateness > cfg.max_entry_lateness_seconds:
+            return f"stale entry: {lateness:.0f}s past target"
     if price_impact_pct is not None and price_impact_pct > cfg.max_price_impact_pct:
         return f"price impact {price_impact_pct:.1f}% > {cfg.max_price_impact_pct:.1f}% (pool too thin for our size)"
-    if (
+    if runner:
+        if market_cap_usd is not None and market_cap_usd > cfg.runner_max_market_cap_usd > 0:
+            return f"market cap ${market_cap_usd:,.0f} > ${cfg.runner_max_market_cap_usd:,.0f} (above the runner band)"
+        if market_cap_usd is not None and market_cap_usd < cfg.runner_min_market_cap_usd:
+            return f"market cap ${market_cap_usd:,.0f} < ${cfg.runner_min_market_cap_usd:,.0f} (fell out of the runner band)"
+    elif (
         market_cap_usd is not None
         and cfg.max_entry_market_cap_usd > 0
         and market_cap_usd > cfg.max_entry_market_cap_usd
@@ -773,7 +805,7 @@ def entry_guard_reason(
             f"market cap ${market_cap_usd:,.0f} > ${cfg.max_entry_market_cap_usd:,.0f} "
             "(already pumped far past graduation)"
         )
-    if (
+    elif (
         market_cap_usd is not None
         and cfg.min_entry_market_cap_usd > 0
         and market_cap_usd < cfg.min_entry_market_cap_usd
@@ -2152,7 +2184,7 @@ class Executor:
             f"dropped={getattr(stream, 'dropped_signatures', 0)} last_event={event_age} "
             f"last_scan={scan_age} pending={len(self.pending)} "
             f"positions={len(self.state['positions'])} stuck={len(self.state.get('stuck', []))} "
-            f"moon_bags={len(self.state.get('moon_bags', []))} "
+            f"moon_bags={len(self.state.get('moon_bags', []))} watchlist={len(self.state.get('watchlist', []))} "
             f"draining={self.state.get('draining', False)} cooldown={cooldown:.0f}s "
             f"reconcile_pending={getattr(self, '_reconcile_pending', False)} "
             f"decode_totals={json.dumps(self._discovery_counts, sort_keys=True)}"
@@ -2187,6 +2219,10 @@ class Executor:
             self.discovery_result(signature, "mint_already_pending_or_owned")
             return
         age = now_ts() - int(timestamp)
+        self.watch_runner(mint, int(timestamp))
+        if self.cfg.runner_only:
+            self.discovery_result(signature, "watchlist_only")
+            return
         if age > self.cfg.max_entry_age_seconds:
             self.discovery_result(signature, "too_old")
             self.skip(mint, f"graduation too old at detection ({age:.0f}s)")
@@ -2242,6 +2278,114 @@ class Executor:
                 log(f"WARN RPC discovery failed: {describe_error(exc)}")
             return
         self._provider_backoff_seconds = 30.0
+
+    # ---- runner watchlist ------------------------------------------------
+    def watch_runner(self, mint: str, graduated_ts: int) -> None:
+        """Put a graduation on the runner watchlist (newest first, bounded)."""
+        cfg = self.cfg
+        if not cfg.runner_enabled:
+            return
+        if now_ts() - graduated_ts > cfg.runner_watch_hours * 3600:
+            return
+        watch = self.state.setdefault("watchlist", [])
+        if any(w["mint"] == mint for w in watch):
+            return
+        watch.insert(0, {"mint": mint, "graduated_ts": graduated_ts, "added_at": utc_iso(), "samples": [], "supply_raw": None, "decimals": None})
+        del watch[cfg.runner_max_watch:]
+
+    def runner_prices(self, mints: list[str]) -> dict[str, float]:
+        """USD price per mint from Jupiter's batched price feed; mints without a price are absent."""
+        out: dict[str, float] = {}
+        for i in range(0, len(mints), 50):
+            chunk = mints[i:i + 50]
+            resp = self.jup.session.get(self.cfg.jupiter_price_url, params={"ids": ",".join(chunk)}, timeout=15)
+            resp.raise_for_status()
+            body = resp.json()
+            data = body.get("data", body) if isinstance(body, dict) else {}
+            for mint in chunk:
+                entry = data.get(mint) if isinstance(data, dict) else None
+                price = None
+                if isinstance(entry, dict):
+                    price = entry.get("usdPrice", entry.get("price"))
+                try:
+                    if price is not None and float(price) > 0:
+                        out[mint] = float(price)
+                except (TypeError, ValueError):
+                    pass
+        return out
+
+    def manage_watchlist(self, sol_price: float) -> None:
+        """Every RUNNER_CHECK_SECONDS: value every watched graduation, drop the dead and the
+        expired, and enter the ones that climbed into the runner band with momentum."""
+        cfg = self.cfg
+        watch = self.state.get("watchlist") or []
+        if not cfg.runner_enabled or not watch:
+            return
+        if now_ts() - float(self.state.get("watchlist_checked_ts") or 0) < cfg.runner_check_seconds:
+            return
+        self.state["watchlist_checked_ts"] = now_ts()
+        now = now_ts()
+        keep = []
+        for w in watch:
+            if now - float(w["graduated_ts"]) > cfg.runner_watch_hours * 3600:
+                continue
+            if any(p.get("mint") == w["mint"] for p in self.state["positions"]) or any(p.get("mint") == w["mint"] for p in self.pending):
+                continue
+            keep.append(w)
+        watch[:] = keep
+        if not watch:
+            return
+        try:
+            prices = self.runner_prices([w["mint"] for w in watch])
+        except Exception as exc:
+            log(f"WARN runner price feed: {describe_error(exc)}")
+            return
+        candidates = []
+        for w in watch:
+            price = prices.get(w["mint"])
+            if price is None:
+                w["missing"] = int(w.get("missing", 0)) + 1
+                continue
+            w["missing"] = 0
+            if w.get("supply_raw") is None:
+                try:
+                    _ui, decimals, raw = self.rpc.token_supply_details(w["mint"])
+                    w["supply_raw"], w["decimals"] = raw, decimals
+                except Exception as exc:
+                    log(f"WARN runner supply {w['mint']}: {describe_error(exc)}")
+                    continue
+            mcap = price * int(w["supply_raw"]) / (10 ** int(w["decimals"]))
+            samples = w.setdefault("samples", [])
+            samples.append([round(now), round(mcap)])
+            del samples[:-60]
+            window = [m for t, m in samples if now - t <= cfg.runner_momentum_minutes * 60]
+            low = min(window) if window else mcap
+            gain_pct = (mcap / low - 1.0) * 100 if low > 0 else 0.0
+            w["last_market_cap_usd"] = round(mcap)
+            in_band = cfg.runner_min_market_cap_usd <= mcap <= (cfg.runner_max_market_cap_usd or float("inf"))
+            if in_band and gain_pct >= cfg.runner_min_gain_pct and len(window) >= 2:
+                candidates.append((gain_pct, w, mcap))
+        # Watch tokens a price feed has forgotten for five checks in a row are dead.
+        watch[:] = [w for w in watch if int(w.get("missing", 0)) < 5]
+        if not candidates:
+            return
+        candidates.sort(key=lambda c: -c[0])
+        for gain_pct, w, mcap in candidates[: cfg.max_entries_per_cycle]:
+            log(f"RUNNER {w['mint']}: market cap ${mcap:,.0f} in band, +{gain_pct:.0f}% over {cfg.runner_momentum_minutes:.0f}m; entering")
+            watch.remove(w)
+            self.enter_with_retry({"mint": w["mint"], "graduated_ts": int(w["graduated_ts"]), "enter_at": now, "runner": True,
+                                   "runner_market_cap_usd": round(mcap), "runner_gain_pct": round(gain_pct, 1)}, sol_price)
+
+    def exit_cfg(self, pos: dict[str, Any]) -> "Config":
+        """Exit thresholds for a position: runner positions swing on their own settings."""
+        if not pos.get("runner"):
+            return self.cfg
+        cfg = copy.copy(self.cfg)
+        cfg.take_profit = self.cfg.runner_take_profit
+        cfg.stop_loss = self.cfg.runner_stop_loss
+        cfg.trailing_stop = self.cfg.runner_trailing_stop
+        cfg.time_stop_minutes = self.cfg.runner_time_stop_minutes
+        return cfg
 
     def _prune_stale_pending(self) -> None:
         """Drop entry work that became unsafe while the process was stopped."""
@@ -2443,8 +2587,10 @@ class Executor:
             raise RuntimeError("zero-token quote")
         impact = quote_price_impact_pct(quote)
         self.last_entry_meta["price_impact_pct"] = impact
+        runner = bool(item.get("runner"))
+        self.last_entry_meta["runner"] = runner
         # Reject an already-invalid quote before expensive holder/history/funder queries.
-        early_guard = entry_guard_reason(self.cfg, item['graduated_ts'], now_ts(), impact)
+        early_guard = entry_guard_reason(self.cfg, item['graduated_ts'], now_ts(), impact, runner=runner)
         if early_guard:
             self.skip(mint, early_guard)
             return
@@ -2458,6 +2604,7 @@ class Executor:
             creator_hold_pct=meta.get("creator_hold_pct"),
             early_sell_pct=meta.get("early_sell_pct"),
             early_seller=meta.get("early_seller"),
+            runner=runner,
         )
         guard = entry_guard_reason(
             self.cfg, item["graduated_ts"], now_ts(), impact, market_cap, curve_age, top_holder_pct, **extra
@@ -2580,6 +2727,8 @@ class Executor:
                 "entry_history_total": bundle.get("history_total"),
                 "entry_history_decoded": bundle.get("history_decoded"),
                 "peak_usd": size_usd,
+                "runner": runner,
+                "runner_gain_pct": item.get("runner_gain_pct"),
             }
         )
         save_state(self.state)
@@ -2803,13 +2952,14 @@ class Executor:
                 current_usd = int(quote["outAmount"]) / LAMPORTS * sol_price
                 pos["peak_usd"] = max(float(pos.get("peak_usd", pos["position_usd"])), current_usd)
                 pos["last_value_usd"] = current_usd
+                xcfg = self.exit_cfg(pos)
                 if now_ts() >= self._next_position_log.get(pos['mint'], 0):
                     self._next_position_log[pos['mint']] = now_ts() + 30.0
                     basis = float(pos['position_usd'])
                     log(
-                        f"POSITION {pos['mint']} sell_quote=${current_usd:.2f} basis=${basis:.2f} "
-                        f"tp_value=${basis * (1 + self.cfg.take_profit):.2f} "
-                        f"sl_value=${basis * (1 - self.cfg.stop_loss):.2f} "
+                        f"POSITION {pos['mint']}{' (runner)' if pos.get('runner') else ''} sell_quote=${current_usd:.2f} basis=${basis:.2f} "
+                        f"tp_value=${basis * (1 + xcfg.take_profit):.2f} "
+                        f"sl_value=${basis * (1 - xcfg.stop_loss):.2f} "
                         f"peak_quote=${pos['peak_usd']:.2f} scaled_out={bool(pos.get('scaled_out'))} "
                         f"age={(now_ts() - pos['opened_ts']) / 60:.1f}m"
                     )
@@ -2822,7 +2972,7 @@ class Executor:
                     self.scale_out(pos, sol_price)
                     continue  # remainder is re-evaluated against a fresh quote next cycle
                 reason = "panic" if panic else decide_exit(
-                    pos["position_usd"], current_usd, pos["opened_ts"], now_ts(), self.cfg, pos["peak_usd"]
+                    pos["position_usd"], current_usd, pos["opened_ts"], now_ts(), xcfg, pos["peak_usd"]
                 )
                 if reason:
                     self.close_position(pos, reason, sol_price)
@@ -3067,6 +3217,11 @@ class Executor:
                     self.pending.remove(item)
                     log(f"ENTRY checking mint={item['mint']} lateness={now_ts() - item['enter_at']:.0f}s")
                     self.enter_with_retry(item, sol_price)
+            if self.state.get("watchlist"):
+                try:
+                    self.manage_watchlist(sol_price or self.sol_price_usd())
+                except Exception as exc:
+                    log(f"WARN runner watchlist: {describe_error(exc)}")
         save_state(self.state)
 
     def run(self) -> None:
@@ -3081,6 +3236,11 @@ class Executor:
             f"slippage={self.cfg.slippage_bps}/{self.cfg.sell_slippage_bps}bps(buy/sell) "
             f"round_trip>={self.cfg.min_entry_round_trip_pct:.0f}% "
             f"mcap=${self.cfg.min_entry_market_cap_usd:,.0f}-${self.cfg.max_entry_market_cap_usd:,.0f} "
+            f"runner={'only' if self.cfg.runner_only else ('on' if self.cfg.runner_enabled else 'off')}"
+            f"(${self.cfg.runner_min_market_cap_usd:,.0f}-${self.cfg.runner_max_market_cap_usd:,.0f} "
+            f"+{self.cfg.runner_min_gain_pct:.0f}%/{self.cfg.runner_momentum_minutes:.0f}m watch={self.cfg.runner_watch_hours:.0f}h "
+            f"tp=+{self.cfg.runner_take_profit:.0%} sl=-{self.cfg.runner_stop_loss:.0%} trail={self.cfg.runner_trailing_stop:.0%} "
+            f"time_stop={self.cfg.runner_time_stop_minutes:.0f}m) "
             f"curve_age>={self.cfg.min_curve_age_seconds:.0f}s top_holder<={self.cfg.max_top_holder_pct:.0f}% "
             f"curve_txs>={self.cfg.min_curve_transactions} early_sell<={self.cfg.max_early_sell_pct:.0f}% "
             f"creator_launches<={self.cfg.max_creator_prior_launches} creator_hold<={self.cfg.max_creator_hold_pct:.0f}% "
