@@ -37,7 +37,10 @@ class WinnersOnlyTests(unittest.TestCase):
         executor, p = fresh()
         self.addCleanup(p.stop)
         cfg = executor.Config()
-        self.assertTrue(cfg.moon_bag_winners_only)
+        # No exit sells everything by default: a bag stays, winners or losers, never burned.
+        self.assertGreater(cfg.moon_bag, 0)
+        self.assertFalse(cfg.moon_bag_winners_only)
+        self.assertEqual(cfg.moon_bag_dead_pct, 0)
         self.assertEqual(cfg.moon_bag_target_x, 100)
         self.assertEqual(cfg.moon_bag_check_seconds, 60)
 
@@ -55,7 +58,7 @@ class WinnersOnlyTests(unittest.TestCase):
         self.assertEqual(bags[0]["cost_usd"], 1.0)
 
     def test_no_bag_on_losing_exit(self):
-        executor, p = fresh()
+        executor, p = fresh(MOON_BAG_WINNERS_ONLY="1")
         self.addCleanup(p.stop)
         ex = executor.Executor(executor.Config())
         ex.state["positions"] = [position(last_value=3.4)]
@@ -162,7 +165,7 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(len(ex.state["moon_bags"]), 1)
 
     def test_dead_bag_burned_and_recorded(self):
-        executor, p = fresh()
+        executor, p = fresh(MOON_BAG_DEAD_PCT="5")
         self.addCleanup(p.stop)
         ex = executor.Executor(executor.Config())
         ex.state["moon_bags"] = [bag(kept=1.75)]
