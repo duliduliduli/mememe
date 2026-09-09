@@ -81,6 +81,9 @@ const CFG = {
   launchLeadS: num('SNIPER_LAUNCH_LEAD_S', 600),
   launchPollMs: Math.max(1000, num('SNIPER_LAUNCH_POLL_MS', 2000)),
   targetIdlePollMs: Math.max(5000, num('SNIPER_TARGET_IDLE_POLL_MS', 10000)),
+  // Entry cap: skip the buy while the quoted price implies a fully diluted valuation above
+  // this many USD, and buy the moment it dips under. 0 = buy at the first route.
+  maxEntryFdvUsd: num('SNIPER_MAX_ENTRY_FDV_USD', 0),
   logFile: env('SNIPER_LOG_FILE', path.join(DATA_DIR, 'sniper.log')),
   // Spend = this share of the wallet's native balance at buy time, leaving the reserve for
   // gas. 0 switches to the fixed SNIPER_SPEND_ETH / SNIPER_SPEND_SOL amounts instead.
@@ -972,7 +975,27 @@ async function recoverEvmPosition() {
 // ---------------------------------------------------------------------------------------
 // Launch watch: a known contract is bought the moment any venue quotes a route for it.
 // ---------------------------------------------------------------------------------------
-const launch = { target: null, info: '', attempts: 0, lastTry: 0, lastLog: 0, routeErrors: 0, lastAggregatorAt: 0 };
+const launch = { target: null, info: '', attempts: 0, lastTry: 0, lastLog: 0, routeErrors: 0, lastAggregatorAt: 0, supplyRaw: null, decimals: null, lastCapLog: 0 };
+const USDC = { 8453: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', 1: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48' };
+const ethUsd = { price: 0, at: 0 };
+
+/** ETH price in USD from a 1 ETH -> USDC aggregator quote, cached a minute. */
+async function ethPriceUsd(chainId) {
+  if (Date.now() - ethUsd.at < 60000 && ethUsd.price > 0) return ethUsd.price;
+  const usdc = USDC[chainId] || USDC[8453];
+  const q = await quoteKyber(USDC[chainId] ? chainId : 8453, NATIVE_ETH, usdc, ethers.parseEther('1').toString(), evm.wallets[chainId].address, 100);
+  ethUsd.price = Number(q.buyAmount) / 1e6; ethUsd.at = Date.now();
+  return ethUsd.price;
+}
+
+/** Fully diluted valuation in USD implied by a quote of `spendWei` for `outRaw` tokens. */
+async function impliedFdvUsd(chainId, spendWei, outRaw) {
+  if (!launch.supplyRaw || launch.decimals == null || !outRaw || BigInt(outRaw) === 0n) return null;
+  const tokens = Number(outRaw) / 10 ** launch.decimals;
+  const priceEth = Number(ethers.formatEther(spendWei)) / tokens;
+  const supply = Number(launch.supplyRaw) / 10 ** launch.decimals;
+  return priceEth * supply * await ethPriceUsd(chainId);
+}
 
 async function resolveLaunchTarget() {
   const addr = CFG.targetContract;
@@ -984,7 +1007,9 @@ async function resolveLaunchTarget() {
     try {
       const erc20 = new ethers.Contract(addr, ['function name() view returns (string)', 'function symbol() view returns (string)', 'function decimals() view returns (uint8)', 'function totalSupply() view returns (uint256)'], evm.providers[chainId]);
       const [name, symbol, dec, supply] = await Promise.all([erc20.name(), erc20.symbol(), erc20.decimals(), erc20.totalSupply()]);
-      launch.info = `${name} (${symbol}), supply ${(Number(supply) / 10 ** Number(dec)).toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
+      launch.supplyRaw = supply.toString(); launch.decimals = Number(dec);
+      launch.info = `${name} (${symbol}), supply ${(Number(supply) / 10 ** Number(dec)).toLocaleString('en-US', { maximumFractionDigits: 0 })}`
+        + (CFG.maxEntryFdvUsd > 0 ? `; entry cap FDV $${CFG.maxEntryFdvUsd.toLocaleString('en-US')}` : '; no entry cap');
     } catch (e) { launch.info = `token details unreadable (${String(e.message).slice(0, 80)})`; }
     log(`[launch] watching contract ${launch.target.address} on ${CHAIN_NAMES[chainId]}: ${launch.info}`);
   } else if (solEnabled() && await detectSolanaMint(addr)) {
@@ -1036,7 +1061,23 @@ async function launchCheck() {
     return;
   }
   const out = quote.buyAmount || quote.outAmount;
-  await notify(`🚀 LAUNCH: ${t.address} on ${CHAIN_NAMES[t.chain]} has a route (${quote.via || 'jupiter'}, est. ${out} raw out). Buying now${CFG.dryRun ? ' (DRY RUN)' : ''}.`);
+  let fdvNote = '';
+  if (t.chain !== 'sol') {
+    try {
+      const fdv = await impliedFdvUsd(t.chain, quote.value ?? (await evmSpendWei(t.chain)), out);
+      if (fdv != null) {
+        fdvNote = `, implied FDV $${Math.round(fdv).toLocaleString('en-US')}`;
+        if (CFG.maxEntryFdvUsd > 0 && fdv > CFG.maxEntryFdvUsd) {
+          if (Date.now() - launch.lastCapLog > 30000) {
+            launch.lastCapLog = Date.now();
+            log(`[launch] route exists but implied FDV $${Math.round(fdv).toLocaleString('en-US')} is above the $${CFG.maxEntryFdvUsd.toLocaleString('en-US')} entry cap; waiting for a dip (checking every ${every / 1000}s)`);
+          }
+          return;
+        }
+      }
+    } catch (e) { fdvNote = ` (FDV check failed: ${String(e.message).slice(0, 80)})`; }
+  }
+  await notify(`🚀 LAUNCH: ${t.address} on ${CHAIN_NAMES[t.chain]} has a route (${quote.via || 'jupiter'}, est. ${out} raw out${fdvNote}). Buying now${CFG.dryRun ? ' (DRY RUN)' : ''}.`);
   if (!CFG.dryRun && await alreadyHolds(t)) {
     state.bought = true; state.buy = { hash: 'already-held', address: t.address, chain: CHAIN_NAMES[t.chain], tweet: 'launch', at: new Date().toISOString() };
     saveState(state);
