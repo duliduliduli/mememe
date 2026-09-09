@@ -72,7 +72,7 @@ class ExecutorScaleOutTests(unittest.TestCase):
             return list(csv.DictReader(fh))
 
     def test_paper_scale_out_then_remainder_take_profit(self):
-        ex = self._executor({"SCALE_OUT_AT": "0.4", "SCALE_OUT_FRACTION": "0.5"})
+        ex = self._executor({"SCALE_OUT_AT": "0.4", "SCALE_OUT_FRACTION": "0.5", "MOON_BAG": "0"})
         self._seed(ex)
         start_balance = ex.state["paper_balance_usd"]
         # sol_price=100: 1000 tokens quote to 0.07 SOL = $7.00 (+40%) -> scale-out fires

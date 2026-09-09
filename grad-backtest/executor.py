@@ -256,19 +256,21 @@ class Config:
         self.take_profit = float(os.getenv("TAKE_PROFIT", "0.75"))
         self.stop_loss = float(os.getenv("STOP_LOSS", "0.30"))
         self.trailing_stop = float(os.getenv("TRAILING_STOP", "0"))  # fraction off peak; 0 disables
-        self.moon_bag = min(0.5, max(0.0, float(os.getenv("MOON_BAG", "0"))))  # fraction kept at exit; 0 disables
+        # Never sell the whole position: a slice stays in the wallet in case the token runs
+        # after the exit. MOON_BAG=0 restores full exits.
+        self.moon_bag = min(0.5, max(0.0, float(os.getenv("MOON_BAG", "0.15"))))  # fraction kept at exit; 0 disables
         # Keep a bag only when the exit was profitable (a stop-loss remnant just rides to zero and
         # locks its rent), and sell a bag once it is worth MOON_BAG_TARGET_X times what was kept
         # (0 = hold forever; panic is then the only way out). Bags are re-quoted every
         # MOON_BAG_CHECK_SECONDS, not every loop, since they are off the Jupiter budget otherwise.
-        self.moon_bag_winners_only = os.getenv("MOON_BAG_WINNERS_ONLY", "1") == "1"
+        self.moon_bag_winners_only = os.getenv("MOON_BAG_WINNERS_ONLY", "0") == "1"  # losers keep a bag too
         self.moon_bag_target_x = max(0.0, float(os.getenv("MOON_BAG_TARGET_X", "100")))
         self.moon_bag_check_seconds = float(os.getenv("MOON_BAG_CHECK_SECONDS", "60"))
         # A bag worth less than MIN_MOON_BAG_USD is not worth its own rent (0.002 SOL) and is
         # sold with the rest. A bag that has fallen to MOON_BAG_DEAD_PCT of the value it was kept
         # at is burned and its account closed: the rent is worth more than the tokens.
         self.min_moon_bag_usd = float(os.getenv("MIN_MOON_BAG_USD", "0.5"))
-        self.moon_bag_dead_pct = float(os.getenv("MOON_BAG_DEAD_PCT", "5"))
+        self.moon_bag_dead_pct = float(os.getenv("MOON_BAG_DEAD_PCT", "0"))  # 0: bags are never burned
         # Partial take-profit: at +SCALE_OUT_AT sell SCALE_OUT_FRACTION of the position and let the
         # remainder ride to the full take-profit under the same rules. 0 disables.
         self.scale_out_at = float(os.getenv("SCALE_OUT_AT", "0"))
