@@ -24,7 +24,8 @@ import { ethers } from 'ethers';
 import { Connection, Keypair, PublicKey, VersionedTransaction, LAMPORTS_PER_SOL } from '@solana/web3.js';
 import bs58 from 'bs58';
 import {
-  collectResponseText, extractCandidates, oembedText, parseTweetsJson, statusRefs, tweetTimeMs,
+  collectResponseText, extractCandidates, oembedText, parseSyndicationTimeline, parseTweetResult, parseTweetsJson,
+  statusRefs, syndicationToken, tweetTimeMs,
 } from './lib.mjs';
 
 // ---------------------------------------------------------------------------------------
@@ -58,6 +59,12 @@ const CFG = {
   xaiModel: env('SNIPER_MODEL', 'grok-4.6'),
   xaiBase: env('XAI_BASE_URL', 'https://api.x.ai').replace(/\/$/, ''),
   bearer: env('TWITTER_BEARER_TOKEN').trim(),
+  // X's public syndication timeline (what embedded profile widgets read): free, polled every
+  // SNIPER_POLL_MS. Grok then only runs as a backup on its own interval, which is what keeps
+  // the xAI bill down: every Grok poll is a paid X search.
+  syndication: flag('SNIPER_SYNDICATION', true),
+  grokBackupMs: Math.max(30000, num('SNIPER_GROK_BACKUP_MS', 300000)),   // when the free feed works
+  grokIntervalMs: Math.max(10000, num('SNIPER_GROK_INTERVAL_MS', 30000)), // when it does not
   verify: env('SNIPER_VERIFY', 'auto').toLowerCase(),          // auto | oembed | grok | none
   trustUnverified: flag('SNIPER_TRUST_UNVERIFIED', false),
   maxAgeS: num('SNIPER_MAX_POST_AGE_S', 900),                   // never act on posts older than this
@@ -228,6 +235,40 @@ async function xApiTweets() {
   });
 }
 
+const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+const synd = { ok: 0, errors: 0, lastOkAt: 0, lastError: '' };
+
+/** Posts from X's public syndication timeline for the handle. Free, no key, X's own data. */
+async function syndicationTweets() {
+  const urls = [
+    `https://syndication.twitter.com/srv/timeline-profile/screen-name/${CFG.handle}`,
+    `https://syndication.twitter.com/srv/timeline-profile/screen-name/${CFG.handle}?showReplies=false`,
+  ];
+  let lastErr = 'no response';
+  for (const url of urls) {
+    let r;
+    try { r = await fetchJson(url, { headers: { 'User-Agent': BROWSER_UA, Accept: 'text/html,*/*' } }, 10000); } catch (e) { lastErr = e.message; continue; }
+    if (!r.ok) { lastErr = `HTTP ${r.status}`; continue; }
+    if (!/__NEXT_DATA__/.test(r.text)) { lastErr = 'no timeline data in response'; continue; }
+    synd.ok += 1; synd.lastOkAt = Date.now();
+    return parseSyndicationTimeline(r.text, CFG.handle).map((t) => ({ ...t, source: 'x-timeline', verified: true }));
+  }
+  synd.errors += 1; synd.lastError = lastErr;
+  throw new Error(lastErr);
+}
+const syndicationHealthy = () => synd.lastOkAt > 0 && Date.now() - synd.lastOkAt < 3 * CFG.pollMs + 5000;
+
+/** One post by id from X's tweet-result endpoint (also public): the verification used
+ *  before the embed and the second Grok read. */
+async function tweetResultVerify(tweet) {
+  const url = `https://cdn.syndication.twimg.com/tweet-result?id=${tweet.id}&token=${syndicationToken(tweet.id)}&lang=en`;
+  const r = await fetchJson(url, { headers: { 'User-Agent': BROWSER_UA } }, 10000);
+  if (!r.ok || !r.json) throw new Error(`tweet-result ${r.status}`);
+  const post = parseTweetResult(r.json, CFG.handle);
+  if (!post) throw new Error('tweet-result: not this account, or the post is gone');
+  return post.text;
+}
+
 const GROK_SYSTEM = 'You are a monitoring tool, not a chat assistant. You answer ONLY with the JSON requested. '
   + 'Never invent, paraphrase or summarize posts: copy their text verbatim, including every URL and every token contract address. '
   + 'If you cannot find a matching post with certainty, return [].';
@@ -351,6 +392,9 @@ async function grokVerify(tweet) {
 async function verifyTweet(tweet) {
   if (tweet.verified || CFG.verify === 'none') return { verified: true, text: tweet.text, how: tweet.source };
   const errors = [];
+  if (CFG.verify === 'auto') {
+    try { return { verified: true, text: await tweetResultVerify(tweet), how: 'tweet-result' }; } catch (e) { errors.push(`tweet-result: ${e.message}`); }
+  }
   if (CFG.verify === 'auto' || CFG.verify === 'oembed') {
     try { return { verified: true, text: await oembedVerify(tweet), how: 'oembed' }; } catch (e) { errors.push(`oembed: ${e.message}`); }
   }
@@ -792,6 +836,53 @@ async function runTest(text, origin) {
   } finally { CFG.dryRun = saved.dryRun; CFG.routeWaitS = saved.routeWaitS; }
 }
 
+/** State-file loss (a redeploy without a persistent volume) must not strand a bag: rebuild the
+ *  position from chain history. Alchemy's asset-transfer index lists ERC20 tokens this
+ *  wallet received; a token we still hold that arrived in a transaction we sent with ETH
+ *  attached is our buy, and that ETH is the spend. Rungs already taken are inferred from
+ *  how much of the original bag is left. */
+async function recoverEvmPosition() {
+  for (const [id, provider] of Object.entries(evm.providers)) {
+    const chainId = Number(id);
+    if (!/alchemy\.com/.test(evm.rpc[chainId] || '')) continue;
+    const wallet = evm.wallets[chainId].address;
+    let res;
+    try {
+      res = await provider.send('alchemy_getAssetTransfers', [{ fromBlock: '0x0', toAddress: wallet, category: ['erc20'], order: 'desc', maxCount: '0x19', withMetadata: true }]);
+    } catch (e) { log(`[tp] chain history unavailable on ${CHAIN_NAMES[chainId]} (${String(e.message).slice(0, 100)}); no position recovery`); continue; }
+    for (const t of res?.transfers || []) {
+      const token = t.rawContract?.address;
+      if (!token || !ethers.isAddress(token)) continue;
+      const when = Date.parse(t.metadata?.blockTimestamp || '');
+      if (when && Date.now() - when > 14 * 24 * 3600 * 1000) break;
+      const address = ethers.getAddress(token);
+      let balance;
+      try { balance = await tokenBalance({ chain: chainId, address }); } catch { continue; }
+      if (balance <= 0n) continue;
+      let tx;
+      try { tx = await provider.getTransaction(t.hash); } catch { tx = null; }
+      if (!tx || tx.from.toLowerCase() !== wallet.toLowerCase() || tx.value <= 0n) continue;
+      const initial = BigInt(t.rawContract.value || '0x0');
+      const ladder = TAKE_PROFIT_LADDER.map((r) => ({ ...r, done: null }));
+      const leftFrac = initial > 0n ? Number(balance) / Number(initial) : 1;
+      // Infer rungs already taken: the initial-back rung leaves ~80% at 5x, the 80% rung far less.
+      if (leftFrac < 0.9 && ladder[0]) ladder[0].done = { hash: 'inferred', why: `only ${(leftFrac * 100).toFixed(0)}% of the original bag remains` };
+      if (leftFrac < 0.4 && ladder[1]) ladder[1].done = { hash: 'inferred', why: `only ${(leftFrac * 100).toFixed(0)}% of the original bag remains` };
+      const spend = `${Number(ethers.formatEther(tx.value)).toFixed(5)} ETH`;
+      state.position = {
+        chain: chainId, chainName: CHAIN_NAMES[chainId], address, spentRaw: tx.value.toString(), spend, buyHash: t.hash, tweet: 'recovered',
+        openedAt: t.metadata?.blockTimestamp || new Date().toISOString(), ladder, initialBalanceRaw: initial > 0n ? initial.toString() : null, sales: [], sold: null,
+      };
+      state.bought = true;
+      state.buy = { hash: t.hash, chain: CHAIN_NAMES[chainId], address, spend, at: state.position.openedAt, recovered: true };
+      saveState(state);
+      log(`[tp] recovered position from chain history: ${address} on ${CHAIN_NAMES[chainId]}, bought for ${spend} in ${t.hash}; `
+        + `${(leftFrac * 100).toFixed(0)}% of the original bag held; rungs already taken: ${ladder.filter((r) => r.done).length}/${ladder.length}`);
+      return;
+    }
+  }
+}
+
 const TEST_FILE = path.join(DATA_DIR, 'sniper-test.json');
 async function runQueuedTest() {
   let text = null;
@@ -860,7 +951,7 @@ async function handleTweet(tweet) {
 }
 
 let backoffMs = 0;
-const stats = { polls: 0, ok: 0, errors: 0, posts: 0, lastHeartbeat: Date.now() };
+const stats = { polls: 0, ok: 0, errors: 0, posts: 0, grok: 0, lastGrokAt: 0, lastHeartbeat: Date.now() };
 const HEARTBEAT_MS = Math.max(60000, num('SNIPER_HEARTBEAT_MS', 300000));
 
 function heartbeat() {
@@ -870,8 +961,9 @@ function heartbeat() {
   const rungsDone = pos?.ladder ? pos.ladder.filter((r) => r.done).length : 0;
   const posNote = pos ? (pos.sold ? `; ${pos.address.slice(0, 10)} fully sold (${pos.sold.hash})`
     : `; holding ${pos.address.slice(0, 10)} on ${pos.chainName} at ${tp.multiple == null ? '?' : tp.multiple.toFixed(2) + 'x'} entry, ${rungsDone}/${pos.ladder ? pos.ladder.length : 0} rungs taken`) : '';
-  log(`[heartbeat] ${stats.polls} polls, ${stats.ok} ok, ${stats.errors} errors, ${stats.posts} posts seen, `
-    + `${Object.keys(state.pending).length} pending; dryRun=${CFG.dryRun} bought=${state.bought}${posNote}`);
+  const feed = CFG.syndication ? `free X feed ${syndicationHealthy() ? 'OK' : 'DOWN'} (${synd.ok} ok/${synd.errors} err), ` : '';
+  log(`[heartbeat] ${stats.polls} polls, ${stats.ok} ok, ${stats.errors} errors, ${stats.posts} posts seen, ${Object.keys(state.pending).length} pending; `
+    + `${feed}Grok calls ${stats.grok}; dryRun=${CFG.dryRun} bought=${state.bought}${posNote}`);
 }
 
 async function tick() {
@@ -879,14 +971,26 @@ async function tick() {
   try { await checkTakeProfit(); } catch (e) { log(`[tp] ${String(e.message || e).slice(0, 200)}`); }
   const tweets = [];
   stats.polls += 1;
+  let freeOk = false;
   if (CFG.bearer) {
-    try { tweets.push(...await xApiTweets()); stats.ok += 1; } catch (e) { stats.errors += 1; log(`[x] ${e.message}`); }
+    try { tweets.push(...await xApiTweets()); stats.ok += 1; freeOk = true; } catch (e) { stats.errors += 1; log(`[x] ${e.message}`); }
   }
-  if (CFG.xaiKey && (!CFG.bearer || tweets.length === 0)) {
+  if (CFG.syndication && !freeOk) {
+    try { tweets.push(...await syndicationTweets()); stats.ok += 1; freeOk = true; } catch (e) {
+      stats.errors += 1;
+      if (synd.errors === 1 || synd.errors % 60 === 0) log(`[x-timeline] free feed unavailable (${e.message}); Grok covers every ${CFG.grokIntervalMs / 1000}s until it is back`);
+    }
+  }
+  // Grok is a paid search per call: a backup sweep when a free feed works, the only eyes
+  // otherwise, and never more often than its interval (plus any backoff from the API).
+  const grokEvery = freeOk ? CFG.grokBackupMs : CFG.grokIntervalMs;
+  if (CFG.xaiKey && Date.now() - stats.lastGrokAt >= grokEvery + backoffMs) {
+    stats.lastGrokAt = Date.now();
+    stats.grok += 1;
     try { tweets.push(...await grokTweets()); backoffMs = 0; stats.ok += 1; } catch (e) {
       stats.errors += 1;
-      backoffMs = e.retryAfterMs || Math.min(60000, (backoffMs || 5000) * 2);
-      log(`[grok] ${e.message} (backing off ${backoffMs / 1000}s)`);
+      backoffMs = e.retryAfterMs || Math.min(600000, (backoffMs || 30000) * 2);
+      log(`[grok] ${e.message} (next Grok try in ${((grokEvery + backoffMs) / 1000) | 0}s${freeOk ? '; the free X feed is still watching' : ''})`);
     }
   }
   stats.posts += tweets.filter((t) => !state.seen.includes(t.id)).length;
@@ -914,7 +1018,9 @@ async function tick() {
 
 async function main() {
   if (!CFG.xaiKey && !CFG.bearer) { log('no source configured: set XAI_API_KEY (Grok x_search) or TWITTER_BEARER_TOKEN (X API v2)'); process.exit(1); }
-  log(`watching @${CFG.handle} every ${CFG.pollMs / 1000}s via ${[CFG.bearer && 'X API', CFG.xaiKey && `Grok ${CFG.xaiModel}`].filter(Boolean).join(' + ')}; `
+  const sources = [CFG.bearer && 'X API', CFG.syndication && 'free X feed',
+    CFG.xaiKey && `Grok ${CFG.xaiModel} as backup every ${CFG.grokBackupMs / 1000}s (every ${CFG.grokIntervalMs / 1000}s if the free feed fails)`].filter(Boolean);
+  log(`watching @${CFG.handle} every ${CFG.pollMs / 1000}s via ${sources.join(' + ')}; `
     + `dryRun=${CFG.dryRun} verify=${CFG.verify} routeWait=${CFG.routeWaitS}s slippage=${CFG.slippageBps}-${CFG.maxSlippageBps}bps`);
   await connectEvm();
   if (!evmEnabled() && !solEnabled()) { log('no wallet configured: set WALLET_PRIVATE_KEY (Solana) and/or SNIPER_EVM_PRIVATE_KEY (Base/Ethereum)'); process.exit(1); }
@@ -933,16 +1039,27 @@ async function main() {
     log(`Solana wallet ${sol.keypair.publicKey.toBase58()}: ${bal} SOL; spend rule ${spendRule()} = right now ${now}`);
   } else log('Solana buying off (needs WALLET_PRIVATE_KEY)');
   if (state.bought) log(`already bought once: ${JSON.stringify(state.buy)} — delete ${CFG.stateFile} to arm again`);
+  if (!state.position && evmEnabled()) {
+    try { await recoverEvmPosition(); } catch (e) { log(`[tp] position recovery failed: ${String(e.message).slice(0, 160)}`); }
+  }
   if (state.position && !state.position.sold) log(`[tp] resuming watch on ${state.position.address} (${state.position.chainName}): ${describeLadder(state.position.ladder || TAKE_PROFIT_LADDER)}`);
   log(`take profit ladder: ${describeLadder(TAKE_PROFIT_LADDER)}; checked every ${TP_CHECK_MS / 1000}s; POST /api/sniper/sell sells everything left`);
   if (CFG.dryRun) log('DRY RUN: nothing will be sent. Set SNIPER_DRY_RUN=false to go live.');
+  if (CFG.syndication) {
+    try {
+      const posts = await syndicationTweets();
+      const latest = posts[0];
+      log(latest ? `[probe] free X feed works: latest post ${latest.id} (${((Date.now() - (tweetTimeMs(latest) ?? Date.now())) / 60000).toFixed(0)} min old): ${latest.text.replace(/\s+/g, ' ').slice(0, 140)}`
+        : '[probe] free X feed answered but listed no posts for this account');
+    } catch (e) { log(`[probe] free X feed unavailable (${e.message}); Grok will be the only eyes, every ${CFG.grokIntervalMs / 1000}s`); }
+  }
   if (CFG.xaiKey) {
     try { await grokProbe(); } catch (e) { log(`[probe] Grok read failed: ${e.message}`); }
   }
   if (env('SNIPER_TEST_TEXT').trim()) await runTest(env('SNIPER_TEST_TEXT'), 'SNIPER_TEST_TEXT');
   for (;;) {
     try { await tick(); } catch (e) { log(`[tick] ${e.message}`); }
-    await sleep(CFG.pollMs + backoffMs);
+    await sleep(CFG.pollMs);
   }
 }
 

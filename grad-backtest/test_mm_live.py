@@ -217,6 +217,29 @@ class LiveEngineTests(unittest.TestCase):
         self.assertEqual(adaptive.portfolio.events[-1].action, "CLOSE_EXTERNAL")
         self.assertEqual(engine.broker.deployed_usd, 0.0)
 
+    def test_adopts_untracked_positions_at_current_value(self):
+        engine, cfg, sidecar = self.make_engine()
+        adaptive = next(s for s in engine.engine.strategies if s.name == "adaptive_dlmm")
+        engine.universe = [{"mint": MINT, "dlmm_pool": POOL}]
+
+        def get(path, **params):
+            if path == "/positions":
+                return {"tracked": [], "discovered": [{"position": "ORPHAN", "lowerPrice": 0.000095, "upperPrice": 0.000105,
+                                                       "tokenAmountRaw": "2000000000", "quoteAmountRaw": "200000000"}]}
+            return {"decimalsX": 6, "price": 0.0001}
+        sidecar.get.side_effect = get
+        engine.adopt_untracked()
+        pos = adaptive.portfolio.lp[MINT]
+        self.assertEqual(pos.position_key, "ORPHAN")
+        self.assertEqual(pos.pool, POOL)
+        # 2000 tokens at $0.01 plus 0.2 SOL at $100 = $40 taken over at current value.
+        self.assertAlmostEqual(pos.entry_value, 40.0, places=2)
+        self.assertAlmostEqual(adaptive.portfolio.cash, 47.0, places=2)
+        self.assertAlmostEqual(engine.broker.deployed_usd, 40.0, places=2)
+        self.assertEqual(adaptive.portfolio.events[-1].action, "ADOPTED")
+        engine.adopt_untracked()
+        self.assertEqual(len(adaptive.portfolio.lp), 1)
+
     def test_reconcile_keeps_live_positions_and_counts_deployed_capital(self):
         engine, cfg, sidecar = self.make_engine()
         adaptive = next(s for s in engine.engine.strategies if s.name == "adaptive_dlmm")
