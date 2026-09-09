@@ -381,6 +381,12 @@ not establish that graduations are being detected. Counters reset on process res
 | `MOON_BAG_CHECK_SECONDS` | `60` | How often bags are re-quoted. |
 | `MIN_MOON_BAG_USD` | `0.5` | A would-be bag worth less than this is sold with the rest. |
 | `MOON_BAG_DEAD_PCT` | `0` | A bag worth less than this percent of its kept value is burned and its account closed. `0` (default) never burns a bag. |
+| `RUNNER_ENABLED` | `1` | Runner mode: every graduation goes on a watchlist and is bought once its market cap grows into the swing band with momentum. |
+| `RUNNER_ONLY` | `0` | `1` turns the at-graduation entry off so only runners are traded. |
+| `RUNNER_MIN_MARKET_CAP_USD` / `RUNNER_MAX_MARKET_CAP_USD` | `400000` / `4000000` | The swing band. |
+| `RUNNER_MIN_GAIN_PCT` / `RUNNER_MOMENTUM_MINUTES` | `10` / `15` | Enter only when the cap is up this much from its low of the last N minutes. |
+| `RUNNER_WATCH_HOURS` / `RUNNER_CHECK_SECONDS` / `RUNNER_MAX_WATCH` | `6` / `60` / `100` | How long a graduation is watched, how often the watchlist is priced (one batched Jupiter price call per 50 mints), and the watchlist size. |
+| `RUNNER_TAKE_PROFIT` / `RUNNER_STOP_LOSS` / `RUNNER_TRAILING_STOP` / `RUNNER_TIME_STOP_MINUTES` | `1.0` / `0.30` / `0.25` / `240` | Exit thresholds for runner positions; graduation positions keep the plain `TAKE_PROFIT` family. |
 
 ### 4.7 Restart safety and housekeeping (live mode)
 
