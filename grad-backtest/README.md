@@ -375,12 +375,12 @@ not establish that graduations are being detected. Counters reset on process res
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MOON_BAG` | `0` | Fraction of tokens kept at a normal exit (clamped to 0.5). `0` disables. |
-| `MOON_BAG_WINNERS_ONLY` | `1` | Keep a bag only when the exit was profitable. |
+| `MOON_BAG` | `0.15` | Fraction of tokens kept at a normal exit (clamped to 0.5), so no position is ever sold in full. `0` disables. |
+| `MOON_BAG_WINNERS_ONLY` | `0` | `1` keeps a bag only when the exit was profitable; `0` keeps one on every exit. |
 | `MOON_BAG_TARGET_X` | `100` | Sell a bag once worth this multiple of the value it was kept at. `0` holds forever. |
 | `MOON_BAG_CHECK_SECONDS` | `60` | How often bags are re-quoted. |
 | `MIN_MOON_BAG_USD` | `0.5` | A would-be bag worth less than this is sold with the rest. |
-| `MOON_BAG_DEAD_PCT` | `5` | A bag worth less than this percent of its kept value is burned and its account closed. `0` disables. |
+| `MOON_BAG_DEAD_PCT` | `0` | A bag worth less than this percent of its kept value is burned and its account closed. `0` (default) never burns a bag. |
 
 ### 4.7 Restart safety and housekeeping (live mode)
 
