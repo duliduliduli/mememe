@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   base58Decode, collectResponseText, extractCandidates, extractEvmAddresses, extractSolanaAddresses,
-  oembedText, parseTweetsJson, statusRefs, tweetTimeMs,
+  oembedText, parseSyndicationTimeline, parseTweetResult, parseTweetsJson, statusRefs, syndicationToken, tweetTimeMs,
 } from './lib.mjs';
 
 const EVM = '0x4200000000000000000000000000000000000006';
@@ -55,6 +55,33 @@ test('oembed html yields visible text and hrefs', () => {
   assert.match(text, /CA: 0x4200/);
   assert.match(text, /& go/);
   assert.deepEqual(hrefs, ['https://t.co/abc', 'https://twitter.com/hunterbiden/status/5?ref_src=x']);
+});
+
+test('parses the syndication timeline, skipping retweets and other authors', () => {
+  const data = {
+    props: { pageProps: { timeline: { entries: [
+      { content: { tweet: { id_str: '300', full_text: 'CA below', created_at: 'Tue Sep 09 12:00:00 +0000 2026', user: { screen_name: 'HunterBiden' },
+        entities: { urls: [{ url: 'https://t.co/x', expanded_url: `https://basescan.org/token/${EVM}` }] } } } },
+      { content: { tweet: { id_str: '299', full_text: 'RT @someone: not mine', user: { screen_name: 'hunterbiden' }, retweeted_status: {} } } },
+      { content: { tweet: { id_str: '298', full_text: 'someone else', user: { screen_name: 'other' } } } },
+    ] } } },
+  };
+  const html = `<html><script id="__NEXT_DATA__" type="application/json">${JSON.stringify(data)}</script></html>`;
+  const posts = parseSyndicationTimeline(html, 'hunterbiden');
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].id, '300');
+  assert.equal(posts[0].handle, 'hunterbiden');
+  assert.deepEqual(extractCandidates(posts[0].text).evm, [EVM.toLowerCase()]);
+  assert.equal(posts[0].created_at, '2026-09-09T12:00:00.000Z');
+  assert.deepEqual(parseSyndicationTimeline('<html>nothing</html>', 'hunterbiden'), []);
+});
+
+test('tweet-result json and its token', () => {
+  const post = parseTweetResult({ id_str: '1964000000000000000', text: 'gm', user: { screen_name: 'hunterbiden' }, entities: { urls: [{ expanded_url: 'https://pump.fun/coin/' + MINT }] } }, 'hunterbiden');
+  assert.equal(post.id, '1964000000000000000');
+  assert.deepEqual(extractCandidates(post.text).solana, [MINT]);
+  assert.equal(parseTweetResult({ id_str: '1', text: 'x', user: { screen_name: 'other' } }, 'hunterbiden'), null);
+  assert.match(syndicationToken('1964000000000000000'), /^[0-9a-z]+$/);
 });
 
 test('tweet time falls back to the snowflake id', () => {

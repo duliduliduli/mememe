@@ -130,6 +130,66 @@ export function decodeEntities(s) {
   });
 }
 
+/** Posts from X's public syndication timeline (the HTML behind embedded profile widgets).
+ *  The page carries a __NEXT_DATA__ JSON blob; every object in it with id_str + full_text
+ *  is a post. Retweets are skipped; only posts by `handle` (when given) are returned, with
+ *  expanded URLs appended to the text so an address inside a link still counts. */
+export function parseSyndicationTimeline(html, handle = '') {
+  const raw = String(html || '');
+  const want = String(handle || '').replace(/^@/, '').toLowerCase();
+  let json = null;
+  const m = raw.match(/<script[^>]*id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i);
+  const body = m ? m[1] : raw;
+  try { json = JSON.parse(body); } catch { return []; }
+  const out = [];
+  const seen = new Set();
+  const visit = (node, depth) => {
+    if (!node || depth > 20) return;
+    if (Array.isArray(node)) { node.forEach((n) => visit(n, depth + 1)); return; }
+    if (typeof node !== 'object') return;
+    if (typeof node.id_str === 'string' && typeof node.full_text === 'string') {
+      const author = String(node.user?.screen_name || '').toLowerCase();
+      const isRetweet = Boolean(node.retweeted_status) || /^RT @/.test(node.full_text);
+      if (!seen.has(node.id_str) && !isRetweet && (!want || author === want)) {
+        seen.add(node.id_str);
+        const urls = (node.entities?.urls || []).map((u) => u.expanded_url || u.unwound_url || '').filter(Boolean);
+        out.push({
+          id: node.id_str,
+          url: `https://x.com/${author || want}/status/${node.id_str}`,
+          text: [node.full_text, ...urls].join(' '),
+          created_at: node.created_at ? new Date(node.created_at).toISOString() : '',
+          handle: author || want,
+        });
+      }
+    }
+    for (const v of Object.values(node)) if (v && typeof v === 'object') visit(v, depth + 1);
+  };
+  visit(json, 0);
+  return out.sort((a, b) => (a.id.length === b.id.length ? (a.id < b.id ? 1 : -1) : b.id.length - a.id.length));
+}
+
+/** Token X's tweet-result endpoint requires alongside a status id (the same derivation
+ *  the official embed code uses). */
+export function syndicationToken(id) {
+  return ((Number(id) / 1e15) * Math.PI).toString(36).replace(/(0+|\.)/g, '');
+}
+
+/** A post from the tweet-result JSON (cdn.syndication.twimg.com/tweet-result). */
+export function parseTweetResult(json, handle = '') {
+  if (!json || typeof json !== 'object') return null;
+  const id = String(json.id_str || json.id || '').replace(/\D/g, '');
+  if (!id) return null;
+  const author = String(json.user?.screen_name || '').toLowerCase();
+  const want = String(handle || '').replace(/^@/, '').toLowerCase();
+  if (want && author && author !== want) return null;
+  const urls = (json.entities?.urls || []).map((u) => u.expanded_url || u.unwound_url || '').filter(Boolean);
+  const media = (json.mediaDetails || json.entities?.media || []).map((u) => u.expanded_url || '').filter(Boolean);
+  return {
+    id, url: `https://x.com/${author || want}/status/${id}`, text: [json.text || json.full_text || '', ...urls, ...media].join(' '),
+    created_at: json.created_at ? new Date(json.created_at).toISOString() : '', handle: author || want,
+  };
+}
+
 /** Candidate contract addresses in a blob, EVM first then Solana, each unique. */
 export function extractCandidates(blob) {
   return {
