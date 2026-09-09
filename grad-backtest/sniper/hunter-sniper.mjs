@@ -1042,7 +1042,15 @@ async function main() {
   if (!state.position && evmEnabled()) {
     try { await recoverEvmPosition(); } catch (e) { log(`[tp] position recovery failed: ${String(e.message).slice(0, 160)}`); }
   }
-  if (state.position && !state.position.sold) log(`[tp] resuming watch on ${state.position.address} (${state.position.chainName}): ${describeLadder(state.position.ladder || TAKE_PROFIT_LADDER)}`);
+  if (state.position && !state.position.sold) {
+    // The ladder in the environment wins over the one saved with the position, so the
+    // owner can retune rungs after the buy; rungs already taken stay taken.
+    const done = new Map((state.position.ladder || []).filter((r) => r.done).map((r) => [String(r.x), r.done]));
+    const fresh = TAKE_PROFIT_LADDER.map((r) => ({ ...r, done: done.get(String(r.x)) || null }));
+    const changed = JSON.stringify(fresh.map((r) => [r.x, r.sell])) !== JSON.stringify((state.position.ladder || []).map((r) => [r.x, r.sell]));
+    if (changed) { state.position.ladder = fresh; saveState(state); log('[tp] ladder updated from SNIPER_TAKE_PROFIT_LADDER for the open position'); }
+    log(`[tp] resuming watch on ${state.position.address} (${state.position.chainName}): ${describeLadder(state.position.ladder)}`);
+  }
   log(`take profit ladder: ${describeLadder(TAKE_PROFIT_LADDER)}; checked every ${TP_CHECK_MS / 1000}s; POST /api/sniper/sell sells everything left`);
   if (CFG.dryRun) log('DRY RUN: nothing will be sent. Set SNIPER_DRY_RUN=false to go live.');
   if (CFG.syndication) {
