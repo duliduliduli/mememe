@@ -438,6 +438,10 @@ class Config:
         # token accounts to reclaim their rent. Holdings under the threshold are left alone,
         # so nothing the wallet held before the bot is ever burned.
         self.min_adopt_usd = float(os.getenv("MIN_ADOPT_USD", "1.0"))
+        # A holding worth less than this at startup is a leftover (a moon bag from before the
+        # restart, or dust), not a position: it is adopted as a moon bag so it neither takes a
+        # slot nor blocks a fresh copy of the same coin. Default: half the minimum position.
+        self.adopt_as_bag_below_usd = float(os.getenv("ADOPT_AS_BAG_BELOW_USD", str(self.min_position_usd * 0.5)))
         self.close_empty_accounts = os.getenv("CLOSE_EMPTY_ACCOUNTS", "1") == "1"
         # A position whose sells keep failing this long past its time stop is moved to
         # state["stuck"] so it stops blocking a slot; panic still tries to liquidate it.
@@ -3136,6 +3140,15 @@ class Executor:
                 log(f"WARN {mint}: held but not quotable ({describe_error(exc)}); leaving it alone")
                 continue
             if value < self.cfg.min_adopt_usd:
+                continue
+            if value < self.cfg.adopt_as_bag_below_usd:
+                self.state.setdefault("moon_bags", []).append(
+                    {"mint": mint, "tokens": acct["amount"], "cost_usd": round(value, 2), "kept_usd": round(value, 2),
+                     "peak_usd": round(value, 2), "created_at": utc_iso(), "from_exit": "adopted"}
+                )
+                adopted += 1
+                log(f"ADOPTED leftover {mint} worth ${value:.2f} as a moon bag (< ${self.cfg.adopt_as_bag_below_usd:.2f}); "
+                    f"it takes no slot and sells at {self.cfg.moon_bag_target_x:.0f}x")
                 continue
             self.state["positions"].append(
                 {

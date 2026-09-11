@@ -83,6 +83,20 @@ class ReconcileTests(unittest.TestCase):
         self.assertAlmostEqual(adopted["position_usd"], 6.0)
         self.assertEqual(len(closed), 1)  # only the empty account was closed; dust untouched
 
+    def test_small_leftovers_become_moon_bags_not_positions(self):
+        executor, ex, p = live_executor()
+        self.addCleanup(p.stop)
+        leftover, real = (str(Keypair().pubkey()) for _ in range(2))
+        ex.rpc.token_accounts = lambda owner, mint=None: [acct(leftover, 300_000), acct(real, 1_000_000)]
+        ex.jup.quote = lambda i, o, amount, **kw: {"outAmount": str(int(amount * 60))}   # $1.80 and $6.00 at SOL=$100
+        with mock.patch.object(executor.time, "sleep"):
+            ex.reconcile_wallet(sol_price=100.0)
+        self.assertEqual([q["mint"] for q in ex.state["positions"]], [real])
+        bag = ex.state["moon_bags"][0]
+        self.assertEqual(bag["mint"], leftover)
+        self.assertAlmostEqual(bag["kept_usd"], 1.8)
+        self.assertEqual(bag["from_exit"], "adopted")
+
     def test_reconcile_skipped_in_paper_mode(self):
         executor, p = fresh()
         self.addCleanup(p.stop)
