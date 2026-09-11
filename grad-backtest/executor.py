@@ -2529,9 +2529,12 @@ class Executor:
                 if swap["side"] == "sell":
                     if not cfg.copy_follow_sells:
                         continue
+                    # Any followed wallet selling a coin we hold is our cue to sell it too, whichever
+                    # lane or wallet got us in (close_position still keeps the moon bag).
                     for pos in list(self.state["positions"]):
-                        if pos.get("mint") == mint and pos.get("copy") == wallet:
-                            log(f"COPY {wallet[:8]} sold {mint} (${usd:,.0f}); closing our copy")
+                        if pos.get("mint") == mint:
+                            how = "our copy" if pos.get("copy") == wallet else "our position"
+                            log(f"COPY {wallet[:8]} sold {mint} (${usd:,.0f}); closing {how}")
                             try:
                                 self.close_position(pos, "copy_sell", sol_price)
                             except Exception as exc:
