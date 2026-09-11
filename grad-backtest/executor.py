@@ -348,6 +348,9 @@ class Config:
         # probe with a full-size position would out-bet the wallet itself. $50 skips the probes.
         self.copy_min_buy_usd = float(os.getenv("COPY_MIN_BUY_USD", "50"))
         self.copy_follow_sells = os.getenv("COPY_FOLLOW_SELLS", "1") == "1"
+        # With every slot full, a new copied buy sells our oldest position and takes its slot
+        # (COPY_ROTATE=0 skips the new buy instead), so the book is never stuck in old coins.
+        self.copy_rotate = os.getenv("COPY_ROTATE", "1") == "1"
         self.copy_fast = os.getenv("COPY_FAST", "1") == "1"
         self.copy_max_tx_age_seconds = float(os.getenv("COPY_MAX_TX_AGE_SECONDS", "90"))
         self.copy_take_profit = float(os.getenv("COPY_TAKE_PROFIT", "0.75"))
@@ -2562,9 +2565,35 @@ class Executor:
                 if any(p.get("mint") == mint for p in self.state["positions"]) or any(p.get("mint") == mint for p in self.pending):
                     log(f"COPY {wallet[:8]} bought {mint} (${usd:,.0f}); already held or pending")
                     continue
+                if not self.rotate_for_copy(mint, sol_price):
+                    continue
                 log(f"COPY {wallet[:8]} bought {mint} for ${usd:,.0f}; mirroring")
                 self.enter_with_retry({"mint": mint, "graduated_ts": int(block_time or now_ts()), "enter_at": now_ts(),
                                        "copy": wallet, "copy_buy_usd": round(usd)}, sol_price)
+
+    def rotate_for_copy(self, mint: str, sol_price: float) -> bool:
+        """Make room for a copied buy when every slot is taken: sell the oldest position we chose
+        ourselves (adopted leftovers hold no slot) and let the new coin take its place. Returns
+        False when the buy should be skipped instead (rotation off, daily loss limit reached, or
+        the sale failed)."""
+        cfg = self.cfg
+        held = [p for p in self.state["positions"] if not p.get("adopted")]
+        if len(held) < cfg.max_concurrent:
+            return True
+        if not cfg.copy_rotate:
+            log(f"COPY {mint}: all {cfg.max_concurrent} slots full and COPY_ROTATE=0; skipped")
+            return False
+        if float(self.state["daily"]["realized_pnl_usd"]) <= -cfg.daily_loss_limit_usd:
+            log(f"COPY {mint}: daily loss limit reached; not rotating")
+            return False
+        oldest = min(held, key=lambda p: float(p.get("opened_ts") or 0))
+        log(f"ROTATE selling oldest {oldest['mint']} (opened {oldest.get('opened_at', '?')}) to make room for {mint}")
+        try:
+            self.close_position(oldest, "rotate", sol_price)
+        except Exception as exc:
+            log(f"WARN rotate {oldest['mint']}: {describe_error(exc)}; {mint} skipped")
+            return False
+        return not any(p.get("mint") == oldest["mint"] for p in self.state["positions"])
 
     def _prune_stale_pending(self) -> None:
         """Drop entry work that became unsafe while the process was stopped."""
@@ -3471,6 +3500,7 @@ class Executor:
             f"time_stop={self.cfg.runner_time_stop_minutes:.0f}m) "
             f"copy={'only,' if self.cfg.copy_only else ''}{len(self.cfg.copy_wallets)}wallets(min${self.cfg.copy_min_buy_usd:,.0f} "
             f"{'fast' if self.cfg.copy_fast else 'full-checks'} {'follow-sells' if self.cfg.copy_follow_sells else 'own-exits'} "
+            f"{'rotate' if self.cfg.copy_rotate else 'no-rotate'} "
             f"ladder={ladder_text(self.cfg.copy_ladder)} "
             f"tp=+{self.cfg.copy_take_profit:.0%} sl=-{self.cfg.copy_stop_loss:.0%} trail={self.cfg.copy_trailing_stop:.0%} "
             f"time_stop={self.cfg.copy_time_stop_minutes:.0f}m) "
