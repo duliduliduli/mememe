@@ -77,6 +77,7 @@ class CheckCadenceTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         ex.manage_positions(SOL, panic=True)          # panic ignores the cadence (quote + paper sell quote)
         self.assertGreaterEqual(len(calls), 2)
+        p.stop()                                      # drop POSITION_CHECK_SECONDS=100 before testing the default
         executor, p = fresh(COPY_WALLETS="")
         self.addCleanup(p.stop)
         self.assertEqual(executor.Config().position_check_seconds, 0.0)
