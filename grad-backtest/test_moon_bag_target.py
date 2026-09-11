@@ -42,7 +42,7 @@ class WinnersOnlyTests(unittest.TestCase):
         self.assertFalse(cfg.moon_bag_winners_only)
         self.assertEqual(cfg.moon_bag_dead_pct, 0)
         self.assertEqual(cfg.moon_bag_target_x, 100)
-        self.assertEqual(cfg.moon_bag_check_seconds, 60)
+        self.assertEqual(cfg.moon_bag_check_seconds, 180)
 
     def test_bag_kept_on_winning_exit(self):
         executor, p = fresh()
@@ -123,7 +123,7 @@ class TargetTests(unittest.TestCase):
         with mock.patch.object(self.executor, "now_ts", return_value=1000.0):
             self.ex.manage_moon_bags(SOL)
             self.ex.manage_moon_bags(SOL)
-        with mock.patch.object(self.executor, "now_ts", return_value=1061.0):
+        with mock.patch.object(self.executor, "now_ts", return_value=1181.0):
             self.ex.manage_moon_bags(SOL)
         self.assertEqual(len(calls), 2)
 

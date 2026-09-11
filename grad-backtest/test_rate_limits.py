@@ -104,7 +104,7 @@ class BackoffTests(unittest.TestCase):
 
 
 class SolPriceCacheTests(unittest.TestCase):
-    def test_price_cached_for_30s(self):
+    def test_price_cached_for_60s(self):
         executor, p = fresh()
         self.addCleanup(p.stop)
         ex = executor.Executor(executor.Config())
@@ -113,7 +113,7 @@ class SolPriceCacheTests(unittest.TestCase):
         with mock.patch.object(executor, "now_ts", return_value=1000.0):
             self.assertEqual(ex.sol_price_usd(), 100.0)
             self.assertEqual(ex.sol_price_usd(), 100.0)
-        with mock.patch.object(executor, "now_ts", return_value=1031.0):
+        with mock.patch.object(executor, "now_ts", return_value=1061.0):
             ex.sol_price_usd()
         self.assertEqual(len(calls), 2)
 

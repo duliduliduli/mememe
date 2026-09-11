@@ -378,7 +378,7 @@ not establish that graduations are being detected. Counters reset on process res
 | `MOON_BAG` | `0.15` | Fraction of tokens kept at a normal exit (clamped to 0.5), so no position is ever sold in full. `0` disables. |
 | `MOON_BAG_WINNERS_ONLY` | `0` | `1` keeps a bag only when the exit was profitable; `0` keeps one on every exit. |
 | `MOON_BAG_TARGET_X` | `100` | Sell a bag once worth this multiple of the value it was kept at. `0` holds forever. |
-| `MOON_BAG_CHECK_SECONDS` | `60` | How often bags are re-quoted. |
+| `MOON_BAG_CHECK_SECONDS` | `180` | How often bags are re-quoted (each bag is one Jupiter request; bags wait for 100x, so minutes are fine). |
 | `MIN_MOON_BAG_USD` | `0.5` | A would-be bag worth less than this is sold with the rest. |
 | `MOON_BAG_DEAD_PCT` | `0` | A bag worth less than this percent of its kept value is burned and its account closed. `0` (default) never burns a bag. |
 | `RUNNER_ENABLED` | `1` | Runner mode: every graduation goes on a watchlist and is bought once its market cap grows into the swing band with momentum. |
@@ -388,6 +388,7 @@ not establish that graduations are being detected. Counters reset on process res
 | `RUNNER_WATCH_HOURS` / `RUNNER_CHECK_SECONDS` / `RUNNER_MAX_WATCH` | `6` / `60` / `100` | How long a graduation is watched, how often the watchlist is priced (one batched Jupiter price call per 50 mints), and the watchlist size. |
 | `RUNNER_TAKE_PROFIT` / `RUNNER_STOP_LOSS` / `RUNNER_TRAILING_STOP` / `RUNNER_TIME_STOP_MINUTES` | `1.0` / `0.30` / `0.25` / `240` | Exit thresholds for runner positions; graduation positions keep the plain `TAKE_PROFIT` family. |
 | `COPY_WALLETS` | (empty) | Comma-separated wallet addresses whose buys are mirrored at the usual position size. Each is polled every `COPY_POLL_SECONDS` (3); the first poll records a baseline, mirroring only trades still inside `COPY_MAX_TX_AGE_SECONDS`. Buys paid in SOL, wrapped SOL, USDC or USDT are all recognised. |
+| `COPY_ROTATE_MIN_AGE_MINUTES` | `20` | A position younger than this keeps its slot; the new copied buy is skipped instead of rotating it out (adopted leftovers always rotate first). |
 | `COPY_ROTATE` | `1` | When every slot is full and a followed wallet buys, sell our oldest position (moon bag kept) and give the slot to the new coin. `0` skips the new buy instead. Never rotates once the daily loss limit is hit. In copy-only mode positions adopted after a redeploy count as held (and rotate first) and use the copy exits. |
 | `POSITION_CHECK_SECONDS` | `8` in copy-only mode, else `0` | How often each open position is re-quoted for its exits. Every quote is a Jupiter request, and the keyless tier rate-limits a busy loop, which only delays exits. |
 | `COPY_ONLY` | `1` when `COPY_WALLETS` is set | Copy trading is the only lane: graduation discovery and the runner watchlist are off. `0` runs every lane. |

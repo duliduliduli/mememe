@@ -266,7 +266,7 @@ class Config:
         # MOON_BAG_CHECK_SECONDS, not every loop, since they are off the Jupiter budget otherwise.
         self.moon_bag_winners_only = os.getenv("MOON_BAG_WINNERS_ONLY", "0") == "1"  # losers keep a bag too
         self.moon_bag_target_x = max(0.0, float(os.getenv("MOON_BAG_TARGET_X", "100")))
-        self.moon_bag_check_seconds = float(os.getenv("MOON_BAG_CHECK_SECONDS", "60"))
+        self.moon_bag_check_seconds = float(os.getenv("MOON_BAG_CHECK_SECONDS", "180"))
         # A bag worth less than MIN_MOON_BAG_USD is not worth its own rent (0.002 SOL) and is
         # sold with the rest. A bag that has fallen to MOON_BAG_DEAD_PCT of the value it was kept
         # at is burned and its account closed: the rent is worth more than the tokens.
@@ -355,6 +355,10 @@ class Config:
         # With every slot full, a new copied buy sells our oldest position and takes its slot
         # (COPY_ROTATE=0 skips the new buy instead), so the book is never stuck in old coins.
         self.copy_rotate = os.getenv("COPY_ROTATE", "1") == "1"
+        # A hyperactive wallet would otherwise rotate the book every minute, paying the buy and
+        # sell slippage each time; a position younger than this keeps its slot and the new buy
+        # is skipped instead.
+        self.copy_rotate_min_age_minutes = float(os.getenv("COPY_ROTATE_MIN_AGE_MINUTES", "20"))
         self.copy_fast = os.getenv("COPY_FAST", "1") == "1"
         self.copy_max_tx_age_seconds = float(os.getenv("COPY_MAX_TX_AGE_SECONDS", "90"))
         self.copy_take_profit = float(os.getenv("COPY_TAKE_PROFIT", "0.75"))
@@ -2238,9 +2242,17 @@ class Executor:
         """SOL/USD from a 1 SOL -> USDC quote, cached for 30s: it only converts position sizes and
         P&L, and re-quoting it every 5s loop was a third of our Jupiter request budget."""
         cached = getattr(self, "_sol_price", None)
-        if cached and now_ts() - cached[0] < 30:
+        if cached and now_ts() - cached[0] < 60:
             return cached[1]
-        quote = self.jup.quote(WSOL, USDC, LAMPORTS)  # 1 SOL -> USDC (6 decimals)
+        try:
+            quote = self.jup.quote(WSOL, USDC, LAMPORTS)  # 1 SOL -> USDC (6 decimals)
+        except Exception as exc:
+            if cached and is_rate_limited(exc):
+                # A stale SOL price only skews sizing by a few cents; a 429 here must not
+                # abort the whole cycle and with it every exit check.
+                self._sol_price = (now_ts() - 30, cached[1])
+                return cached[1]
+            raise
         price = int(quote["outAmount"]) / 1e6
         self._sol_price = (now_ts(), price)
         return price
@@ -2592,6 +2604,11 @@ class Executor:
             return False
         # Adopted positions were bought before this process started, so they are the oldest.
         oldest = min(held, key=lambda p: (0 if p.get("adopted") else 1, float(p.get("opened_ts") or 0)))
+        age_minutes = (now_ts() - float(oldest.get("opened_ts") or 0)) / 60
+        if not oldest.get("adopted") and age_minutes < cfg.copy_rotate_min_age_minutes:
+            log(f"COPY {mint}: slots full and the oldest position ({oldest['mint'][:8]}) is only {age_minutes:.0f}m old "
+                f"(< {cfg.copy_rotate_min_age_minutes:.0f}m); skipped instead of rotating")
+            return False
         log(f"ROTATE selling oldest {oldest['mint']} (opened {oldest.get('opened_at', '?')}) to make room for {mint}")
         try:
             self.close_position(oldest, "rotate", sol_price)
