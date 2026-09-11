@@ -341,7 +341,9 @@ class Config:
         # detection are ignored, and the first poll of a wallet only takes a baseline.
         self.copy_wallets = tuple(w.strip() for w in os.getenv("COPY_WALLETS", "").replace("\n", ",").split(",") if w.strip())
         self.copy_poll_seconds = max(1.0, float(os.getenv("COPY_POLL_SECONDS", "3")))
-        self.copy_min_buy_usd = float(os.getenv("COPY_MIN_BUY_USD", "300"))
+        # Followed wallets scatter $3-$10 probe buys between their real entries; mirroring a
+        # probe with a full-size position would out-bet the wallet itself. $50 skips the probes.
+        self.copy_min_buy_usd = float(os.getenv("COPY_MIN_BUY_USD", "50"))
         self.copy_follow_sells = os.getenv("COPY_FOLLOW_SELLS", "1") == "1"
         self.copy_fast = os.getenv("COPY_FAST", "1") == "1"
         self.copy_max_tx_age_seconds = float(os.getenv("COPY_MAX_TX_AGE_SECONDS", "90"))
