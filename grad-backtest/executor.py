@@ -331,6 +331,24 @@ class Config:
         self.runner_trailing_stop = float(os.getenv("RUNNER_TRAILING_STOP", "0.25"))
         self.runner_time_stop_minutes = float(os.getenv("RUNNER_TIME_STOP_MINUTES", "240"))
         self.jupiter_price_url = os.getenv("JUPITER_PRICE_URL", "https://lite-api.jup.ag/price/v3").rstrip("/")
+        # Copy mode: mirror the buys of chosen wallets. COPY_WALLETS lists their addresses; each
+        # is polled every COPY_POLL_SECONDS for new signatures and every new transaction is
+        # decoded from its balance changes. A buy worth at least COPY_MIN_BUY_USD is mirrored at
+        # our usual position size; the price-impact and round-trip checks always run, the slow
+        # holder/bundle analysis is skipped when COPY_FAST=1 (speed is the whole point). With
+        # COPY_FOLLOW_SELLS=1 the position is closed when that wallet sells the token; the
+        # COPY_* thresholds guard it in between. Trades older than COPY_MAX_TX_AGE_SECONDS at
+        # detection are ignored, and the first poll of a wallet only takes a baseline.
+        self.copy_wallets = tuple(w.strip() for w in os.getenv("COPY_WALLETS", "").replace("\n", ",").split(",") if w.strip())
+        self.copy_poll_seconds = max(1.0, float(os.getenv("COPY_POLL_SECONDS", "3")))
+        self.copy_min_buy_usd = float(os.getenv("COPY_MIN_BUY_USD", "300"))
+        self.copy_follow_sells = os.getenv("COPY_FOLLOW_SELLS", "1") == "1"
+        self.copy_fast = os.getenv("COPY_FAST", "1") == "1"
+        self.copy_max_tx_age_seconds = float(os.getenv("COPY_MAX_TX_AGE_SECONDS", "90"))
+        self.copy_take_profit = float(os.getenv("COPY_TAKE_PROFIT", "0.75"))
+        self.copy_stop_loss = float(os.getenv("COPY_STOP_LOSS", "0.30"))
+        self.copy_trailing_stop = float(os.getenv("COPY_TRAILING_STOP", "0.25"))
+        self.copy_time_stop_minutes = float(os.getenv("COPY_TIME_STOP_MINUTES", "240"))
         # Bundle guards. A curve that fills in seconds was bought by one party (SOLL graduated 29s
         # after creation with six buyers), and a wallet holding a big slice of supply at entry is
         # the one that dumps on us (SOLL's creator held 59% at graduation). 0 disables either.
@@ -514,6 +532,45 @@ def describe_error(exc: BaseException) -> str:
     if "0x1770" in text or "'Custom': 6000" in text or '"Custom": 6000' in text:
         return "Jupiter 6000: route no longer valid"
     return text[:240] + "…" if len(text) > 240 else text
+
+
+def wallet_swap_from_transaction(tx: dict[str, Any], wallet: str) -> dict[str, Any] | None:
+    """What `wallet` bought or sold in a confirmed transaction, read from balance changes:
+    a token whose balance rose while the wallet's SOL (or wrapped SOL) fell is a buy, the
+    reverse a sell. Returns {"side", "mint", "tokens", "sol"} or None when the wallet did not
+    swap. Multi-hop routes report the token with the largest change."""
+    meta = tx.get("meta") or {}
+    if meta.get("err") is not None:
+        return None
+    keys = rpc_account_keys(tx)
+    sol_delta = 0.0
+    if wallet in keys:
+        idx = keys.index(wallet)
+        pre, post = meta.get("preBalances") or [], meta.get("postBalances") or []
+        if idx < len(pre) and idx < len(post):
+            sol_delta = (int(post[idx]) - int(pre[idx])) / LAMPORTS
+    deltas: dict[str, int] = {}
+    for sign, rows in ((-1, meta.get("preTokenBalances") or []), (1, meta.get("postTokenBalances") or [])):
+        for row in rows:
+            if str(row.get("owner")) != wallet:
+                continue
+            mint = str(row.get("mint"))
+            try:
+                amount = int((row.get("uiTokenAmount") or {}).get("amount") or 0)
+            except (TypeError, ValueError):
+                continue
+            deltas[mint] = deltas.get(mint, 0) + sign * amount
+    wsol_delta = deltas.pop(WSOL, 0) / LAMPORTS
+    sol_delta += wsol_delta
+    deltas = {m: d for m, d in deltas.items() if d != 0}
+    if not deltas:
+        return None
+    mint, delta = max(deltas.items(), key=lambda kv: abs(kv[1]))
+    if delta > 0 and sol_delta < 0:
+        return {"side": "buy", "mint": mint, "tokens": delta, "sol": -sol_delta}
+    if delta < 0 and sol_delta > 0:
+        return {"side": "sell", "mint": mint, "tokens": -delta, "sol": sol_delta}
+    return None
 
 
 def rpc_account_keys(tx: dict[str, Any]) -> list[str]:
@@ -778,6 +835,7 @@ def entry_guard_reason(
     early_sell_pct: float | None = None,
     early_seller: str | None = None,
     runner: bool = False,
+    copy_trade: bool = False,
 ) -> str | None:
     """Reject entries that are no longer the trade the backtest models.
 
@@ -785,13 +843,15 @@ def entry_guard_reason(
     The one exception is the bundle snapshot, which fails closed when BUNDLE_FAIL_CLOSED is set.
     A runner entry (watchlist token that grew into the swing band) is late by design: it skips
     the lateness check and uses the runner market-cap band instead of the graduation one."""
-    if not runner:
+    if not runner and not copy_trade:
         lateness = now - (graduated_ts + cfg.entry_delay_seconds)
         if lateness > cfg.max_entry_lateness_seconds:
             return f"stale entry: {lateness:.0f}s past target"
     if price_impact_pct is not None and price_impact_pct > cfg.max_price_impact_pct:
         return f"price impact {price_impact_pct:.1f}% > {cfg.max_price_impact_pct:.1f}% (pool too thin for our size)"
-    if runner:
+    if copy_trade:
+        pass  # the copied wallet chose the cap; no band applies
+    elif runner:
         if market_cap_usd is not None and market_cap_usd > cfg.runner_max_market_cap_usd > 0:
             return f"market cap ${market_cap_usd:,.0f} > ${cfg.runner_max_market_cap_usd:,.0f} (above the runner band)"
         if market_cap_usd is not None and market_cap_usd < cfg.runner_min_market_cap_usd:
@@ -2377,15 +2437,84 @@ class Executor:
                                    "runner_market_cap_usd": round(mcap), "runner_gain_pct": round(gain_pct, 1)}, sol_price)
 
     def exit_cfg(self, pos: dict[str, Any]) -> "Config":
-        """Exit thresholds for a position: runner positions swing on their own settings."""
-        if not pos.get("runner"):
+        """Exit thresholds for a position: runner and copied positions use their own settings."""
+        if pos.get("copy"):
+            prefix = "copy"
+        elif pos.get("runner"):
+            prefix = "runner"
+        else:
             return self.cfg
         cfg = copy.copy(self.cfg)
-        cfg.take_profit = self.cfg.runner_take_profit
-        cfg.stop_loss = self.cfg.runner_stop_loss
-        cfg.trailing_stop = self.cfg.runner_trailing_stop
-        cfg.time_stop_minutes = self.cfg.runner_time_stop_minutes
+        cfg.take_profit = getattr(self.cfg, f"{prefix}_take_profit")
+        cfg.stop_loss = getattr(self.cfg, f"{prefix}_stop_loss")
+        cfg.trailing_stop = getattr(self.cfg, f"{prefix}_trailing_stop")
+        cfg.time_stop_minutes = getattr(self.cfg, f"{prefix}_time_stop_minutes")
         return cfg
+
+    # ---- copy trading ----------------------------------------------------
+    def poll_copy_wallets(self, sol_price: float) -> None:
+        """Mirror new buys of the copied wallets and, when configured, their sells of tokens we
+        hold because of them. The first look at a wallet only records a baseline."""
+        cfg = self.cfg
+        if not cfg.copy_wallets:
+            return
+        if now_ts() - float(self.state.get("copy_polled_ts") or 0) < cfg.copy_poll_seconds:
+            return
+        self.state["copy_polled_ts"] = now_ts()
+        seen_all = self.state.setdefault("copy_seen", {})
+        for wallet in cfg.copy_wallets:
+            try:
+                rows = self.rpc.call("getSignaturesForAddress", [wallet, {"limit": 10, "commitment": "confirmed"}]) or []
+            except Exception as exc:
+                log(f"WARN copy poll {wallet[:8]}: {describe_error(exc)}")
+                continue
+            seen = seen_all.setdefault(wallet, [])
+            if not seen:
+                seen.extend(r.get("signature") for r in rows if r.get("signature"))
+                log(f"COPY watching {wallet} (baseline {len(seen)} signatures; only new trades are mirrored)")
+                continue
+            for row in reversed(rows):
+                sig = row.get("signature")
+                if not sig or sig in seen:
+                    continue
+                seen.append(sig)
+                del seen[:-200]
+                if row.get("err"):
+                    continue
+                block_time = row.get("blockTime")
+                if block_time and now_ts() - int(block_time) > cfg.copy_max_tx_age_seconds:
+                    log(f"COPY {wallet[:8]}: trade {sig[:12]}… is {now_ts() - int(block_time):.0f}s old; too late to mirror")
+                    continue
+                try:
+                    tx = self.rpc.transaction(sig)
+                except Exception as exc:
+                    log(f"WARN copy decode {sig[:12]}…: {describe_error(exc)}")
+                    continue
+                swap = wallet_swap_from_transaction(tx or {}, wallet)
+                if not swap:
+                    continue
+                usd = swap["sol"] * sol_price
+                mint = swap["mint"]
+                if swap["side"] == "sell":
+                    if not cfg.copy_follow_sells:
+                        continue
+                    for pos in list(self.state["positions"]):
+                        if pos.get("mint") == mint and pos.get("copy") == wallet:
+                            log(f"COPY {wallet[:8]} sold {mint} (${usd:,.0f}); closing our copy")
+                            try:
+                                self.close_position(pos, "copy_sell", sol_price)
+                            except Exception as exc:
+                                log(f"WARN copy sell {mint}: {describe_error(exc)}")
+                    continue
+                if usd < cfg.copy_min_buy_usd:
+                    log(f"COPY {wallet[:8]} bought {mint} for ${usd:,.0f} < ${cfg.copy_min_buy_usd:,.0f} minimum; ignored")
+                    continue
+                if any(p.get("mint") == mint for p in self.state["positions"]) or any(p.get("mint") == mint for p in self.pending):
+                    log(f"COPY {wallet[:8]} bought {mint} (${usd:,.0f}); already held or pending")
+                    continue
+                log(f"COPY {wallet[:8]} bought {mint} for ${usd:,.0f}; mirroring")
+                self.enter_with_retry({"mint": mint, "graduated_ts": int(block_time or now_ts()), "enter_at": now_ts(),
+                                       "copy": wallet, "copy_buy_usd": round(usd)}, sol_price)
 
     def _prune_stale_pending(self) -> None:
         """Drop entry work that became unsafe while the process was stopped."""
@@ -2588,15 +2717,21 @@ class Executor:
         impact = quote_price_impact_pct(quote)
         self.last_entry_meta["price_impact_pct"] = impact
         runner = bool(item.get("runner"))
+        copied = item.get("copy") or ""
         self.last_entry_meta["runner"] = runner
         # Reject an already-invalid quote before expensive holder/history/funder queries.
-        early_guard = entry_guard_reason(self.cfg, item['graduated_ts'], now_ts(), impact, runner=runner)
+        early_guard = entry_guard_reason(self.cfg, item['graduated_ts'], now_ts(), impact, runner=runner, copy_trade=bool(copied))
         if early_guard:
             self.skip(mint, early_guard)
             return
-        market_cap, curve_age, top_holder_pct, top_holder, bundle = self.entry_metadata(
-            mint, item["graduated_ts"], size_usd, tokens
-        )
+        if copied and self.cfg.copy_fast:
+            # Mirroring a wallet is a race: the slow holder/bundle analysis is skipped and the
+            # executable checks below (round trip, impact) are the safety net.
+            market_cap, curve_age, top_holder_pct, top_holder, bundle = None, None, None, None, None
+        else:
+            market_cap, curve_age, top_holder_pct, top_holder, bundle = self.entry_metadata(
+                mint, item["graduated_ts"], size_usd, tokens
+            )
         meta = self.last_entry_meta
         extra = dict(
             curve_tx_count=meta.get("curve_tx_count"),
@@ -2605,6 +2740,7 @@ class Executor:
             early_sell_pct=meta.get("early_sell_pct"),
             early_seller=meta.get("early_seller"),
             runner=runner,
+            copy_trade=bool(copied),
         )
         guard = entry_guard_reason(
             self.cfg, item["graduated_ts"], now_ts(), impact, market_cap, curve_age, top_holder_pct, **extra
@@ -2625,6 +2761,7 @@ class Executor:
             bundle,
             **extra,
         )
+        bundle = bundle if bundle is not None else {"skipped": True}
         summary = " ".join(
             f"{key.removesuffix('_pct')}={bundle[key]:.1f}%"
             for key in (
@@ -2647,7 +2784,7 @@ class Executor:
                 f" funders={bundle.get('funder_sample_count', 0)}/{bundle['holder_sample_count']}"
                 f" confidence={bundle.get('bundle_confidence', 'unknown')}"
             )
-        log(f"BUNDLE {mint}: {summary or bundle.get('error', 'no metrics')}")
+        log(f"BUNDLE {mint}: {summary or bundle.get('error', 'skipped (copy fast entry)' if bundle.get('skipped') else 'no metrics')}")
         if bundle_guard:
             if self.cfg.bundle_log_only:
                 log(f"WARN {mint}: bundle log-only would skip: {bundle_guard}")
@@ -2729,6 +2866,8 @@ class Executor:
                 "peak_usd": size_usd,
                 "runner": runner,
                 "runner_gain_pct": item.get("runner_gain_pct"),
+                "copy": copied or None,
+                "copy_buy_usd": item.get("copy_buy_usd"),
             }
         )
         save_state(self.state)
@@ -3222,6 +3361,11 @@ class Executor:
                     self.manage_watchlist(sol_price or self.sol_price_usd())
                 except Exception as exc:
                     log(f"WARN runner watchlist: {describe_error(exc)}")
+            if self.cfg.copy_wallets:
+                try:
+                    self.poll_copy_wallets(sol_price or self.sol_price_usd())
+                except Exception as exc:
+                    log(f"WARN copy trading: {describe_error(exc)}")
         save_state(self.state)
 
     def run(self) -> None:
@@ -3241,6 +3385,10 @@ class Executor:
             f"+{self.cfg.runner_min_gain_pct:.0f}%/{self.cfg.runner_momentum_minutes:.0f}m watch={self.cfg.runner_watch_hours:.0f}h "
             f"tp=+{self.cfg.runner_take_profit:.0%} sl=-{self.cfg.runner_stop_loss:.0%} trail={self.cfg.runner_trailing_stop:.0%} "
             f"time_stop={self.cfg.runner_time_stop_minutes:.0f}m) "
+            f"copy={len(self.cfg.copy_wallets)}wallets(min${self.cfg.copy_min_buy_usd:,.0f} "
+            f"{'fast' if self.cfg.copy_fast else 'full-checks'} {'follow-sells' if self.cfg.copy_follow_sells else 'own-exits'} "
+            f"tp=+{self.cfg.copy_take_profit:.0%} sl=-{self.cfg.copy_stop_loss:.0%} trail={self.cfg.copy_trailing_stop:.0%} "
+            f"time_stop={self.cfg.copy_time_stop_minutes:.0f}m) "
             f"curve_age>={self.cfg.min_curve_age_seconds:.0f}s top_holder<={self.cfg.max_top_holder_pct:.0f}% "
             f"curve_txs>={self.cfg.min_curve_transactions} early_sell<={self.cfg.max_early_sell_pct:.0f}% "
             f"creator_launches<={self.cfg.max_creator_prior_launches} creator_hold<={self.cfg.max_creator_hold_pct:.0f}% "
