@@ -83,6 +83,22 @@ class CheckCadenceTests(unittest.TestCase):
         self.assertEqual(executor.Config().position_check_seconds, 0.0)
 
 
+class SolPriceTests(unittest.TestCase):
+    def test_rate_limited_price_quote_keeps_the_last_price(self):
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        ex = executor.Executor(executor.Config())
+        ex.jup.quote = lambda *a, **k: {"outAmount": str(int(150 * 1e6))}
+        self.assertEqual(ex.sol_price_usd(), 150.0)
+        import requests
+        resp = requests.Response(); resp.status_code = 429
+        def limited(*a, **k):
+            raise requests.HTTPError("429 Client Error: Too Many Requests", response=resp)
+        ex.jup.quote = limited
+        ex._sol_price = (0, 150.0)                     # cache expired
+        self.assertEqual(ex.sol_price_usd(), 150.0)    # stale price instead of an aborted cycle
+
+
 class LaneTests(unittest.TestCase):
     def test_copy_only_is_the_default_with_wallets(self):
         executor, p = fresh()
@@ -232,6 +248,7 @@ class RotateTests(unittest.TestCase):
     def make(self, **env):
         env.setdefault("MAX_CONCURRENT_POSITIONS", "2")
         env.setdefault("COPY_ONLY", "0")          # all lanes: adopted leftovers hold no slot
+        env.setdefault("COPY_ROTATE_MIN_AGE_MINUTES", "0")
         executor, p = fresh(**env)
         self.addCleanup(p.stop)
         ex = executor.Executor(executor.Config())
@@ -273,6 +290,14 @@ class RotateTests(unittest.TestCase):
         self.assertTrue(ex.rotate_for_copy("New", SOL))
         self.assertEqual(self.closed, [("Bag", "rotate")])
         self.assertEqual(ex.exit_cfg({"mint": "x", "adopted": True}).time_stop_minutes, ex.cfg.copy_time_stop_minutes)
+
+    def test_young_positions_are_not_rotated_out(self):
+        executor, ex = self.make(COPY_ROTATE_MIN_AGE_MINUTES="30")   # Oldest is 10 minutes old
+        self.assertFalse(ex.rotate_for_copy("New", SOL))
+        self.assertEqual(self.closed, [])
+        executor, ex = self.make(COPY_ROTATE_MIN_AGE_MINUTES="5")
+        self.assertTrue(ex.rotate_for_copy("New", SOL))
+        self.assertEqual(self.closed, [("Oldest", "rotate")])
 
     def test_failed_sale_skips_the_new_buy(self):
         executor, ex = self.make()
