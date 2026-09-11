@@ -389,6 +389,7 @@ not establish that graduations are being detected. Counters reset on process res
 | `RUNNER_TAKE_PROFIT` / `RUNNER_STOP_LOSS` / `RUNNER_TRAILING_STOP` / `RUNNER_TIME_STOP_MINUTES` | `1.0` / `0.30` / `0.25` / `240` | Exit thresholds for runner positions; graduation positions keep the plain `TAKE_PROFIT` family. |
 | `COPY_WALLETS` | (empty) | Comma-separated wallet addresses whose buys are mirrored at the usual position size. Each is polled every `COPY_POLL_SECONDS` (3); the first poll records a baseline, mirroring only trades still inside `COPY_MAX_TX_AGE_SECONDS`. Buys paid in SOL, wrapped SOL, USDC or USDT are all recognised. |
 | `COPY_ROTATE` | `1` | When every slot is full and a followed wallet buys, sell our oldest position (moon bag kept) and give the slot to the new coin. `0` skips the new buy instead. Never rotates once the daily loss limit is hit. In copy-only mode positions adopted after a redeploy count as held (and rotate first) and use the copy exits. |
+| `POSITION_CHECK_SECONDS` | `8` in copy-only mode, else `0` | How often each open position is re-quoted for its exits. Every quote is a Jupiter request, and the keyless tier rate-limits a busy loop, which only delays exits. |
 | `COPY_ONLY` | `1` when `COPY_WALLETS` is set | Copy trading is the only lane: graduation discovery and the runner watchlist are off. `0` runs every lane. |
 
 #### EVM copy lane (Robinhood Chain, Base, BNB Chain)

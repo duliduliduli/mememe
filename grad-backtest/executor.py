@@ -343,6 +343,10 @@ class Config:
         # COPY_ONLY=1 (the default once COPY_WALLETS is set) turns graduation discovery and the
         # runner watchlist off: the only entries are mirrored buys. COPY_ONLY=0 runs all lanes.
         self.copy_only = os.getenv("COPY_ONLY", "1" if self.copy_wallets else "0") == "1" and bool(self.copy_wallets)
+        # Each open position costs one Jupiter sell quote per check; the keyless Jupiter tier
+        # answers a busy loop with 429s, which delays every exit. Copy positions ride for hours,
+        # so checking them every few seconds is plenty; graduation snipes keep every-cycle checks.
+        self.position_check_seconds = float(os.getenv("POSITION_CHECK_SECONDS", "8" if self.copy_only else "0"))
         self.copy_poll_seconds = max(1.0, float(os.getenv("COPY_POLL_SECONDS", "3")))
         # Followed wallets scatter $3-$10 probe buys between their real entries; mirroring a
         # probe with a full-size position would out-bet the wallet itself. $50 skips the probes.
@@ -3170,6 +3174,9 @@ class Executor:
 
     def manage_positions(self, sol_price: float, panic: bool) -> None:
         for pos in list(self.state["positions"]):
+            if not panic and now_ts() < float(pos.get("next_check_ts") or 0):
+                continue
+            pos["next_check_ts"] = now_ts() + self.cfg.position_check_seconds
             try:
                 quote = self.jup.quote(pos["mint"], WSOL, int(pos["tokens"]))
                 current_usd = int(quote["outAmount"]) / LAMPORTS * sol_price
@@ -3187,6 +3194,7 @@ class Executor:
                         f"age={(now_ts() - pos['opened_ts']) / 60:.1f}m"
                     )
                 if not panic and pos.get("ladder") and self.ladder_step(pos, current_usd, sol_price):
+                    pos["next_check_ts"] = 0
                     continue  # re-quote what is left next cycle
                 if (
                     not panic
@@ -3196,6 +3204,7 @@ class Executor:
                     and current_usd >= pos["position_usd"] * (1.0 + self.cfg.scale_out_at)
                 ):
                     self.scale_out(pos, sol_price)
+                    pos["next_check_ts"] = 0
                     continue  # remainder is re-evaluated against a fresh quote next cycle
                 reason = "panic" if panic else decide_exit(
                     pos["position_usd"], current_usd, pos["opened_ts"], now_ts(), xcfg, pos["peak_usd"]

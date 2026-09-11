@@ -62,6 +62,27 @@ class DecodeTests(unittest.TestCase):
         self.assertAlmostEqual(swap["sol"], 1.501)
 
 
+class CheckCadenceTests(unittest.TestCase):
+    def test_copy_positions_are_quoted_every_few_seconds_not_every_cycle(self):
+        executor, p = fresh(POSITION_CHECK_SECONDS="100")
+        self.addCleanup(p.stop)
+        ex = executor.Executor(executor.Config())
+        import time as _time
+        ex.state["positions"] = [{"mint": MINT, "tokens": 1000, "position_usd": 10.0, "opened_ts": _time.time(), "opened_at": "t",
+                                  "peak_usd": 10.0, "buy_signature": "", "copy": WALLET}]
+        calls = []
+        ex.jup.quote = lambda mint, out, amount, **kw: (calls.append(mint), {"outAmount": str(int(amount * 0.01 / SOL * 1e9))})[1]
+        ex.manage_positions(SOL, panic=False)
+        ex.manage_positions(SOL, panic=False)
+        self.assertEqual(len(calls), 1)
+        ex.manage_positions(SOL, panic=True)          # panic ignores the cadence (quote + paper sell quote)
+        self.assertGreaterEqual(len(calls), 2)
+        p.stop()                                      # drop POSITION_CHECK_SECONDS=100 before testing the default
+        executor, p = fresh(COPY_WALLETS="")
+        self.addCleanup(p.stop)
+        self.assertEqual(executor.Config().position_check_seconds, 0.0)
+
+
 class LaneTests(unittest.TestCase):
     def test_copy_only_is_the_default_with_wallets(self):
         executor, p = fresh()
@@ -264,6 +285,7 @@ class RotateTests(unittest.TestCase):
 
 class LadderTests(unittest.TestCase):
     def make(self, **env):
+        env.setdefault("POSITION_CHECK_SECONDS", "0")     # these tests step the price between calls
         executor, p = fresh(**env)
         self.addCleanup(p.stop)
         ex = executor.Executor(executor.Config())
