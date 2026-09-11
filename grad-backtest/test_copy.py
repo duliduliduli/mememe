@@ -62,6 +62,32 @@ class DecodeTests(unittest.TestCase):
         self.assertAlmostEqual(swap["sol"], 1.501)
 
 
+class LaneTests(unittest.TestCase):
+    def test_copy_only_is_the_default_with_wallets(self):
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        self.assertTrue(executor.Config().copy_only)
+        executor, p = fresh(COPY_ONLY="0")
+        self.addCleanup(p.stop)
+        self.assertFalse(executor.Config().copy_only)
+        executor, p = fresh(COPY_WALLETS="")
+        self.addCleanup(p.stop)
+        self.assertFalse(executor.Config().copy_only)
+
+    def test_copy_only_skips_graduations_and_watchlist(self):
+        executor, p = fresh()
+        self.addCleanup(p.stop)
+        ex = executor.Executor(executor.Config())
+        calls = []
+        ex.poll_graduations = lambda: calls.append("grad")
+        ex.manage_watchlist = lambda price: calls.append("watch")
+        ex.poll_copy_wallets = lambda price: calls.append("copy")
+        ex.sol_price_usd = lambda: SOL
+        ex.state["watchlist"] = [{"mint": "x"}]
+        ex.run_cycle()
+        self.assertEqual(calls, ["copy"])
+
+
 class GuardTests(unittest.TestCase):
     def test_copy_entry_skips_lateness_and_cap_bands(self):
         executor, p = fresh()
@@ -89,7 +115,7 @@ class PollTests(unittest.TestCase):
     def test_baseline_then_mirror_new_buys_only(self):
         executor, ex = self.make()
         now = int(executor.now_ts())
-        self.sigs = [{"signature": "old1", "blockTime": now - 5}]
+        self.sigs = [{"signature": "old1", "blockTime": now - 600}]
         ex.poll_copy_wallets(SOL)
         self.assertEqual(self.entered, [])
         self.assertEqual(ex.state["copy_seen"][WALLET], ["old1"])
@@ -103,6 +129,34 @@ class PollTests(unittest.TestCase):
         ex.state["copy_polled_ts"] = 0
         ex.poll_copy_wallets(SOL)                             # same signatures: nothing new
         self.assertEqual(len(self.entered), 1)
+
+    def test_first_poll_mirrors_a_buy_made_during_restart(self):
+        executor, ex = self.make()
+        now = int(executor.now_ts())
+        self.sigs = [{"signature": "fresh", "blockTime": now - 20}, {"signature": "old1", "blockTime": now - 600}]
+        self.txs["fresh"] = tx(10.0, 5.0, 0, 9_000_000)
+        ex.poll_copy_wallets(SOL)
+        self.assertEqual([e["mint"] for e in self.entered], [MINT])
+        self.assertIn("old1", ex.state["copy_seen"][WALLET])
+        ex.state["copy_polled_ts"] = 0
+        ex.poll_copy_wallets(SOL)
+        self.assertEqual(len(self.entered), 1)
+
+    def test_usdc_buys_are_sized_in_dollars(self):
+        executor, ex = self.make()
+        now = int(executor.now_ts())
+        self.sigs = [{"signature": "base", "blockTime": now - 600}]
+        ex.poll_copy_wallets(SOL)
+        t = tx(10.0, 9.99999, 0, 4_000_000)                 # only the fee in SOL...
+        usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        t["meta"]["preTokenBalances"].append({"owner": WALLET, "mint": usdc, "uiTokenAmount": {"amount": str(250_000_000)}})
+        t["meta"]["postTokenBalances"].append({"owner": WALLET, "mint": usdc, "uiTokenAmount": {"amount": str(150_000_000)}})
+        self.txs["u1"] = t                                    # ...and 100 USDC for the token
+        self.sigs = [{"signature": "u1", "blockTime": now}, {"signature": "base", "blockTime": now - 600}]
+        ex.state["copy_polled_ts"] = 0
+        ex.poll_copy_wallets(SOL)
+        self.assertEqual(len(self.entered), 1)
+        self.assertAlmostEqual(self.entered[0]["copy_buy_usd"], 100.001, places=2)
 
     def test_small_and_stale_buys_are_ignored(self):
         executor, ex = self.make(COPY_MIN_BUY_USD="300")
