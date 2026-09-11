@@ -436,8 +436,19 @@ def _mm_mode() -> str:
     return "live" if os.getenv("MM_MODE", "").strip().lower() == "live" else "paper"
 
 
+def _copy_only_executor() -> bool:
+    """COPY_WALLETS set and COPY_ONLY not turned off: the executor mirrors wallets only."""
+    return bool(os.getenv("COPY_WALLETS", "").strip()) and os.getenv("COPY_ONLY", "1") == "1"
+
+
 def _mm_autostart() -> bool:
-    return os.getenv("MM_AUTOSTART", "1") != "0"
+    """The market-making lane quotes dozens of tokens through Jupiter's keyless tier every few
+    minutes, which starved the copy lane of quotes. It stays off in copy-only deployments
+    unless MM_AUTOSTART=1 asks for it explicitly."""
+    explicit = os.getenv("MM_AUTOSTART")
+    if explicit is not None:
+        return explicit != "0"
+    return not _copy_only_executor()
 
 
 def _start_mm(mode: str) -> None:

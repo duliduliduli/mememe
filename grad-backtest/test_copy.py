@@ -83,6 +83,54 @@ class CheckCadenceTests(unittest.TestCase):
         self.assertEqual(executor.Config().position_check_seconds, 0.0)
 
 
+class PriceFirstTests(unittest.TestCase):
+    def make(self):
+        executor, p = fresh(POSITION_CHECK_SECONDS="0")
+        self.addCleanup(p.stop)
+        ex = executor.Executor(executor.Config())
+        import time as _time
+        self.pos = {"mint": MINT, "tokens": 1000, "position_usd": 10.0, "opened_ts": _time.time(), "opened_at": "t", "peak_usd": 10.0,
+                    "buy_signature": "", "copy": WALLET, "entry_tokens": 1000, "entry_basis_usd": 10.0,
+                    "ladder": [dict(r, done=False) for r in ex.cfg.copy_ladder]}
+        ex.state["positions"] = [self.pos]
+        self.quotes = []
+        ex.jup.quote = lambda mint, out, amount, **kw: (self.quotes.append(mint), {"outAmount": str(int(amount * self.price / SOL * 1e9))})[1]
+        ex.token_prices = lambda mints: {m: (self.price, 0) for m in mints}     # 0 decimals: 1000 tokens
+        self.price = 0.01                                                       # $0.01/token = $10 = 1.0x
+        return executor, ex
+
+    def test_quiet_position_costs_no_quote(self):
+        executor, ex = self.make()
+        ex.manage_positions(SOL, panic=False)
+        self.assertEqual(self.quotes, [])
+        self.assertAlmostEqual(self.pos["last_value_usd"], 10.0)
+        self.price = 0.015                                  # +50%: still under the 2x rung and the 75% tp
+        ex.manage_positions(SOL, panic=False)
+        self.assertEqual(self.quotes, [])
+        self.assertAlmostEqual(self.pos["peak_usd"], 15.0)
+
+    def test_near_a_trigger_the_real_quote_decides(self):
+        executor, ex = self.make()
+        self.price = 0.0195                                 # within 8% of the 2x rung -> quote
+        ex.manage_positions(SOL, panic=False)
+        self.assertEqual(self.quotes, [MINT])
+        self.assertEqual(self.pos["tokens"], 1000)          # quote said 1.95x: rung not reached
+        self.price = 0.021
+        ex.manage_positions(SOL, panic=False)
+        self.assertEqual(self.pos["tokens"], 600)           # rung taken on the quote
+        self.price = 0.005                                  # -50%: stop loss via quote
+        ex.manage_positions(SOL, panic=False)
+        self.assertEqual(ex.state["positions"], [])
+
+    def test_feed_failure_falls_back_to_quotes(self):
+        executor, ex = self.make()
+        def boom(mints):
+            raise RuntimeError("feed down")
+        ex.token_prices = boom
+        ex.manage_positions(SOL, panic=False)
+        self.assertEqual(self.quotes, [MINT])
+
+
 class SolPriceTests(unittest.TestCase):
     def test_rate_limited_price_quote_keeps_the_last_price(self):
         executor, p = fresh()
