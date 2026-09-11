@@ -31,6 +31,16 @@ class ServerTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"EVM_COPY_WALLETS": "0x1111111111111111111111111111111111111111", "EXECUTOR_MODE": "paper", "EVM_PRIVATE_KEY": ""}):
             self.assertTrue(server._evm_configured())
 
+    def test_mm_lane_stays_off_in_copy_only_deployments(self):
+        with mock.patch.dict(os.environ, {"COPY_WALLETS": "w1", "COPY_ONLY": "1"}, clear=False):
+            os.environ.pop("MM_AUTOSTART", None)
+            self.assertFalse(server._mm_autostart())
+        with mock.patch.dict(os.environ, {"COPY_WALLETS": "w1", "MM_AUTOSTART": "1"}):
+            self.assertTrue(server._mm_autostart())
+        with mock.patch.dict(os.environ, {"COPY_WALLETS": ""}, clear=False):
+            os.environ.pop("MM_AUTOSTART", None)
+            self.assertTrue(server._mm_autostart())
+
     def test_health(self):
         self.assertEqual(self.client.get("/healthz").json(), {"status": "ok"})
 

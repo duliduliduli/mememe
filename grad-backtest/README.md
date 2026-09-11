@@ -391,6 +391,7 @@ not establish that graduations are being detected. Counters reset on process res
 | `ADOPT_AS_BAG_BELOW_USD` | half of `MIN_POSITION_USD` ($2.50) | At startup, an untracked holding worth less than this (but at least `MIN_ADOPT_USD`) is adopted as a moon bag instead of a position: moon bags left from before a redeploy no longer fill the slots or block a fresh copy of the same coin. |
 | `COPY_ROTATE_MIN_AGE_MINUTES` | `20` | A position younger than this keeps its slot; the new copied buy is skipped instead of rotating it out (adopted leftovers always rotate first). |
 | `COPY_ROTATE` | `1` | When every slot is full and a followed wallet buys, sell our oldest position (moon bag kept) and give the slot to the new coin. `0` skips the new buy instead. Never rotates once the daily loss limit is hit. In copy-only mode positions adopted after a redeploy count as held (and rotate first) and use the copy exits. |
+| `PRICE_FIRST_VALUATION` / `PRICE_FIRST_MARGIN_PCT` | `1` / `8` | Value open positions from Jupiter's batched price feed (one request for all of them) and only ask for a real sell quote when an exit, rung or scale-out is within this margin of firing. `0` quotes every position every check. |
 | `POSITION_CHECK_SECONDS` | `8` in copy-only mode, else `0` | How often each open position is re-quoted for its exits. Every quote is a Jupiter request, and the keyless tier rate-limits a busy loop, which only delays exits. |
 | `COPY_ONLY` | `1` when `COPY_WALLETS` is set | Copy trading is the only lane: graduation discovery and the runner watchlist are off. `0` runs every lane. |
 
@@ -934,7 +935,7 @@ python -m mm paper --hours 168
 python -m mm live         # real DLMM ranges + Jupiter swaps for adaptive_dlmm and momentum
 ```
 
-On Railway, `MM_AUTOSTART=1` with `MM_MODE=paper|live` launches the lane next to the
+In copy-only deployments (`COPY_WALLETS` set) the lane stays off unless `MM_AUTOSTART=1` is set explicitly: its universe refresh quotes dozens of tokens through Jupiter's keyless tier and starved the copy lane. On Railway, `MM_AUTOSTART=1` with `MM_MODE=paper|live` launches the lane next to the
 executor; `/api/mm/status`, `/api/mm/stop` and `/api/mm/panic` control it. Live mode needs
 the Node sidecar (`mm/sidecar`, built into the image) and `WALLET_PRIVATE_KEY`; capital is
 capped by `MM_BANKROLL_USD`. Design, the edge gate, the inventory rule, live execution and

@@ -347,6 +347,10 @@ class Config:
         # answers a busy loop with 429s, which delays every exit. Copy positions ride for hours,
         # so checking them every few seconds is plenty; graduation snipes keep every-cycle checks.
         self.position_check_seconds = float(os.getenv("POSITION_CHECK_SECONDS", "8" if self.copy_only else "0"))
+        # Value open positions from the batched price feed (one request for all of them) and
+        # only ask for a real sell quote when an exit is within PRICE_FIRST_MARGIN_PCT of firing.
+        self.price_first_valuation = os.getenv("PRICE_FIRST_VALUATION", "1") == "1"
+        self.price_first_margin_pct = float(os.getenv("PRICE_FIRST_MARGIN_PCT", "8"))
         self.copy_poll_seconds = max(1.0, float(os.getenv("COPY_POLL_SECONDS", "3")))
         # Followed wallets scatter $3-$10 probe buys between their real entries; mirroring a
         # probe with a full-size position would out-bet the wallet itself. $50 skips the probes.
@@ -2438,6 +2442,31 @@ class Executor:
         watch.insert(0, {"mint": mint, "graduated_ts": graduated_ts, "added_at": utc_iso(), "samples": [], "supply_raw": None, "decimals": None})
         del watch[cfg.runner_max_watch:]
 
+    def token_prices(self, mints: list[str]) -> dict[str, tuple[float, int]]:
+        """(usd price, decimals) per mint from Jupiter's batched price feed: one request values
+        every open position, where a sell quote each would cost one request per position."""
+        out: dict[str, tuple[float, int]] = {}
+        for i in range(0, len(mints), 50):
+            chunk = mints[i:i + 50]
+            resp = self.jup.session.get(self.cfg.jupiter_price_url, params={"ids": ",".join(chunk)}, timeout=15)
+            resp.raise_for_status()
+            body = resp.json()
+            data = body.get("data", body) if isinstance(body, dict) else {}
+            for mint in chunk:
+                entry = data.get(mint) if isinstance(data, dict) else None
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    price = float(entry.get("usdPrice", entry.get("price")) or 0)
+                    decimals = int(entry.get("decimals")) if entry.get("decimals") is not None else -1
+                except (TypeError, ValueError):
+                    continue
+                if price > 0 and decimals >= 0:
+                    out[mint] = (price, decimals)
+        if WSOL in out:
+            self._sol_price = (now_ts(), out[WSOL][0])
+        return out
+
     def runner_prices(self, mints: list[str]) -> dict[str, float]:
         """USD price per mint from Jupiter's batched price feed; mints without a price are absent."""
         out: dict[str, float] = {}
@@ -3226,11 +3255,63 @@ class Executor:
         peaked = f", peaked {peak_gain:+.1%}" if peak_gain is not None else ""
         log(f"EXIT {pos['mint']} {reason} ${exit_usd:.2f} ({net:+.1%}{peaked})")
 
+    def position_estimates(self, positions: list[dict[str, Any]]) -> dict[str, float]:
+        """Mark each position at the batched feed price. A position is only sell-quoted when this
+        estimate says an exit or ladder rung is due, which keeps the Jupiter budget for the
+        trades themselves. Empty when the feed is unavailable (the quote path then runs)."""
+        if not positions or not self.cfg.price_first_valuation:
+            return {}
+        try:
+            prices = self.token_prices([p["mint"] for p in positions] + [WSOL])
+        except Exception as exc:
+            log(f"WARN price feed: {describe_error(exc)}; falling back to sell quotes")
+            return {}
+        out: dict[str, float] = {}
+        for pos in positions:
+            hit = prices.get(pos["mint"])
+            if hit:
+                out[pos["mint"]] = int(pos["tokens"]) / 10 ** hit[1] * hit[0]
+        return out
+
+    def exit_due_at(self, pos: dict[str, Any], value_usd: float, panic: bool) -> bool:
+        """Would a value of `value_usd` trigger any exit, rung or scale-out for this position?"""
+        if panic:
+            return True
+        xcfg = self.exit_cfg(pos)
+        margin = 1.0 + self.cfg.price_first_margin_pct / 100  # quote a little before the line
+        if pos.get("ladder"):
+            entry_tokens, entry_basis = int(pos.get("entry_tokens") or 0), float(pos.get("entry_basis_usd") or 0)
+            pending = [r for r in pos["ladder"] if not r.get("done")]
+            if pending and entry_tokens > 0 and entry_basis > 0 and int(pos["tokens"]) > 0:
+                multiple = (value_usd / int(pos["tokens"])) / (entry_basis / entry_tokens)
+                if multiple * margin >= pending[0]["x"]:
+                    return True
+        elif self.cfg.scale_out_at > 0 and not pos.get("scaled_out") and value_usd * margin >= pos["position_usd"] * (1.0 + self.cfg.scale_out_at):
+            return True
+        peak = max(float(pos.get("peak_usd", pos["position_usd"])), value_usd)
+        return decide_exit(pos["position_usd"], value_usd / margin, pos["opened_ts"], now_ts(), xcfg, peak) is not None
+
     def manage_positions(self, sol_price: float, panic: bool) -> None:
-        for pos in list(self.state["positions"]):
-            if not panic and now_ts() < float(pos.get("next_check_ts") or 0):
+        due = [pos for pos in self.state["positions"] if panic or now_ts() >= float(pos.get("next_check_ts") or 0)]
+        estimates = self.position_estimates(due)
+        for pos in due:
+            if pos not in self.state["positions"]:
                 continue
             pos["next_check_ts"] = now_ts() + self.cfg.position_check_seconds
+            estimate = estimates.get(pos["mint"])
+            if estimate is not None and not self.exit_due_at(pos, estimate, panic):
+                # Nothing is close to firing: mark at the feed price and spend no quote.
+                pos["peak_usd"] = max(float(pos.get("peak_usd", pos["position_usd"])), estimate)
+                pos["last_value_usd"] = estimate
+                pos["sell_failures"] = 0
+                if now_ts() >= self._next_position_log.get(pos['mint'], 0):
+                    self._next_position_log[pos['mint']] = now_ts() + 30.0
+                    basis = float(pos['position_usd'])
+                    xcfg = self.exit_cfg(pos)
+                    log(f"POSITION {pos['mint']} price_value=${estimate:.2f} basis=${basis:.2f} "
+                        f"tp_value=${basis * (1 + xcfg.take_profit):.2f} sl_value=${basis * (1 - xcfg.stop_loss):.2f} "
+                        f"peak=${pos['peak_usd']:.2f} age={(now_ts() - pos['opened_ts']) / 60:.1f}m")
+                continue
             try:
                 quote = self.jup.quote(pos["mint"], WSOL, int(pos["tokens"]))
                 current_usd = int(quote["outAmount"]) / LAMPORTS * sol_price
