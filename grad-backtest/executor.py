@@ -2481,8 +2481,8 @@ class Executor:
 
     def exit_cfg(self, pos: dict[str, Any]) -> "Config":
         """Exit thresholds for a position: runner and copied positions use their own settings."""
-        if pos.get("copy"):
-            prefix = "copy"
+        if pos.get("copy") or (pos.get("adopted") and self.cfg.copy_only):
+            prefix = "copy"          # a position picked up after a redeploy keeps the copy lane's exits
         elif pos.get("runner"):
             prefix = "runner"
         else:
@@ -2577,7 +2577,7 @@ class Executor:
         False when the buy should be skipped instead (rotation off, daily loss limit reached, or
         the sale failed)."""
         cfg = self.cfg
-        held = [p for p in self.state["positions"] if not p.get("adopted")]
+        held = [p for p in self.state["positions"] if not p.get("adopted") or cfg.copy_only]
         if len(held) < cfg.max_concurrent:
             return True
         if not cfg.copy_rotate:
@@ -2586,7 +2586,8 @@ class Executor:
         if float(self.state["daily"]["realized_pnl_usd"]) <= -cfg.daily_loss_limit_usd:
             log(f"COPY {mint}: daily loss limit reached; not rotating")
             return False
-        oldest = min(held, key=lambda p: float(p.get("opened_ts") or 0))
+        # Adopted positions were bought before this process started, so they are the oldest.
+        oldest = min(held, key=lambda p: (0 if p.get("adopted") else 1, float(p.get("opened_ts") or 0)))
         log(f"ROTATE selling oldest {oldest['mint']} (opened {oldest.get('opened_at', '?')}) to make room for {mint}")
         try:
             self.close_position(oldest, "rotate", sol_price)
@@ -2783,7 +2784,8 @@ class Executor:
         daily_pnl = float(self.state["daily"]["realized_pnl_usd"])
         # Adopted bags are money already in the market, not a choice we are making now, so they
         # do not take an entry slot: three $2 leftovers must not block every new graduation.
-        open_slots = sum(1 for p in self.state["positions"] if not p.get("adopted"))
+        # In copy-only mode they do count: a redeploy must not let the book grow past the slots.
+        open_slots = sum(1 for p in self.state["positions"] if not p.get("adopted") or self.cfg.copy_only)
         size_usd = position_size_usd(self.cfg, self.equity_usd(sol_price), open_slots, daily_pnl)
         if size_usd <= 0:
             self.skip(mint, f"sizing guards (open={open_slots}, daily_pnl={daily_pnl:.2f})")
