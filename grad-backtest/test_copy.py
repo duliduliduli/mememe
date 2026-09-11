@@ -207,6 +207,52 @@ class PollTests(unittest.TestCase):
         self.assertEqual(ex.exit_cfg({"mint": "x", "copy": WALLET, "ladder": ladder}).take_profit, 4.0)
 
 
+class RotateTests(unittest.TestCase):
+    def make(self, **env):
+        executor, p = fresh(MAX_CONCURRENT_POSITIONS="2", **env)
+        self.addCleanup(p.stop)
+        ex = executor.Executor(executor.Config())
+        now = executor.now_ts()
+        ex.state["positions"] = [
+            {"mint": "Newer", "tokens": 1, "position_usd": 5.0, "opened_ts": now - 60, "opened_at": "b", "peak_usd": 5.0},
+            {"mint": "Oldest", "tokens": 1, "position_usd": 5.0, "opened_ts": now - 600, "opened_at": "a", "peak_usd": 5.0},
+            {"mint": "Bag", "tokens": 1, "position_usd": 2.0, "opened_ts": now - 9000, "opened_at": "z", "peak_usd": 2.0, "adopted": True},
+        ]
+        self.closed = []
+        def close(pos, reason, sol_price):
+            self.closed.append((pos["mint"], reason))
+            ex.state["positions"].remove(pos)
+        ex.close_position = close
+        return executor, ex
+
+    def test_sells_oldest_chosen_position_when_full(self):
+        executor, ex = self.make()
+        self.assertTrue(ex.rotate_for_copy("New", SOL))
+        self.assertEqual(self.closed, [("Oldest", "rotate")])
+        self.assertEqual([p["mint"] for p in ex.state["positions"]], ["Newer", "Bag"])
+
+    def test_no_rotation_with_a_free_slot_or_when_disabled_or_after_daily_loss(self):
+        executor, ex = self.make()
+        ex.state["positions"].pop(0)
+        self.assertTrue(ex.rotate_for_copy("New", SOL))
+        self.assertEqual(self.closed, [])
+        executor, ex = self.make(COPY_ROTATE="0")
+        self.assertFalse(ex.rotate_for_copy("New", SOL))
+        self.assertEqual(self.closed, [])
+        executor, ex = self.make(DAILY_LOSS_LIMIT_USD="10")
+        ex.state["daily"]["realized_pnl_usd"] = -12.0
+        self.assertFalse(ex.rotate_for_copy("New", SOL))
+        self.assertEqual(self.closed, [])
+
+    def test_failed_sale_skips_the_new_buy(self):
+        executor, ex = self.make()
+        def boom(pos, reason, sol_price):
+            raise RuntimeError("rpc down")
+        ex.close_position = boom
+        self.assertFalse(ex.rotate_for_copy("New", SOL))
+        self.assertEqual(len(ex.state["positions"]), 3)
+
+
 class LadderTests(unittest.TestCase):
     def make(self, **env):
         executor, p = fresh(**env)
