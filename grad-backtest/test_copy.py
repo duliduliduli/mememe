@@ -130,6 +130,21 @@ class PollTests(unittest.TestCase):
         ex.poll_copy_wallets(SOL)
         self.assertEqual(closed, [(MINT, "copy_sell")])
 
+    def test_follow_sell_closes_any_position_in_that_coin(self):
+        executor, ex = self.make()
+        now = int(executor.now_ts())
+        self.sigs = [{"signature": "base", "blockTime": now}]
+        ex.poll_copy_wallets(SOL)
+        ex.state["positions"] = [{"mint": MINT, "tokens": 10, "position_usd": 5.0, "opened_ts": now, "peak_usd": 5.0},   # graduation entry
+                                 {"mint": "Other", "tokens": 10, "position_usd": 5.0, "opened_ts": now, "peak_usd": 5.0, "copy": WALLET}]
+        closed = []
+        ex.close_position = lambda pos, reason, sol_price: closed.append((pos["mint"], reason))
+        self.sigs = [{"signature": "sell1", "blockTime": now}, {"signature": "base", "blockTime": now}]
+        self.txs["sell1"] = tx(5.0, 9.0, 9_000_000, 0)
+        ex.state["copy_polled_ts"] = 0
+        ex.poll_copy_wallets(SOL)
+        self.assertEqual(closed, [(MINT, "copy_sell")])
+
     def test_copy_positions_use_copy_exits(self):
         executor, ex = self.make(COPY_TAKE_PROFIT="0.5", TAKE_PROFIT="0.75", COPY_LADDER="")
         self.assertEqual(ex.exit_cfg({"mint": "x", "copy": WALLET}).take_profit, 0.5)
