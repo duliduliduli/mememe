@@ -207,6 +207,25 @@ class PollTests(unittest.TestCase):
         ex.poll_copy_wallets(SOL)
         self.assertEqual(self.entered, [])
 
+    def test_per_wallet_minimum_overrides_the_default(self):
+        executor, ex = self.make(COPY_WALLETS=f"{WALLET}:400, {OTHER}", COPY_MIN_BUY_USD="50")
+        self.assertEqual(ex.cfg.copy_wallets, (WALLET, OTHER))
+        self.assertEqual(ex.cfg.copy_wallet_min_usd, {WALLET: 400.0})
+        now = int(executor.now_ts())
+        self.sigs = [{"signature": "base", "blockTime": now - 600}]
+        ex.poll_copy_wallets(SOL)
+        self.txs["b1"] = tx(10.0, 7.0, 0, 1_000)             # $300: under this wallet's $400 floor
+        self.sigs = [{"signature": "b1", "blockTime": now}, {"signature": "base", "blockTime": now - 600}]
+        ex.state["copy_polled_ts"] = 0
+        ex.poll_copy_wallets(SOL)
+        self.assertEqual(self.entered, [])
+        self.txs["b2"] = tx(10.0, 5.0, 0, 1_000)             # $500: mirrored
+        self.sigs = [{"signature": "b2", "blockTime": now}] + self.sigs
+        ex.state["copy_polled_ts"] = 0
+        ex.poll_copy_wallets(SOL)
+        self.assertEqual([e["copy_buy_usd"] for e in self.entered], [500])
+        self.assertEqual(executor.parse_wallet_list("a:$1k; b\nc:250")[1], {"a": 1000.0, "c": 250.0})
+
     def test_follow_sell_closes_our_copy(self):
         executor, ex = self.make()
         now = int(executor.now_ts())
