@@ -390,7 +390,8 @@ not establish that graduations are being detected. Counters reset on process res
 | `COPY_WALLETS` | (empty) | Comma-separated wallet addresses whose buys are mirrored at the usual position size. Each is polled every `COPY_POLL_SECONDS` (3); the first poll only records a baseline. |
 | `COPY_MIN_BUY_USD` / `COPY_MAX_TX_AGE_SECONDS` | `300` / `90` | Ignore a copied wallet's buys below this size, or older than this when detected. |
 | `COPY_FAST` / `COPY_FOLLOW_SELLS` | `1` / `1` | Skip the slow holder/bundle analysis on copied entries (impact and round-trip checks still run); close our copy when the wallet sells the token. |
-| `COPY_TAKE_PROFIT` / `COPY_STOP_LOSS` / `COPY_TRAILING_STOP` / `COPY_TIME_STOP_MINUTES` | `0.75` / `0.30` / `0.25` / `240` | Exit thresholds for copied positions between the wallet's own sell and ours. |
+| `COPY_TAKE_PROFIT` / `COPY_STOP_LOSS` / `COPY_TRAILING_STOP` / `COPY_TIME_STOP_MINUTES` | `0.75` / `0.30` / `0.25` / `240` | Exit thresholds for copied positions between the wallet's own sell and ours. With a ladder the take profit only backstops its top rung. |
+| `COPY_LADDER` | `2:40,3:30,5:30` | Phase profit out on copied positions: sell that percent of the entry tokens once the price reaches that multiple of the entry price. The last rung closes the position (moon bag applies). Empty disables it. |
 
 ### 4.7 Restart safety and housekeeping (live mode)
 

@@ -131,9 +131,64 @@ class PollTests(unittest.TestCase):
         self.assertEqual(closed, [(MINT, "copy_sell")])
 
     def test_copy_positions_use_copy_exits(self):
-        executor, ex = self.make(COPY_TAKE_PROFIT="0.5", TAKE_PROFIT="0.75")
+        executor, ex = self.make(COPY_TAKE_PROFIT="0.5", TAKE_PROFIT="0.75", COPY_LADDER="")
         self.assertEqual(ex.exit_cfg({"mint": "x", "copy": WALLET}).take_profit, 0.5)
         self.assertEqual(ex.exit_cfg({"mint": "x"}).take_profit, 0.75)
+        ladder = [{"x": 2, "pct": 40, "done": False}, {"x": 5, "pct": 60, "done": False}]
+        self.assertEqual(ex.exit_cfg({"mint": "x", "copy": WALLET, "ladder": ladder}).take_profit, 4.0)
+
+
+class LadderTests(unittest.TestCase):
+    def make(self, **env):
+        executor, p = fresh(**env)
+        self.addCleanup(p.stop)
+        ex = executor.Executor(executor.Config())
+        return executor, ex
+
+    def test_parse(self):
+        executor, ex = self.make()
+        self.assertEqual(executor.parse_sell_ladder("5:30, 2x:40%,3:30,bad,0.5:10"),
+                         [{"x": 2.0, "pct": 40.0}, {"x": 3.0, "pct": 30.0}, {"x": 5.0, "pct": 30.0}])
+        self.assertEqual(executor.parse_sell_ladder(""), [])
+        self.assertEqual([(r["x"], r["pct"]) for r in ex.cfg.copy_ladder], [(2.0, 40.0), (3.0, 30.0), (5.0, 30.0)])
+
+    def position(self, ex, tokens=1000, basis=10.0):
+        import time as _time
+        pos = {"mint": MINT, "tokens": tokens, "position_usd": basis, "opened_ts": _time.time(), "opened_at": "t", "peak_usd": basis,
+               "buy_signature": "", "copy": WALLET, "entry_tokens": tokens, "entry_basis_usd": basis,
+               "ladder": [dict(r, done=False) for r in ex.cfg.copy_ladder]}
+        ex.state["positions"] = [pos]
+        return pos
+
+    def test_phases_out_at_each_rung_and_closes_at_the_top(self):
+        executor, ex = self.make()
+        pos = self.position(ex)                     # 1000 tokens for $10: entry price $0.01
+        price = {"v": 0.01}
+        # quote: `amount` tokens -> lamports at the current price with SOL = $100
+        ex.jup.quote = lambda mint, out, amount, **kw: {"outAmount": str(int(amount * price["v"] / SOL * 1e9))}
+        ex.manage_positions(SOL, panic=False)       # 1.0x: nothing
+        self.assertEqual(pos["tokens"], 1000)
+        price["v"] = 0.021                          # 2.1x: first rung, sell 40% of entry tokens
+        ex.manage_positions(SOL, panic=False)
+        self.assertEqual(pos["tokens"], 600)
+        self.assertTrue(pos["ladder"][0]["done"])
+        self.assertAlmostEqual(ex.state["daily"]["realized_pnl_usd"], 400 * 0.021 - 4.0, places=6)
+        price["v"] = 0.035                          # 3.5x: second rung, 30% of entry tokens = 300 more
+        ex.manage_positions(SOL, panic=False)
+        self.assertEqual(pos["tokens"], 300)
+        closed = []
+        ex.close_position = lambda p, reason, sol_price: closed.append(reason)
+        price["v"] = 0.06                           # 6x: top rung closes the rest (moon bag inside close)
+        ex.manage_positions(SOL, panic=False)
+        self.assertEqual(closed, ["ladder_5x"])
+
+    def test_jump_past_two_rungs_takes_both(self):
+        executor, ex = self.make()
+        pos = self.position(ex)
+        ex.jup.quote = lambda mint, out, amount, **kw: {"outAmount": str(int(amount * 0.033 / SOL * 1e9))}  # 3.3x at once
+        ex.manage_positions(SOL, panic=False)
+        self.assertEqual(pos["tokens"], 300)        # 40% + 30% of the entry tokens sold together
+        self.assertEqual([r["done"] for r in pos["ladder"]], [True, True, False])
 
 
 if __name__ == "__main__":

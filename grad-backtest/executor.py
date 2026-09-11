@@ -349,6 +349,11 @@ class Config:
         self.copy_stop_loss = float(os.getenv("COPY_STOP_LOSS", "0.30"))
         self.copy_trailing_stop = float(os.getenv("COPY_TRAILING_STOP", "0.25"))
         self.copy_time_stop_minutes = float(os.getenv("COPY_TIME_STOP_MINUTES", "240"))
+        # Copied coins tend to do 2x-5x from the buy, so profit is phased out across that range:
+        # "2:40,3:30,5:30" sells 40% of the entry tokens at 2x the entry price, 30% at 3x and
+        # the last 30% at 5x (the final rung closes the position, so the moon bag still applies).
+        # Empty disables the ladder and COPY_TAKE_PROFIT decides instead.
+        self.copy_ladder = parse_sell_ladder(os.getenv("COPY_LADDER", "2:40,3:30,5:30"))
         # Bundle guards. A curve that fills in seconds was bought by one party (SOLL graduated 29s
         # after creation with six buyers), and a wallet holding a big slice of supply at entry is
         # the one that dumps on us (SOLL's creator held 59% at graduation). 0 disables either.
@@ -532,6 +537,27 @@ def describe_error(exc: BaseException) -> str:
     if "0x1770" in text or "'Custom': 6000" in text or '"Custom": 6000' in text:
         return "Jupiter 6000: route no longer valid"
     return text[:240] + "…" if len(text) > 240 else text
+
+
+def parse_sell_ladder(spec: str) -> list[dict[str, float]]:
+    """"2:40,3:30,5:30" -> [{"x": 2, "pct": 40}, ...]: percent of the entry tokens to sell once
+    the token price reaches x times the entry price. Sorted by multiple; bad rungs dropped."""
+    rungs = []
+    for part in str(spec or "").split(","):
+        if ":" not in part:
+            continue
+        x_text, pct_text = part.split(":", 1)
+        try:
+            x, pct = float(x_text.strip().rstrip("xX")), float(pct_text.strip().rstrip("%"))
+        except ValueError:
+            continue
+        if x > 1 and 0 < pct <= 100:
+            rungs.append({"x": x, "pct": pct})
+    return sorted(rungs, key=lambda r: r["x"])
+
+
+def ladder_text(rungs: list[dict[str, float]]) -> str:
+    return ",".join("{:g}x:{:g}%".format(r["x"], r["pct"]) for r in rungs) or "off"
 
 
 def wallet_swap_from_transaction(tx: dict[str, Any], wallet: str) -> dict[str, Any] | None:
@@ -2449,6 +2475,9 @@ class Executor:
         cfg.stop_loss = getattr(self.cfg, f"{prefix}_stop_loss")
         cfg.trailing_stop = getattr(self.cfg, f"{prefix}_trailing_stop")
         cfg.time_stop_minutes = getattr(self.cfg, f"{prefix}_time_stop_minutes")
+        if pos.get("ladder"):
+            # The ladder phases profit out; the flat take profit only backstops its top rung.
+            cfg.take_profit = max(cfg.take_profit, max(r["x"] for r in pos["ladder"]) - 1.0)
         return cfg
 
     # ---- copy trading ----------------------------------------------------
@@ -2868,6 +2897,9 @@ class Executor:
                 "runner_gain_pct": item.get("runner_gain_pct"),
                 "copy": copied or None,
                 "copy_buy_usd": item.get("copy_buy_usd"),
+                "entry_tokens": tokens,
+                "entry_basis_usd": size_usd,
+                "ladder": [dict(r, done=False) for r in self.cfg.copy_ladder] if copied and self.cfg.copy_ladder else None,
             }
         )
         save_state(self.state)
@@ -3102,8 +3134,11 @@ class Executor:
                         f"peak_quote=${pos['peak_usd']:.2f} scaled_out={bool(pos.get('scaled_out'))} "
                         f"age={(now_ts() - pos['opened_ts']) / 60:.1f}m"
                     )
+                if not panic and pos.get("ladder") and self.ladder_step(pos, current_usd, sol_price):
+                    continue  # re-quote what is left next cycle
                 if (
                     not panic
+                    and not pos.get("ladder")
                     and self.cfg.scale_out_at > 0
                     and not pos.get("scaled_out")
                     and current_usd >= pos["position_usd"] * (1.0 + self.cfg.scale_out_at)
@@ -3130,11 +3165,12 @@ class Executor:
                     log(f"STUCK {pos['mint']}: {pos['sell_failures']} consecutive sell failures past its time stop "
                         f"({reason_text}). Slot freed; moved to state.stuck. Panic will retry it, or sell manually.")
 
-    def scale_out(self, pos: dict[str, Any], sol_price: float) -> None:
+    def scale_out(self, pos: dict[str, Any], sol_price: float, frac: float | None = None, reason: str = "scale_out") -> None:
         """Bank part of a winner at the first target. The remainder keeps the same TP/SL/trailing
-        rules on its reduced cost basis, which leaves every threshold at the same token price."""
+        rules on its reduced cost basis, which leaves every threshold at the same token price.
+        `frac` is the share of the current tokens to sell (default SCALE_OUT_FRACTION)."""
         mint = pos["mint"]
-        frac = self.cfg.scale_out_fraction
+        frac = self.cfg.scale_out_fraction if frac is None else min(0.99, max(0.0, frac))
         amount = self.rpc.token_balance(self.wallet.pubkey, mint) if self.cfg.mode == "live" else int(pos["tokens"])
         sell_amount = int(amount * frac)
         if sell_amount <= 0:
@@ -3162,7 +3198,7 @@ class Executor:
                 "position_usd": round(sold_cost, 2),
                 "exit_usd": round(proceeds, 2),
                 "net_return": round(net, 4),
-                "exit_reason": "scale_out",
+                "exit_reason": reason,
                 "buy_signature": pos.get("buy_signature", ""),
                 "sell_signature": sig,
                 "entry_price_impact_pct": pos.get("entry_price_impact_pct"),
@@ -3187,7 +3223,33 @@ class Executor:
                 "peak_gain_pct": round(peak_gain * 100, 1) if peak_gain is not None else None,
             }
         )
-        log(f"SCALE-OUT {mint}: sold {frac:.0%} for ${proceeds:.2f} ({net:+.1%}); remainder basis ${pos['position_usd']:.2f}")
+        log(f"{reason.upper().replace('_', '-')} {mint}: sold {frac:.0%} for ${proceeds:.2f} ({net:+.1%}); remainder basis ${pos['position_usd']:.2f}")
+
+    def ladder_step(self, pos: dict[str, Any], current_usd: float, sol_price: float) -> bool:
+        """Copied positions phase out profit: at each rung's multiple of the entry price sell that
+        rung's share of the entry tokens; the last rung closes the position (moon bag applies).
+        Returns True when it acted, so the caller re-quotes next cycle."""
+        rungs = pos.get("ladder") or []
+        entry_tokens, entry_basis = int(pos.get("entry_tokens") or 0), float(pos.get("entry_basis_usd") or 0)
+        tokens_now = int(pos["tokens"])
+        if not rungs or entry_tokens <= 0 or entry_basis <= 0 or tokens_now <= 0:
+            return False
+        multiple = (current_usd / tokens_now) / (entry_basis / entry_tokens)
+        pending = [r for r in rungs if not r.get("done")]
+        if not pending or multiple < pending[0]["x"]:
+            return False
+        # Take every rung the price has crossed in one sale; a jump past two rungs sells both shares.
+        crossed = [r for r in pending if multiple >= r["x"]]
+        share_tokens = sum(entry_tokens * r["pct"] / 100 for r in crossed)
+        last = crossed[-1] is rungs[-1]
+        for r in crossed:
+            r["done"] = True
+        log(f"LADDER {pos['mint']}: {multiple:.2f}x entry, rung {crossed[-1]['x']:g}x reached")
+        if last or share_tokens >= tokens_now * 0.98:
+            self.close_position(pos, f"ladder_{crossed[-1]['x']:g}x", sol_price)
+        else:
+            self.scale_out(pos, sol_price, frac=share_tokens / tokens_now, reason=f"ladder_{crossed[-1]['x']:g}x")
+        return True
 
     def sell_bag(self, bag: dict[str, Any], key: str, reason: str, sol_price: float, quote: dict[str, Any] | None = None) -> float:
         """Market-sell one bag from state[key] (moon bags or stuck positions), record the trade,
@@ -3387,6 +3449,7 @@ class Executor:
             f"time_stop={self.cfg.runner_time_stop_minutes:.0f}m) "
             f"copy={len(self.cfg.copy_wallets)}wallets(min${self.cfg.copy_min_buy_usd:,.0f} "
             f"{'fast' if self.cfg.copy_fast else 'full-checks'} {'follow-sells' if self.cfg.copy_follow_sells else 'own-exits'} "
+            f"ladder={ladder_text(self.cfg.copy_ladder)} "
             f"tp=+{self.cfg.copy_take_profit:.0%} sl=-{self.cfg.copy_stop_loss:.0%} trail={self.cfg.copy_trailing_stop:.0%} "
             f"time_stop={self.cfg.copy_time_stop_minutes:.0f}m) "
             f"curve_age>={self.cfg.min_curve_age_seconds:.0f}s top_holder<={self.cfg.max_top_holder_pct:.0f}% "
