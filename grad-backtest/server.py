@@ -423,6 +423,7 @@ def executor_panic(request: Request) -> JSONResponse:
 
 
 _mm_proc: subprocess.Popen | None = None
+_evm_proc: subprocess.Popen | None = None
 
 
 def _mm_running() -> bool:
@@ -447,6 +448,76 @@ def _start_mm(mode: str) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     (DATA_DIR / "mm.stop").unlink(missing_ok=True)
     _mm_proc = subprocess.Popen([sys.executable, "-m", "mm", mode, "--hours", "876000"], cwd=Path(__file__).parent)
+
+
+def _evm_running() -> bool:
+    return _evm_proc is not None and _evm_proc.poll() is None
+
+
+def _evm_configured() -> bool:
+    """The EVM copy lane runs when it has wallets to follow and (live) a signing key."""
+    if not os.getenv("EVM_COPY_WALLETS", "").strip():
+        return False
+    mode = (os.getenv("EVM_MODE") or os.getenv("EXECUTOR_MODE", "paper")).strip().lower()
+    return mode != "live" or bool(os.getenv("EVM_PRIVATE_KEY", "").strip())
+
+
+def _start_evm() -> None:
+    """EVM copy lane (evm package): mirrors EVM_COPY_WALLETS on Robinhood Chain, Base and BNB
+    with its own wallet (EVM_PRIVATE_KEY). Stdout inherited like the other lanes."""
+    global _evm_proc
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    (DATA_DIR / "evm.stop").unlink(missing_ok=True)
+    _evm_proc = subprocess.Popen([sys.executable, "-m", "evm"], cwd=Path(__file__).parent)
+
+
+@app.get("/api/evm")
+def evm_status(limit: int = 100) -> JSONResponse:
+    state = read_json("evm_state.json") or {}
+    trades = read_csv("evm_trades.csv")
+    return JSONResponse({
+        "running": _evm_running(),
+        "configured": _evm_configured(),
+        "state": state,
+        "trades": frame_records(trades.tail(limit)) if not trades.empty else [],
+    })
+
+
+@app.post("/api/evm/start")
+def evm_start(request: Request) -> JSONResponse:
+    _require_admin(request)
+    if not _evm_configured():
+        raise HTTPException(400, "set EVM_COPY_WALLETS (and EVM_PRIVATE_KEY for live) first")
+    if not _evm_running():
+        _start_evm()
+    return JSONResponse({"running": _evm_running()})
+
+
+@app.post("/api/evm/stop")
+def evm_stop(request: Request) -> JSONResponse:
+    _require_admin(request)
+    (DATA_DIR / "evm.stop").touch()
+    return JSONResponse({"draining": True})
+
+
+@app.post("/api/evm/panic")
+def evm_panic(request: Request) -> JSONResponse:
+    _require_admin(request)
+    (DATA_DIR / "evm.panic").touch()
+    return JSONResponse({"panic": True})
+
+
+@app.on_event("startup")
+def maybe_autostart_evm() -> None:
+    if os.getenv("EVM_AUTOSTART", "1") == "0":
+        print("[server] EVM_AUTOSTART=0: EVM copy lane NOT started", flush=True)
+        return
+    if not _evm_configured():
+        print("[server] EVM copy lane NOT started (EVM_COPY_WALLETS empty, or live without EVM_PRIVATE_KEY)", flush=True)
+        return
+    if not _evm_running():
+        _start_evm()
+        print("[server] EVM autostart: launched copy lane for " + os.getenv("EVM_CHAINS", "robinhood,base,bnb"), flush=True)
 
 
 def _mm_tail(name: str, limit: int) -> list[dict[str, Any]]:

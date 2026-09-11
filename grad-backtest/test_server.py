@@ -2,6 +2,7 @@ import base64
 import os
 import tempfile
 import unittest
+from unittest import mock
 from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,6 +18,18 @@ class ServerTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(server.app)
         self.data_dir = Path(os.environ["DATA_DIR"])
+
+    def test_evm_status_reports_unconfigured_lane(self):
+        with mock.patch.dict(os.environ, {"EVM_COPY_WALLETS": "", "EVM_PRIVATE_KEY": ""}):
+            resp = self.client.get("/api/evm")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertFalse(body["configured"])
+        self.assertFalse(body["running"])
+        with mock.patch.dict(os.environ, {"EVM_COPY_WALLETS": "0x1111111111111111111111111111111111111111", "EXECUTOR_MODE": "live", "EVM_PRIVATE_KEY": ""}):
+            self.assertFalse(server._evm_configured())              # live needs a key
+        with mock.patch.dict(os.environ, {"EVM_COPY_WALLETS": "0x1111111111111111111111111111111111111111", "EXECUTOR_MODE": "paper", "EVM_PRIVATE_KEY": ""}):
+            self.assertTrue(server._evm_configured())
 
     def test_health(self):
         self.assertEqual(self.client.get("/healthz").json(), {"status": "ok"})

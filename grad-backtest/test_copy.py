@@ -209,7 +209,9 @@ class PollTests(unittest.TestCase):
 
 class RotateTests(unittest.TestCase):
     def make(self, **env):
-        executor, p = fresh(MAX_CONCURRENT_POSITIONS="2", **env)
+        env.setdefault("MAX_CONCURRENT_POSITIONS", "2")
+        env.setdefault("COPY_ONLY", "0")          # all lanes: adopted leftovers hold no slot
+        executor, p = fresh(**env)
         self.addCleanup(p.stop)
         ex = executor.Executor(executor.Config())
         now = executor.now_ts()
@@ -243,6 +245,13 @@ class RotateTests(unittest.TestCase):
         ex.state["daily"]["realized_pnl_usd"] = -12.0
         self.assertFalse(ex.rotate_for_copy("New", SOL))
         self.assertEqual(self.closed, [])
+
+    def test_copy_only_counts_adopted_positions_and_rotates_them_first(self):
+        executor, ex = self.make(MAX_CONCURRENT_POSITIONS="3", COPY_ONLY="1")   # 3 held including the adopted bag
+        self.assertTrue(ex.cfg.copy_only)
+        self.assertTrue(ex.rotate_for_copy("New", SOL))
+        self.assertEqual(self.closed, [("Bag", "rotate")])
+        self.assertEqual(ex.exit_cfg({"mint": "x", "adopted": True}).time_stop_minutes, ex.cfg.copy_time_stop_minutes)
 
     def test_failed_sale_skips_the_new_buy(self):
         executor, ex = self.make()

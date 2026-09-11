@@ -15,13 +15,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 # omitted from the container by an outdated hand-maintained file list.
 COPY *.py ./
 COPY mm mm
+COPY evm evm
 RUN cd mm/sidecar && npm ci --omit=dev --no-audit --no-fund && node -e "require('@meteora-ag/dlmm')"
 COPY static static
 COPY data/graduations.example.csv data/
 
 # Catch missing runtime modules during the image build instead of after
 # Railway has already started the web server and autostarted the executor.
-RUN python -c "import bundle_analysis, executor, mm.paper, mm.live"
+RUN python -c "import bundle_analysis, executor, mm.paper, mm.live, evm.lane"
 
 ENV PYTHONUNBUFFERED=1
 # All scripts read/write here; mount a Railway volume at /data to persist
