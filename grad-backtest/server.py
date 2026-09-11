@@ -457,7 +457,8 @@ def _mm_tail(name: str, limit: int) -> list[dict[str, Any]]:
         frame = pd.read_csv(path)
     except Exception:  # noqa: BLE001
         return []
-    return frame.tail(limit).to_dict(orient="records")
+    # NaN cells (empty CSV fields) are not valid JSON; to_json turns them into null.
+    return json.loads(frame.tail(limit).to_json(orient="records"))
 
 
 @app.get("/api/mm/status")
