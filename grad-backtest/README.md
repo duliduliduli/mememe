@@ -387,7 +387,7 @@ not establish that graduations are being detected. Counters reset on process res
 | `RUNNER_MIN_GAIN_PCT` / `RUNNER_MOMENTUM_MINUTES` | `10` / `15` | Enter only when the cap is up this much from its low of the last N minutes. |
 | `RUNNER_WATCH_HOURS` / `RUNNER_CHECK_SECONDS` / `RUNNER_MAX_WATCH` | `6` / `60` / `100` | How long a graduation is watched, how often the watchlist is priced (one batched Jupiter price call per 50 mints), and the watchlist size. |
 | `RUNNER_TAKE_PROFIT` / `RUNNER_STOP_LOSS` / `RUNNER_TRAILING_STOP` / `RUNNER_TIME_STOP_MINUTES` | `1.0` / `0.30` / `0.25` / `240` | Exit thresholds for runner positions; graduation positions keep the plain `TAKE_PROFIT` family. |
-| `COPY_WALLETS` | (empty) | Comma-separated wallet addresses whose buys are mirrored at the usual position size. Each is polled every `COPY_POLL_SECONDS` (3); the first poll records a baseline, mirroring only trades still inside `COPY_MAX_TX_AGE_SECONDS`. Buys paid in SOL, wrapped SOL, USDC or USDT are all recognised. |
+| `COPY_WALLETS` | (empty) | Comma-separated wallet addresses whose buys are mirrored at the usual position size. `address:500` gives that wallet its own minimum buy size (a whale's $100 buys are pocket change to it; only its real bets are copied). Each is polled every `COPY_POLL_SECONDS` (3); the first poll records a baseline, mirroring only trades still inside `COPY_MAX_TX_AGE_SECONDS`. Buys paid in SOL, wrapped SOL, USDC or USDT are all recognised. |
 | `COPY_ROTATE_MIN_AGE_MINUTES` | `20` | A position younger than this keeps its slot; the new copied buy is skipped instead of rotating it out (adopted leftovers always rotate first). |
 | `COPY_ROTATE` | `1` | When every slot is full and a followed wallet buys, sell our oldest position (moon bag kept) and give the slot to the new coin. `0` skips the new buy instead. Never rotates once the daily loss limit is hit. In copy-only mode positions adopted after a redeploy count as held (and rotate first) and use the copy exits. |
 | `POSITION_CHECK_SECONDS` | `8` in copy-only mode, else `0` | How often each open position is re-quoted for its exits. Every quote is a Jupiter request, and the keyless tier rate-limits a busy loop, which only delays exits. |
@@ -399,7 +399,7 @@ A second copy lane (`evm/` package, `python -m evm`, autostarted by the server) 
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `EVM_COPY_WALLETS` | (empty) | Comma-separated `0x…` addresses to mirror on every configured chain. Empty means the lane does not start. |
+| `EVM_COPY_WALLETS` | (empty) | Comma-separated `0x…` addresses to mirror on every configured chain; `address:500` sets that wallet's own minimum buy size. Empty means the lane does not start. |
 | `EVM_PRIVATE_KEY` | (empty) | The EVM burner wallet: a hex private key (MetaMask → Show private key) or its 12/24-word recovery phrase (first account is used). Required for live mode. Never the Solana key. |
 | `EVM_MODE` | `EXECUTOR_MODE` | `paper` or `live` for this lane; defaults to the Solana executor's mode so one setting rules both. |
 | `EVM_CHAINS` | `robinhood,base,bnb` | Chains to watch and trade. Fund the wallet with ETH on Robinhood Chain (chain 4663) and Base, and BNB on BNB Chain; `gas_reserve` of 0.002 ETH / 0.005 BNB is never spent on buys. |

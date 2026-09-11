@@ -73,7 +73,10 @@ class Config:
         self.secret = env("EVM_PRIVATE_KEY", "")
         self.api_key = env("UNISWAP_API_KEY", "").strip()
         self.chain_keys = [c for c in env("EVM_CHAINS", "robinhood,base,bnb").replace(" ", "").split(",") if c]
-        self.wallets = tuple(to_checksum_address(w.strip()) for w in env("EVM_COPY_WALLETS", "").replace("\n", ",").split(",") if w.strip())
+        from executor import parse_wallet_list
+        raw_wallets, raw_minimums = parse_wallet_list(env("EVM_COPY_WALLETS", ""))
+        self.wallets = tuple(to_checksum_address(w) for w in raw_wallets)
+        self.wallet_min_usd = {to_checksum_address(w): m for w, m in raw_minimums.items()}
         # Sizing: the same rules as the Solana lane, applied to this lane's own equity.
         self.account_fraction = float(env("ACCOUNT_FRACTION", "0.10"))
         self.max_position_usd = float(env("MAX_POSITION_USD", "20"))
@@ -364,8 +367,9 @@ class Lane:
         if usd <= 0:
             log(f"COPY {key} {wallet[:8]} received {symbol} ({token[:10]}) with no sell route; ignored")
             return
-        if usd < cfg.copy_min_buy_usd:
-            log(f"COPY {key} {wallet[:8]} bought {symbol} for ~${usd:,.0f} < ${cfg.copy_min_buy_usd:,.0f} minimum; ignored")
+        minimum = cfg.wallet_min_usd.get(wallet, cfg.copy_min_buy_usd)
+        if usd < minimum:
+            log(f"COPY {key} {wallet[:8]} bought {symbol} for ~${usd:,.0f} < ${minimum:,.0f} minimum; ignored")
             return
         if any(p["chain"] == key and p["token"].lower() == token.lower() for p in self.state["positions"]):
             log(f"COPY {key} {wallet[:8]} bought {symbol} (~${usd:,.0f}); already held")

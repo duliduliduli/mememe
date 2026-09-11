@@ -339,7 +339,7 @@ class Config:
         # COPY_FOLLOW_SELLS=1 the position is closed when that wallet sells the token; the
         # COPY_* thresholds guard it in between. Trades older than COPY_MAX_TX_AGE_SECONDS at
         # detection are ignored, and the first poll of a wallet only takes a baseline.
-        self.copy_wallets = tuple(w.strip() for w in os.getenv("COPY_WALLETS", "").replace("\n", ",").split(",") if w.strip())
+        self.copy_wallets, self.copy_wallet_min_usd = parse_wallet_list(os.getenv("COPY_WALLETS", ""))
         # COPY_ONLY=1 (the default once COPY_WALLETS is set) turns graduation discovery and the
         # runner watchlist off: the only entries are mirrored buys. COPY_ONLY=0 runs all lanes.
         self.copy_only = os.getenv("COPY_ONLY", "1" if self.copy_wallets else "0") == "1" and bool(self.copy_wallets)
@@ -553,6 +553,28 @@ def describe_error(exc: BaseException) -> str:
     if "0x1770" in text or "'Custom': 6000" in text or '"Custom": 6000' in text:
         return "Jupiter 6000: route no longer valid"
     return text[:240] + "…" if len(text) > 240 else text
+
+
+def parse_wallet_list(spec: str) -> tuple[tuple[str, ...], dict[str, float]]:
+    """COPY_WALLETS entries are `address` or `address:min_usd`; the optional number is that
+    wallet's own minimum buy size to mirror (a whale's $100 buys are pocket change to it)."""
+    wallets: list[str] = []
+    minimums: dict[str, float] = {}
+    for raw in spec.replace("\n", ",").replace(";", ",").split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        address, _, minimum = raw.partition(":")
+        address = address.strip()
+        if not address:
+            continue
+        wallets.append(address)
+        try:
+            if minimum.strip():
+                minimums[address] = float(minimum.strip().lstrip("$").replace("_", "").replace("k", "000").replace("K", "000"))
+        except ValueError:
+            pass
+    return tuple(wallets), minimums
 
 
 def parse_sell_ladder(spec: str) -> list[dict[str, float]]:
@@ -2538,7 +2560,8 @@ class Executor:
                 baselined.append(wallet)
                 fresh = [r for r in rows if r.get("blockTime") and now_ts() - int(r["blockTime"]) <= cfg.copy_max_tx_age_seconds]
                 seen.extend(r.get("signature") for r in rows if r.get("signature") and r not in fresh)
-                log(f"COPY watching {wallet} (baseline {len(seen)} signatures, {len(fresh)} fresh; only new trades are mirrored)")
+                log(f"COPY watching {wallet} (baseline {len(seen)} signatures, {len(fresh)} fresh; "
+                    f"mirroring buys >= ${cfg.copy_wallet_min_usd.get(wallet, cfg.copy_min_buy_usd):,.0f})")
             for row in reversed(rows):
                 sig = row.get("signature")
                 if not sig or sig in seen:
@@ -2575,8 +2598,9 @@ class Executor:
                             except Exception as exc:
                                 log(f"WARN copy sell {mint}: {describe_error(exc)}")
                     continue
-                if usd < cfg.copy_min_buy_usd:
-                    log(f"COPY {wallet[:8]} bought {mint} for ${usd:,.0f} < ${cfg.copy_min_buy_usd:,.0f} minimum; ignored")
+                minimum = cfg.copy_wallet_min_usd.get(wallet, cfg.copy_min_buy_usd)
+                if usd < minimum:
+                    log(f"COPY {wallet[:8]} bought {mint} for ${usd:,.0f} < ${minimum:,.0f} minimum; ignored")
                     continue
                 if any(p.get("mint") == mint for p in self.state["positions"]) or any(p.get("mint") == mint for p in self.pending):
                     log(f"COPY {wallet[:8]} bought {mint} (${usd:,.0f}); already held or pending")
