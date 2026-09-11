@@ -340,6 +340,9 @@ class Config:
         # COPY_* thresholds guard it in between. Trades older than COPY_MAX_TX_AGE_SECONDS at
         # detection are ignored, and the first poll of a wallet only takes a baseline.
         self.copy_wallets = tuple(w.strip() for w in os.getenv("COPY_WALLETS", "").replace("\n", ",").split(",") if w.strip())
+        # COPY_ONLY=1 (the default once COPY_WALLETS is set) turns graduation discovery and the
+        # runner watchlist off: the only entries are mirrored buys. COPY_ONLY=0 runs all lanes.
+        self.copy_only = os.getenv("COPY_ONLY", "1" if self.copy_wallets else "0") == "1" and bool(self.copy_wallets)
         self.copy_poll_seconds = max(1.0, float(os.getenv("COPY_POLL_SECONDS", "3")))
         # Followed wallets scatter $3-$10 probe buys between their real entries; mirroring a
         # probe with a full-size position would out-bet the wallet itself. $50 skips the probes.
@@ -562,11 +565,17 @@ def ladder_text(rungs: list[dict[str, float]]) -> str:
     return ",".join("{:g}x:{:g}%".format(r["x"], r["pct"]) for r in rungs) or "off"
 
 
+STABLE_MINTS = {
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": 6,   # USDC
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB": 6,   # USDT
+}
+
+
 def wallet_swap_from_transaction(tx: dict[str, Any], wallet: str) -> dict[str, Any] | None:
     """What `wallet` bought or sold in a confirmed transaction, read from balance changes:
-    a token whose balance rose while the wallet's SOL (or wrapped SOL) fell is a buy, the
-    reverse a sell. Returns {"side", "mint", "tokens", "sol"} or None when the wallet did not
-    swap. Multi-hop routes report the token with the largest change."""
+    a token whose balance rose while the wallet's SOL (wrapped SOL, USDC or USDT) fell is a
+    buy, the reverse a sell. Returns {"side", "mint", "tokens", "sol", "stable_usd"} or None
+    when the wallet did not swap. Multi-hop routes report the token with the largest change."""
     meta = tx.get("meta") or {}
     if meta.get("err") is not None:
         return None
@@ -590,14 +599,17 @@ def wallet_swap_from_transaction(tx: dict[str, Any], wallet: str) -> dict[str, A
             deltas[mint] = deltas.get(mint, 0) + sign * amount
     wsol_delta = deltas.pop(WSOL, 0) / LAMPORTS
     sol_delta += wsol_delta
+    stable_delta = sum(deltas.pop(m, 0) / 10 ** dec for m, dec in STABLE_MINTS.items())
     deltas = {m: d for m, d in deltas.items() if d != 0}
     if not deltas:
         return None
     mint, delta = max(deltas.items(), key=lambda kv: abs(kv[1]))
-    if delta > 0 and sol_delta < 0:
-        return {"side": "buy", "mint": mint, "tokens": delta, "sol": -sol_delta}
-    if delta < 0 and sol_delta > 0:
-        return {"side": "sell", "mint": mint, "tokens": -delta, "sol": sol_delta}
+    paid_sol = -sol_delta if sol_delta < 0 else 0.0
+    paid_stable = -stable_delta if stable_delta < 0 else 0.0
+    if delta > 0 and (paid_sol > 0 or paid_stable > 0):
+        return {"side": "buy", "mint": mint, "tokens": delta, "sol": paid_sol, "stable_usd": paid_stable}
+    if delta < 0 and (sol_delta > 0 or stable_delta > 0):
+        return {"side": "sell", "mint": mint, "tokens": -delta, "sol": max(sol_delta, 0.0), "stable_usd": max(stable_delta, 0.0)}
     return None
 
 
@@ -2500,10 +2512,14 @@ class Executor:
                 log(f"WARN copy poll {wallet[:8]}: {describe_error(exc)}")
                 continue
             seen = seen_all.setdefault(wallet, [])
-            if not seen:
-                seen.extend(r.get("signature") for r in rows if r.get("signature"))
-                log(f"COPY watching {wallet} (baseline {len(seen)} signatures; only new trades are mirrored)")
-                continue
+            baselined = self.state.setdefault("copy_baselined", [])
+            if wallet not in baselined:
+                # Baseline: everything older than the mirror window is history. Trades inside the
+                # window (a buy made while we were restarting) are handled like any new trade.
+                baselined.append(wallet)
+                fresh = [r for r in rows if r.get("blockTime") and now_ts() - int(r["blockTime"]) <= cfg.copy_max_tx_age_seconds]
+                seen.extend(r.get("signature") for r in rows if r.get("signature") and r not in fresh)
+                log(f"COPY watching {wallet} (baseline {len(seen)} signatures, {len(fresh)} fresh; only new trades are mirrored)")
             for row in reversed(rows):
                 sig = row.get("signature")
                 if not sig or sig in seen:
@@ -2524,7 +2540,7 @@ class Executor:
                 swap = wallet_swap_from_transaction(tx or {}, wallet)
                 if not swap:
                     continue
-                usd = swap["sol"] * sol_price
+                usd = swap["sol"] * sol_price + swap.get("stable_usd", 0.0)
                 mint = swap["mint"]
                 if swap["side"] == "sell":
                     if not cfg.copy_follow_sells:
@@ -3415,7 +3431,8 @@ class Executor:
             log("panic complete: all positions and moon bags closed, executor draining")
 
         if not draining:
-            self.poll_graduations()
+            if not self.cfg.copy_only:
+                self.poll_graduations()
             due = [p for p in self.pending if now_ts() >= p["enter_at"]]
             if due:
                 sol_price = sol_price or self.sol_price_usd()
@@ -3423,7 +3440,7 @@ class Executor:
                     self.pending.remove(item)
                     log(f"ENTRY checking mint={item['mint']} lateness={now_ts() - item['enter_at']:.0f}s")
                     self.enter_with_retry(item, sol_price)
-            if self.state.get("watchlist"):
+            if self.state.get("watchlist") and not self.cfg.copy_only:
                 try:
                     self.manage_watchlist(sol_price or self.sol_price_usd())
                 except Exception as exc:
@@ -3452,7 +3469,7 @@ class Executor:
             f"+{self.cfg.runner_min_gain_pct:.0f}%/{self.cfg.runner_momentum_minutes:.0f}m watch={self.cfg.runner_watch_hours:.0f}h "
             f"tp=+{self.cfg.runner_take_profit:.0%} sl=-{self.cfg.runner_stop_loss:.0%} trail={self.cfg.runner_trailing_stop:.0%} "
             f"time_stop={self.cfg.runner_time_stop_minutes:.0f}m) "
-            f"copy={len(self.cfg.copy_wallets)}wallets(min${self.cfg.copy_min_buy_usd:,.0f} "
+            f"copy={'only,' if self.cfg.copy_only else ''}{len(self.cfg.copy_wallets)}wallets(min${self.cfg.copy_min_buy_usd:,.0f} "
             f"{'fast' if self.cfg.copy_fast else 'full-checks'} {'follow-sells' if self.cfg.copy_follow_sells else 'own-exits'} "
             f"ladder={ladder_text(self.cfg.copy_ladder)} "
             f"tp=+{self.cfg.copy_take_profit:.0%} sl=-{self.cfg.copy_stop_loss:.0%} trail={self.cfg.copy_trailing_stop:.0%} "
@@ -3508,7 +3525,9 @@ class Executor:
                         log(f"WARN wallet reconciliation provider unavailable; deferred for {delay:.0f}s")
                     else:
                         log(f"WARN wallet reconciliation failed: {describe_error(exc)}")
-        if self.cfg.discovery_mode == "websocket":
+        if self.cfg.copy_only:
+            log(f"copy-only: graduation discovery and runner watchlist off; mirroring {len(self.cfg.copy_wallets)} wallet(s)")
+        elif self.cfg.discovery_mode == "websocket":
             self.migration_stream = MigrationStream(self.cfg)
             self.migration_stream.start()
             log(f"graduation discovery: WebSocket stream + {self.cfg.discovery_catchup_seconds:.0f}s RPC catch-up")
