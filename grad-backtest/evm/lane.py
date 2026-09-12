@@ -78,10 +78,11 @@ class Config:
         self.wallets = tuple(to_checksum_address(w) for w in raw_wallets)
         self.wallet_min_usd = {to_checksum_address(w): m for w, m in raw_minimums.items()}
         # Sizing: the same rules as the Solana lane, applied to this lane's own equity.
-        self.account_fraction = float(env("ACCOUNT_FRACTION", "0.10"))
+        self.account_fraction = float(env("ACCOUNT_FRACTION", "0.08"))
         self.max_position_usd = float(env("MAX_POSITION_USD", "20"))
         self.min_position_usd = float(env("MIN_POSITION_USD", "5"))
-        self.max_concurrent = int(env("MAX_CONCURRENT_POSITIONS", "3"))
+        self.max_concurrent = int(env("MAX_CONCURRENT_POSITIONS", "10"))
+        self.max_deployed_fraction = min(1.0, max(0.1, float(env("MAX_DEPLOYED_FRACTION", "0.80"))))
         self.daily_loss_limit_usd = float(env("DAILY_LOSS_LIMIT_USD", "30"))
         self.paper_balance_usd = float(env("PAPER_BALANCE_USD", "500"))
         # Copy rules and exits: shared names with the Solana lane so one setting rules both.
@@ -277,6 +278,9 @@ class Lane:
             return 0.0, f"daily loss limit (${daily:,.2f})"
         equity = self.equity_usd()
         size = min(equity * self.cfg.account_fraction, self.cfg.max_position_usd)
+        deployed = sum(float(p.get("last_value_usd") or p.get("position_usd") or 0) for p in self.state["positions"])
+        if deployed + size > equity * self.cfg.max_deployed_fraction:
+            return 0.0, f"deployment cap: ${deployed:,.2f} in positions + ${size:,.2f} > {self.cfg.max_deployed_fraction:.0%} of ${equity:,.2f}"
         available = (self.native_balance(key) - self.chains[key].gas_reserve_native) * self.native_price(key)
         size = min(size, available)
         if size < self.cfg.min_position_usd:

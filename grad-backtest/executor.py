@@ -350,9 +350,12 @@ class Config:
         # runner watchlist off: the only entries are mirrored buys. COPY_ONLY=0 runs all lanes.
         self.copy_only = os.getenv("COPY_ONLY", "1" if self.copy_wallets else "0") == "1" and bool(self.copy_wallets)
         if self.copy_only and os.getenv("MAX_CONCURRENT_POSITIONS") is None:
-            # Fewer, bigger positions: three slots make each copy about twice the size, which
-            # halves the share of it that slippage and fees eat.
-            self.max_concurrent = 3
+            self.max_concurrent = 10
+        if self.copy_only and os.getenv("ACCOUNT_FRACTION") is None:
+            self.account_fraction = 0.08
+        # Copy-only sizing: 8% of the whole account (free SOL plus open positions) per copy, up
+        # to ten at once, and never more than MAX_DEPLOYED_FRACTION of the account in positions.
+        self.max_deployed_fraction = min(1.0, max(0.1, float(os.getenv("MAX_DEPLOYED_FRACTION", "0.80"))))
         # Each open position costs one Jupiter sell quote per check; the keyless Jupiter tier
         # answers a busy loop with 429s, which delays every exit. Copy positions ride for hours,
         # so checking them every few seconds is plenty; graduation snipes keep every-cycle checks.
@@ -2302,11 +2305,21 @@ class Executor:
         self._sol_price = (now_ts(), price)
         return price
 
-    def equity_usd(self, sol_price: float) -> float:
+    def spendable_usd(self, sol_price: float) -> float:
+        """Free SOL above the fee reserve, the most a single buy can spend."""
         if self.cfg.mode == "paper":
             return float(self.state["paper_balance_usd"])
         spendable = max(0.0, self.rpc.sol_balance(self.wallet.pubkey) - self.cfg.min_sol_reserve)
         return spendable * sol_price
+
+    def deployed_usd(self) -> float:
+        """Current value of every open position (last mark, else its basis)."""
+        return sum(float(p.get("last_value_usd") or p.get("position_usd") or 0.0) for p in self.state["positions"])
+
+    def equity_usd(self, sol_price: float) -> float:
+        """The whole account: free SOL plus open positions, so a fixed fraction of it is the
+        same dollar size for the first copy and the tenth."""
+        return self.spendable_usd(sol_price) + self.deployed_usd()
 
     # ---- detection -------------------------------------------------------
     def note_provider_rate_limit(self, minimum_seconds: float = 30.0) -> float:
@@ -2879,10 +2892,22 @@ class Executor:
         # do not take an entry slot: three $2 leftovers must not block every new graduation.
         # In copy-only mode they do count: a redeploy must not let the book grow past the slots.
         open_slots = sum(1 for p in self.state["positions"] if not p.get("adopted") or self.cfg.copy_only)
-        size_usd = position_size_usd(self.cfg, self.equity_usd(sol_price), open_slots, daily_pnl)
+        equity = self.equity_usd(sol_price)
+        size_usd = position_size_usd(self.cfg, equity, open_slots, daily_pnl)
         if size_usd <= 0:
             self.skip(mint, f"sizing guards (open={open_slots}, daily_pnl={daily_pnl:.2f})")
             return
+        deployed = self.deployed_usd()
+        if deployed + size_usd > equity * self.cfg.max_deployed_fraction:
+            self.skip(mint, f"deployment cap: ${deployed:,.2f} in positions + ${size_usd:,.2f} > "
+                            f"{self.cfg.max_deployed_fraction:.0%} of ${equity:,.2f}")
+            return
+        spendable = self.spendable_usd(sol_price)
+        if size_usd > spendable:
+            size_usd = round(spendable, 2)
+            if size_usd < self.cfg.min_position_usd:
+                self.skip(mint, f"only ${spendable:,.2f} of free SOL left (< ${self.cfg.min_position_usd:,.2f} minimum)")
+                return
         lamports = int(size_usd / sol_price * LAMPORTS)
         quote = self.jup.quote(WSOL, mint, lamports)
         tokens = int(quote["outAmount"])

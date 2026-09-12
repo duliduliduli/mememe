@@ -394,7 +394,8 @@ not establish that graduations are being detected. Counters reset on process res
 | `COPY_ROTATE` | `0` | `1`: when every slot is full and a followed wallet buys, sell our oldest position (moon bag kept) and give the slot to the new coin. Off by default: rotation sold coins at whatever price they were at to chase the next one. `0` skips the new buy instead. Never rotates once the daily loss limit is hit. In copy-only mode positions adopted after a redeploy count as held (and rotate first) and use the copy exits. |
 | `PRICE_FIRST_VALUATION` / `PRICE_FIRST_MARGIN_PCT` | `1` / `8` | Value open positions from Jupiter's batched price feed (one request for all of them) and only ask for a real sell quote when an exit, rung or scale-out is within this margin of firing. `0` quotes every position every check. |
 | `POSITION_CHECK_SECONDS` | `8` in copy-only mode, else `0` | How often each open position is re-quoted for its exits. Every quote is a Jupiter request, and the keyless tier rate-limits a busy loop, which only delays exits. |
-| `MAX_CONCURRENT_POSITIONS` (copy-only) | `3` | In copy-only mode the slot count defaults to 3 instead of 5: fewer, bigger positions so slippage and fees eat a smaller share of each. |
+| `ACCOUNT_FRACTION` / `MAX_CONCURRENT_POSITIONS` (copy-only) | `0.08` / `10` | In copy-only mode each copy is 8% of the whole account (free SOL plus open positions) and up to ten can be open at once. |
+| `MAX_DEPLOYED_FRACTION` | `0.80` | Never more than this share of the account in open positions; a copy that would cross it is skipped. |
 | `COPY_ONLY` | `1` when `COPY_WALLETS` is set | Copy trading is the only lane: graduation discovery and the runner watchlist are off. `0` runs every lane. |
 
 #### EVM copy lane (Robinhood Chain, Base, BNB Chain)

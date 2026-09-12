@@ -147,13 +147,39 @@ class SolPriceTests(unittest.TestCase):
         self.assertEqual(ex.sol_price_usd(), 150.0)    # stale price instead of an aborted cycle
 
 
+class DeploymentCapTests(unittest.TestCase):
+    def test_size_is_a_share_of_the_whole_account_and_stops_at_the_cap(self):
+        executor, p = fresh(PAPER_BALANCE_USD="40")            # $40 free
+        self.addCleanup(p.stop)
+        ex = executor.Executor(executor.Config())
+        ex.state["paper_balance_usd"] = 40.0
+        import time as _time
+        ex.state["positions"] = [{"mint": f"m{i}", "tokens": 1, "position_usd": 8.0, "last_value_usd": 8.0, "opened_ts": _time.time(),
+                                  "opened_at": "t", "peak_usd": 8.0, "copy": WALLET} for i in range(5)]   # $40 deployed
+        self.assertAlmostEqual(ex.equity_usd(SOL), 80.0)          # free + positions
+        entered = []
+        ex.jup.quote = lambda *a, **k: (entered.append(a), {"outAmount": "1000000", "priceImpactPct": "0.01"})[1]
+        ex.skip = lambda mint, reason: entered.append(("skip", reason))
+        ex.try_enter({"mint": MINT, "graduated_ts": _time.time(), "enter_at": _time.time(), "copy": WALLET, "copy_buy_usd": 500}, SOL)
+        reasons = [e[1] for e in entered if isinstance(e, tuple) and e and e[0] == "skip"]
+        self.assertFalse(any("deployment cap" in r for r in reasons), reasons)   # $40 + $6.40 < 80% of $80: the cap allows it
+        ex.state["positions"].append({"mint": "m9", "tokens": 1, "position_usd": 70.0, "last_value_usd": 70.0, "opened_ts": _time.time(),
+                                      "opened_at": "t", "peak_usd": 70.0, "copy": WALLET})              # $110 deployed of $150: 73%, +8% crosses 80%
+        entered.clear()
+        ex.try_enter({"mint": "Other", "graduated_ts": _time.time(), "enter_at": _time.time(), "copy": WALLET, "copy_buy_usd": 500}, SOL)
+        skips = [e for e in entered if isinstance(e, tuple) and e and e[0] == "skip"]
+        self.assertTrue(skips and "deployment cap" in skips[0][1], entered)
+
+
 class LaneTests(unittest.TestCase):
     def test_copy_only_is_the_default_with_wallets(self):
         executor, p = fresh()
         self.addCleanup(p.stop)
         cfg = executor.Config()
         self.assertTrue(cfg.copy_only)
-        self.assertEqual(cfg.max_concurrent, 3)                 # copy-only: fewer, bigger positions
+        self.assertEqual(cfg.max_concurrent, 10)                # copy-only: 8% of the account, ten at once
+        self.assertAlmostEqual(cfg.account_fraction, 0.08)
+        self.assertAlmostEqual(cfg.max_deployed_fraction, 0.80)
         self.assertFalse(cfg.copy_rotate)
         self.assertEqual(cfg.copy_min_buy_usd, 300.0)
         executor, p = fresh(COPY_ONLY="0")

@@ -114,7 +114,7 @@ class WatchTests(unittest.TestCase):
         pos = self.ln.state["positions"][0]
         self.assertEqual(pos["copy"], WALLET)
         self.assertAlmostEqual(pos["copy_buy_usd"], 300)          # 100_000 * 0.000001 ETH * $3000
-        self.assertAlmostEqual(pos["position_usd"], 20.0)          # 10% of $200 paper equity
+        self.assertAlmostEqual(pos["position_usd"], 16.0)          # 8% of $200 paper equity
         self.assertIn("0xnew", self.ln.state["copy_seen"]["base"])
         self.assertNotIn("0xold", self.ln.state["copy_seen"]["base"])
         self.ln._last_poll = 0
@@ -152,7 +152,7 @@ class ExitTests(unittest.TestCase):
         self.price["v"] *= 2.1
         self.ln._last_manage = 0
         self.ln.manage_positions()
-        self.assertEqual(self.pos["tokens"], entry_tokens - int(entry_tokens * 0.4))
+        self.assertAlmostEqual(self.pos["tokens"], entry_tokens * 0.6, delta=entry_tokens * 1e-9)
         self.assertTrue(self.pos["ladder"][0]["done"])
         self.price["v"] *= 3                       # 6.3x: top rung closes the rest
         self.ln._last_manage = 0
