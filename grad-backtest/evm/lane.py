@@ -81,21 +81,21 @@ class Config:
         self.account_fraction = float(env("ACCOUNT_FRACTION", "0.10"))
         self.max_position_usd = float(env("MAX_POSITION_USD", "20"))
         self.min_position_usd = float(env("MIN_POSITION_USD", "5"))
-        self.max_concurrent = int(env("MAX_CONCURRENT_POSITIONS", "5"))
+        self.max_concurrent = int(env("MAX_CONCURRENT_POSITIONS", "3"))
         self.daily_loss_limit_usd = float(env("DAILY_LOSS_LIMIT_USD", "30"))
         self.paper_balance_usd = float(env("PAPER_BALANCE_USD", "500"))
         # Copy rules and exits: shared names with the Solana lane so one setting rules both.
-        self.copy_min_buy_usd = float(env("COPY_MIN_BUY_USD", "50"))
+        self.copy_min_buy_usd = float(env("COPY_MIN_BUY_USD", "300"))
         self.copy_max_tx_age_seconds = float(env("COPY_MAX_TX_AGE_SECONDS", "90"))
         self.copy_poll_seconds = max(1.0, float(env("COPY_POLL_SECONDS", "3")))
         self.copy_follow_sells = env("COPY_FOLLOW_SELLS", "1") == "1"
-        self.copy_rotate = env("COPY_ROTATE", "1") == "1"
+        self.copy_rotate = env("COPY_ROTATE", "0") == "1"
         self.copy_ladder = parse_sell_ladder(env("COPY_LADDER", "2:40,3:30,5:30"))
         self.take_profit = float(env("COPY_TAKE_PROFIT", "0.75"))
         self.stop_loss = float(env("COPY_STOP_LOSS", "0.30"))
         self.trailing_stop = float(env("COPY_TRAILING_STOP", "0.25"))
         self.time_stop_minutes = float(env("COPY_TIME_STOP_MINUTES", "240"))
-        self.moon_bag = float(env("MOON_BAG", "0.15"))
+        self.moon_bag = float(env("MOON_BAG", "0.10"))
         self.moon_bag_target_x = float(env("MOON_BAG_TARGET_X", "100"))
         self.min_moon_bag_usd = float(env("MIN_MOON_BAG_USD", "0.50"))
         self.min_round_trip_pct = float(env("MIN_ENTRY_ROUND_TRIP_PCT", "80"))

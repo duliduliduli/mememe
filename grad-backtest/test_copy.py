@@ -151,7 +151,11 @@ class LaneTests(unittest.TestCase):
     def test_copy_only_is_the_default_with_wallets(self):
         executor, p = fresh()
         self.addCleanup(p.stop)
-        self.assertTrue(executor.Config().copy_only)
+        cfg = executor.Config()
+        self.assertTrue(cfg.copy_only)
+        self.assertEqual(cfg.max_concurrent, 3)                 # copy-only: fewer, bigger positions
+        self.assertFalse(cfg.copy_rotate)
+        self.assertEqual(cfg.copy_min_buy_usd, 300.0)
         executor, p = fresh(COPY_ONLY="0")
         self.addCleanup(p.stop)
         self.assertFalse(executor.Config().copy_only)
@@ -198,7 +202,7 @@ class PollTests(unittest.TestCase):
         return executor, ex
 
     def test_baseline_then_mirror_new_buys_only(self):
-        executor, ex = self.make()
+        executor, ex = self.make(COPY_MIN_BUY_USD="50")
         now = int(executor.now_ts())
         self.sigs = [{"signature": "old1", "blockTime": now - 600}]
         ex.poll_copy_wallets(SOL)
@@ -216,7 +220,7 @@ class PollTests(unittest.TestCase):
         self.assertEqual(len(self.entered), 1)
 
     def test_first_poll_mirrors_a_buy_made_during_restart(self):
-        executor, ex = self.make()
+        executor, ex = self.make(COPY_MIN_BUY_USD="50")
         now = int(executor.now_ts())
         self.sigs = [{"signature": "fresh", "blockTime": now - 20}, {"signature": "old1", "blockTime": now - 600}]
         self.txs["fresh"] = tx(10.0, 5.0, 0, 9_000_000)
@@ -228,7 +232,7 @@ class PollTests(unittest.TestCase):
         self.assertEqual(len(self.entered), 1)
 
     def test_usdc_buys_are_sized_in_dollars(self):
-        executor, ex = self.make()
+        executor, ex = self.make(COPY_MIN_BUY_USD="50")
         now = int(executor.now_ts())
         self.sigs = [{"signature": "base", "blockTime": now - 600}]
         ex.poll_copy_wallets(SOL)
@@ -316,6 +320,7 @@ class RotateTests(unittest.TestCase):
         env.setdefault("MAX_CONCURRENT_POSITIONS", "2")
         env.setdefault("COPY_ONLY", "0")          # all lanes: adopted leftovers hold no slot
         env.setdefault("COPY_ROTATE_MIN_AGE_MINUTES", "0")
+        env.setdefault("COPY_ROTATE", "1")
         executor, p = fresh(**env)
         self.addCleanup(p.stop)
         ex = executor.Executor(executor.Config())
