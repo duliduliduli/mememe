@@ -259,19 +259,25 @@ class Config:
         self.trailing_stop = float(os.getenv("TRAILING_STOP", "0"))  # fraction off peak; 0 disables
         # Never sell the whole position: a slice stays in the wallet in case the token runs
         # after the exit. MOON_BAG=0 restores full exits.
-        self.moon_bag = min(0.5, max(0.0, float(os.getenv("MOON_BAG", "0.15"))))  # fraction kept at exit; 0 disables
+        # 10% of a winning exit is the lottery ticket: 28 bags kept from losing exits in one
+        # day were worth 42% of what was kept eight hours later and none had doubled, while
+        # the capital and the rent sat idle. Bags stay only where a 100x has real odds.
+        self.moon_bag = min(0.5, max(0.0, float(os.getenv("MOON_BAG", "0.10"))))  # fraction kept at exit; 0 disables
         # Keep a bag only when the exit was profitable (a stop-loss remnant just rides to zero and
         # locks its rent), and sell a bag once it is worth MOON_BAG_TARGET_X times what was kept
         # (0 = hold forever; panic is then the only way out). Bags are re-quoted every
         # MOON_BAG_CHECK_SECONDS, not every loop, since they are off the Jupiter budget otherwise.
-        self.moon_bag_winners_only = os.getenv("MOON_BAG_WINNERS_ONLY", "0") == "1"  # losers keep a bag too
+        self.moon_bag_winners_only = os.getenv("MOON_BAG_WINNERS_ONLY", "1") == "1"  # 0: losers keep a bag too
         self.moon_bag_target_x = max(0.0, float(os.getenv("MOON_BAG_TARGET_X", "100")))
         self.moon_bag_check_seconds = float(os.getenv("MOON_BAG_CHECK_SECONDS", "180"))
         # A bag worth less than MIN_MOON_BAG_USD is not worth its own rent (0.002 SOL) and is
         # sold with the rest. A bag that has fallen to MOON_BAG_DEAD_PCT of the value it was kept
         # at is burned and its account closed: the rent is worth more than the tokens.
         self.min_moon_bag_usd = float(os.getenv("MIN_MOON_BAG_USD", "0.5"))
-        self.moon_bag_dead_pct = float(os.getenv("MOON_BAG_DEAD_PCT", "0"))  # 0: bags are never burned
+        self.moon_bag_dead_pct = float(os.getenv("MOON_BAG_DEAD_PCT", "10"))  # 0: bags are never burned
+        # Startup sweep: an untracked holding worth less than this (about one account's rent)
+        # is burned and its account closed, so dust never piles up across restarts.
+        self.dust_sweep_below_usd = float(os.getenv("DUST_SWEEP_BELOW_USD", "0.25"))
         # Partial take-profit: at +SCALE_OUT_AT sell SCALE_OUT_FRACTION of the position and let the
         # remainder ride to the full take-profit under the same rules. 0 disables.
         self.scale_out_at = float(os.getenv("SCALE_OUT_AT", "0"))
@@ -3178,7 +3184,7 @@ class Executor:
         tracked = {p["mint"] for p in self.state["positions"]}
         tracked |= {b["mint"] for b in self.state.get("moon_bags", [])}
         tracked |= {b["mint"] for b in self.state.get("stuck", [])}
-        closed = adopted = 0
+        closed = adopted = swept = 0
         for acct in self.rpc.token_accounts(self.wallet.pubkey):
             mint = acct["mint"]
             if mint in KNOWN_QUOTES:
@@ -3201,6 +3207,14 @@ class Executor:
                 log(f"WARN {mint}: held but not quotable ({describe_error(exc)}); leaving it alone")
                 continue
             if value < self.cfg.min_adopt_usd:
+                if 0 < value < self.cfg.dust_sweep_below_usd and self.cfg.close_empty_accounts:
+                    try:
+                        self.close_token_account(acct["pubkey"], acct["program"], mint, burn_amount=acct["amount"])
+                        swept += 1
+                        log(f"SWEPT dust {mint} worth ${value:.2f}; burned and account closed (rent reclaimed)")
+                        time.sleep(1.0)
+                    except Exception as exc:
+                        log(f"WARN could not sweep dust {mint}: {describe_error(exc)}")
                 continue
             if value < self.cfg.adopt_as_bag_below_usd:
                 self.state.setdefault("moon_bags", []).append(
@@ -3230,10 +3244,10 @@ class Executor:
             )
             adopted += 1
             log(f"ADOPTED untracked holding {mint} worth ${value:.2f}; managing it from here (basis = current value)")
-        if closed or adopted:
+        if closed or adopted or swept:
             save_state(self.state)
-        log(f"wallet reconciled: adopted {adopted} position(s), closed {closed} empty token account(s)"
-            + (f" (~{closed * TOKEN_ACCOUNT_RENT_SOL:.4f} SOL rent)" if closed else ""))
+        log(f"wallet reconciled: adopted {adopted} position(s), closed {closed} empty token account(s), swept {swept} dust holding(s)"
+            + (f" (~{(closed + swept) * TOKEN_ACCOUNT_RENT_SOL:.4f} SOL rent)" if closed or swept else ""))
 
     def _record_close(self, pos: dict[str, Any], reason: str, exit_usd: float, sell_sig: str, sold_cost: float) -> None:
         net = exit_usd / sold_cost - 1.0 if sold_cost > 0 else 0.0

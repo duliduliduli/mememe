@@ -38,9 +38,10 @@ class WinnersOnlyTests(unittest.TestCase):
         self.addCleanup(p.stop)
         cfg = executor.Config()
         # No exit sells everything by default: a bag stays, winners or losers, never burned.
-        self.assertGreater(cfg.moon_bag, 0)
-        self.assertFalse(cfg.moon_bag_winners_only)
-        self.assertEqual(cfg.moon_bag_dead_pct, 0)
+        import os as _os
+        self.assertAlmostEqual(cfg.moon_bag, float(_os.environ.get("MOON_BAG", "0.10")))
+        self.assertTrue(cfg.moon_bag_winners_only)
+        self.assertEqual(cfg.moon_bag_dead_pct, 10)
         self.assertEqual(cfg.moon_bag_target_x, 100)
         self.assertEqual(cfg.moon_bag_check_seconds, 180)
 

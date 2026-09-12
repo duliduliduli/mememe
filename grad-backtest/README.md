@@ -375,12 +375,13 @@ not establish that graduations are being detected. Counters reset on process res
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MOON_BAG` | `0.15` | Fraction of tokens kept at a normal exit (clamped to 0.5), so no position is ever sold in full. `0` disables. |
-| `MOON_BAG_WINNERS_ONLY` | `0` | `1` keeps a bag only when the exit was profitable; `0` keeps one on every exit. |
+| `MOON_BAG` | `0.10` | Fraction of tokens kept at a winning exit (clamped to 0.5), the lottery ticket for a 100x. `0` disables. |
+| `MOON_BAG_WINNERS_ONLY` | `1` | `1` keeps a bag only when the exit was profitable; `0` keeps one on every exit (28 bags from losing exits in one day were worth 42% of what was kept eight hours later, none had doubled). |
 | `MOON_BAG_TARGET_X` | `100` | Sell a bag once worth this multiple of the value it was kept at. `0` holds forever. |
 | `MOON_BAG_CHECK_SECONDS` | `180` | How often bags are re-quoted (each bag is one Jupiter request; bags wait for 100x, so minutes are fine). |
 | `MIN_MOON_BAG_USD` | `0.5` | A would-be bag worth less than this is sold with the rest. |
-| `MOON_BAG_DEAD_PCT` | `0` | A bag worth less than this percent of its kept value is burned and its account closed. `0` (default) never burns a bag. |
+| `MOON_BAG_DEAD_PCT` | `10` | A bag worth less than this percent of its kept value is burned and its account closed (rent back). `0` never burns a bag. |
+| `DUST_SWEEP_BELOW_USD` | `0.25` | At startup, an untracked holding worth less than this (about one token account's rent) is burned and its account closed. `0` disables. |
 | `RUNNER_ENABLED` | `1` | Runner mode: every graduation goes on a watchlist and is bought once its market cap grows into the swing band with momentum. |
 | `RUNNER_ONLY` | `0` | `1` turns the at-graduation entry off so only runners are traded. |
 | `RUNNER_MIN_MARKET_CAP_USD` / `RUNNER_MAX_MARKET_CAP_USD` | `400000` / `4000000` | The swing band. |
