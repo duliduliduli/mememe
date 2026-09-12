@@ -2969,6 +2969,12 @@ class Executor:
             return
         buy_sig = ""
         if self.cfg.mode == "live":
+            # The wallet may already hold this mint (a moon bag from an earlier exit), so the
+            # position's token count is what this buy delivered, never the wallet's balance.
+            try:
+                held_before = self.rpc.token_balance(self.wallet.pubkey, mint)
+            except Exception:
+                held_before = 0
             try:
                 buy_sig = self.execute_swap(quote)
             except Exception as exc:
@@ -2977,11 +2983,13 @@ class Executor:
                 # sitting in the wallet that nothing will ever sell.
                 time.sleep(15)
                 landed = self.rpc.token_balance(self.wallet.pubkey, mint)
-                if landed <= 0:
+                if landed <= held_before:
                     raise
-                log(f"WARN {mint}: entry reported failure ({exc}) but {landed} tokens landed; adopting position")
+                log(f"WARN {mint}: entry reported failure ({exc}) but {landed - held_before} tokens landed; adopting position")
                 buy_sig = "unconfirmed"
-            tokens = self.rpc.token_balance(self.wallet.pubkey, mint) or tokens
+                tokens = landed - held_before
+            else:
+                tokens = self.tokens_received(buy_sig, mint) or tokens
         else:
             self.state["paper_balance_usd"] = float(self.state["paper_balance_usd"]) - size_usd
         self.state["positions"].append(
@@ -3035,6 +3043,30 @@ class Executor:
         save_state(self.state)
         log(f"ENTER {mint} ${size_usd:.2f} ({'live ' + buy_sig[:16] + '…' if buy_sig else 'paper fill'})")
 
+    def tokens_received(self, signature: str, mint: str) -> int:
+        """Tokens of `mint` our wallet received in the confirmed swap `signature` (its balance
+        change in the transaction), retried briefly while the RPC catches up. 0 if unknown."""
+        for attempt in range(6):
+            try:
+                tx = self.rpc.transaction(signature)
+            except Exception:
+                tx = None
+            swap = wallet_swap_from_transaction(tx or {}, str(self.wallet.pubkey)) if tx else None
+            if swap and swap["side"] == "buy" and swap["mint"] == mint:
+                return int(swap["tokens"])
+            time.sleep(2.0)
+        log(f"WARN {mint}: could not read the buy's token delta from {signature[:12]}…; using the quoted amount")
+        return 0
+
+    def sellable(self, mint: str, tracked: int) -> int:
+        """How many of `tracked` tokens we can actually sell: never more than the wallet holds,
+        and never the wallet's whole balance when a moon bag of the same mint sits beside the
+        position."""
+        if self.cfg.mode != "live":
+            return int(tracked)
+        held = self.rpc.token_balance(self.wallet.pubkey, mint)
+        return min(int(tracked), int(held)) if held > 0 else 0
+
     def close_position(self, pos: dict[str, Any], reason: str, sol_price: float) -> None:
         mint = pos["mint"]
         sell_sig = ""
@@ -3049,7 +3081,7 @@ class Executor:
         if mb > 0 and float(pos.get("last_value_usd") or 0.0) * mb < self.cfg.min_moon_bag_usd:
             mb = 0.0  # too small to be worth the rent it would lock
         if self.cfg.mode == "live":
-            amount = self.rpc.token_balance(self.wallet.pubkey, mint)
+            amount = self.sellable(mint, int(pos["tokens"]))
             if amount <= 0:
                 # A previous sell most likely landed after our confirmation timeout. Record the
                 # close at the last quoted value so the trade log stays complete, and flag it.
@@ -3367,7 +3399,7 @@ class Executor:
         `frac` is the share of the current tokens to sell (default SCALE_OUT_FRACTION)."""
         mint = pos["mint"]
         frac = self.cfg.scale_out_fraction if frac is None else min(0.99, max(0.0, frac))
-        amount = self.rpc.token_balance(self.wallet.pubkey, mint) if self.cfg.mode == "live" else int(pos["tokens"])
+        amount = self.sellable(mint, int(pos["tokens"]))
         sell_amount = int(amount * frac)
         if sell_amount <= 0:
             return
@@ -3451,9 +3483,7 @@ class Executor:
         """Market-sell one bag from state[key] (moon bags or stuck positions), record the trade,
         reclaim its rent. Returns the USD proceeds."""
         if quote is None:
-            amount = bag["tokens"]
-            if self.cfg.mode == "live":
-                amount = self.rpc.token_balance(self.wallet.pubkey, bag["mint"]) or amount
+            amount = self.sellable(bag["mint"], int(bag["tokens"])) or int(bag["tokens"])
             quote = self.jup.quote(bag["mint"], WSOL, int(amount), slippage_bps=self.cfg.sell_slippage_bps)
         sig = self.execute_swap(quote) if self.cfg.mode == "live" else ""
         proceeds = int(quote["outAmount"]) / LAMPORTS * sol_price
