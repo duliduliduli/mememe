@@ -50,10 +50,11 @@ class BagBesidePositionTests(unittest.TestCase):
         ex.close_token_account = lambda *a, **k: "x"
         import time as _time
         pos = {"mint": mint, "tokens": 29_902_132_622, "position_usd": 8.13, "opened_ts": _time.time(), "opened_at": "t",
-               "peak_usd": 8.13, "last_value_usd": 8.0, "buy_signature": "sig", "graduated_ts": None}
+               "peak_usd": 12.0, "last_value_usd": 12.0, "buy_signature": "sig", "graduated_ts": None}   # a winner: keeps a bag
         ex.state["positions"] = [pos]
-        ex.close_position(pos, "stop_loss", 100.0)
-        self.assertEqual(quoted, [29_902_132_622 - int(29_902_132_622 * 0.15)])  # 85% of the position, bag untouched
+        ex.close_position(pos, "take_profit", 100.0)
+        keep = int(29_902_132_622 * ex.cfg.moon_bag)
+        self.assertEqual(quoted, [29_902_132_622 - keep])                       # the position minus its own bag; old bag untouched
 
 
 class CloseAccountTests(unittest.TestCase):
@@ -108,7 +109,20 @@ class ReconcileTests(unittest.TestCase):
         adopted = next(q for q in ex.state["positions"] if q["mint"] == untracked)
         self.assertTrue(adopted["adopted"])
         self.assertAlmostEqual(adopted["position_usd"], 6.0)
-        self.assertEqual(len(closed), 1)  # only the empty account was closed; dust untouched
+        self.assertEqual(len(closed), 2)  # the empty account closed and the worthless dust burned; $6 holding adopted
+
+    def test_dust_is_burned_and_its_account_closed(self):
+        executor, ex, p = live_executor()
+        self.addCleanup(p.stop)
+        dust, small = (str(Keypair().pubkey()) for _ in range(2))
+        ex.rpc.token_accounts = lambda owner, mint=None: [acct(dust, 1_000), acct(small, 300_000)]
+        ex.jup.quote = lambda i, o, amount, **kw: {"outAmount": str(int(amount * 60))}   # $0.006 and $1.80
+        closed = []
+        ex.close_token_account = lambda a, prog, mint, burn_amount=0: (closed.append((mint, burn_amount)), "sig")[1]
+        with mock.patch.object(executor.time, "sleep"):
+            ex.reconcile_wallet(sol_price=100.0)
+        self.assertEqual(closed, [(dust, 1_000)])                     # burned; the $1.80 leftover became a bag instead
+        self.assertEqual([b["mint"] for b in ex.state["moon_bags"]], [small])
 
     def test_small_leftovers_become_moon_bags_not_positions(self):
         executor, ex, p = live_executor()
