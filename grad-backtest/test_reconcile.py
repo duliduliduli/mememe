@@ -29,6 +29,33 @@ def acct(mint, amount, program="TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"):
     return {"pubkey": str(Keypair().pubkey()), "program": program, "mint": mint, "amount": amount, "decimals": 6}
 
 
+class BagBesidePositionTests(unittest.TestCase):
+    """A moon bag of the same mint must not be counted as, or sold with, a new position."""
+    def test_entry_counts_the_buys_delta_and_close_sells_only_the_position(self):
+        executor, ex, p = live_executor()
+        self.addCleanup(p.stop)
+        mint = str(Keypair().pubkey())
+        ex.rpc.token_balance = lambda owner, m: 37_000_000_000                   # 7.47 bag + 29.9 new
+        tx = {"transaction": {"message": {"accountKeys": [{"pubkey": str(ex.wallet.pubkey)}]}},
+              "meta": {"err": None, "preBalances": [10**9], "postBalances": [10**9 - 80_000_000],
+                       "preTokenBalances": [{"owner": str(ex.wallet.pubkey), "mint": mint, "uiTokenAmount": {"amount": "7471270702"}}],
+                       "postTokenBalances": [{"owner": str(ex.wallet.pubkey), "mint": mint, "uiTokenAmount": {"amount": "37373403324"}}]}}
+        ex.rpc.transaction = lambda sig: tx
+        self.assertEqual(ex.tokens_received("sig", mint), 29_902_132_622)
+        self.assertEqual(ex.sellable(mint, 29_902_132_622), 29_902_132_622)    # not the 37.37 balance
+        self.assertEqual(ex.sellable(mint, 50_000_000_000), 37_000_000_000)    # never more than held
+        quoted = []
+        ex.jup.quote = lambda m, out, amount, **kw: (quoted.append(amount), {"outAmount": "60000000"})[1]
+        ex.execute_swap = lambda quote: "sellsig"
+        ex.close_token_account = lambda *a, **k: "x"
+        import time as _time
+        pos = {"mint": mint, "tokens": 29_902_132_622, "position_usd": 8.13, "opened_ts": _time.time(), "opened_at": "t",
+               "peak_usd": 8.13, "last_value_usd": 8.0, "buy_signature": "sig", "graduated_ts": None}
+        ex.state["positions"] = [pos]
+        ex.close_position(pos, "stop_loss", 100.0)
+        self.assertEqual(quoted, [29_902_132_622 - int(29_902_132_622 * 0.15)])  # 85% of the position, bag untouched
+
+
 class CloseAccountTests(unittest.TestCase):
     def test_close_builds_signed_tx_and_sends(self):
         executor, ex, p = live_executor()
