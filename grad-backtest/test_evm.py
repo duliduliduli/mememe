@@ -179,7 +179,7 @@ class ExitTests(unittest.TestCase):
 
 class RotateAndRestartTests(unittest.TestCase):
     def test_full_book_rotates_oldest_and_state_survives_restart(self):
-        lane, ln, rpc, price, p = make_lane(MAX_CONCURRENT_POSITIONS="1")
+        lane, ln, rpc, price, p = make_lane(MAX_CONCURRENT_POSITIONS="1", COPY_ROTATE="1")
         self.addCleanup(p.stop)
         rpc.logs_by_block = [transfer_log(TOKEN, OTHER, WALLET, 100_000 * 10**18, 999, "0xbuy")]
         ln.poll_wallets()

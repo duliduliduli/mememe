@@ -349,6 +349,10 @@ class Config:
         # COPY_ONLY=1 (the default once COPY_WALLETS is set) turns graduation discovery and the
         # runner watchlist off: the only entries are mirrored buys. COPY_ONLY=0 runs all lanes.
         self.copy_only = os.getenv("COPY_ONLY", "1" if self.copy_wallets else "0") == "1" and bool(self.copy_wallets)
+        if self.copy_only and os.getenv("MAX_CONCURRENT_POSITIONS") is None:
+            # Fewer, bigger positions: three slots make each copy about twice the size, which
+            # halves the share of it that slippage and fees eat.
+            self.max_concurrent = 3
         # Each open position costs one Jupiter sell quote per check; the keyless Jupiter tier
         # answers a busy loop with 429s, which delays every exit. Copy positions ride for hours,
         # so checking them every few seconds is plenty; graduation snipes keep every-cycle checks.
@@ -360,11 +364,16 @@ class Config:
         self.copy_poll_seconds = max(1.0, float(os.getenv("COPY_POLL_SECONDS", "3")))
         # Followed wallets scatter $3-$10 probe buys between their real entries; mirroring a
         # probe with a full-size position would out-bet the wallet itself. $50 skips the probes.
-        self.copy_min_buy_usd = float(os.getenv("COPY_MIN_BUY_USD", "50"))
+        # $300: only a wallet's conviction buys. Its $10-$100 sprays drove 60 round trips in
+        # six hours, each paying the buy and sell slippage on a coin that did not move.
+        self.copy_min_buy_usd = float(os.getenv("COPY_MIN_BUY_USD", "300"))
         self.copy_follow_sells = os.getenv("COPY_FOLLOW_SELLS", "1") == "1"
         # With every slot full, a new copied buy sells our oldest position and takes its slot
         # (COPY_ROTATE=0 skips the new buy instead), so the book is never stuck in old coins.
-        self.copy_rotate = os.getenv("COPY_ROTATE", "1") == "1"
+        # Off by default: rotating the oldest position out for every new buy sold coins at
+        # whatever price they were at (-5% to -28%) to chase the next one. A full book now
+        # skips the new buy; positions leave only on their own stop, target or time.
+        self.copy_rotate = os.getenv("COPY_ROTATE", "0") == "1"
         # A hyperactive wallet would otherwise rotate the book every minute, paying the buy and
         # sell slippage each time; a position younger than this keeps its slot and the new buy
         # is skipped instead.
