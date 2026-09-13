@@ -371,6 +371,9 @@ class Config:
         # six hours, each paying the buy and sell slippage on a coin that did not move.
         self.copy_min_buy_usd = float(os.getenv("COPY_MIN_BUY_USD", "300"))
         self.copy_follow_sells = os.getenv("COPY_FOLLOW_SELLS", "1") == "1"
+        # A followed wallet selling at least this share of its stack closes our position; a
+        # smaller sale trims ours by the same share (a trim worth under a dollar is skipped).
+        self.copy_full_sell_fraction = float(os.getenv("COPY_FULL_SELL_FRACTION", "0.8"))
         # With every slot full, a new copied buy sells our oldest position and takes its slot
         # (COPY_ROTATE=0 skips the new buy instead), so the book is never stuck in old coins.
         # Off by default: rotating the oldest position out for every new buy sold coins at
@@ -386,12 +389,13 @@ class Config:
         self.copy_take_profit = float(os.getenv("COPY_TAKE_PROFIT", "0.75"))
         self.copy_stop_loss = float(os.getenv("COPY_STOP_LOSS", "0.30"))
         self.copy_trailing_stop = float(os.getenv("COPY_TRAILING_STOP", "0.25"))
-        self.copy_time_stop_minutes = float(os.getenv("COPY_TIME_STOP_MINUTES", "240"))
-        # Copied coins tend to do 2x-5x from the buy, so profit is phased out across that range:
-        # "2:40,3:30,5:30" sells 40% of the entry tokens at 2x the entry price, 30% at 3x and
-        # the last 30% at 5x (the final rung closes the position, so the moon bag still applies).
+        self.copy_time_stop_minutes = float(os.getenv("COPY_TIME_STOP_MINUTES", "1440"))
+        # The followed wallets' winners mostly top out between +30% and +100% from their entry,
+        # so profit is phased out across that range: "1.4:40,1.8:30,3:30" sells 40% of the entry
+        # tokens at +40%, 30% at +80% and the last 30% at 3x (the final rung closes the
+        # position, so the moon bag still applies).
         # Empty disables the ladder and COPY_TAKE_PROFIT decides instead.
-        self.copy_ladder = parse_sell_ladder(os.getenv("COPY_LADDER", "2:40,3:30,5:30"))
+        self.copy_ladder = parse_sell_ladder(os.getenv("COPY_LADDER", "1.4:40,1.8:30,3:30"))
         # Bundle guards. A curve that fills in seconds was bought by one party (SOLL graduated 29s
         # after creation with six buyers), and a wallet holding a big slice of supply at entry is
         # the one that dumps on us (SOLL's creator held 59% at graduation). 0 disables either.
@@ -633,8 +637,10 @@ STABLE_MINTS = {
 def wallet_swap_from_transaction(tx: dict[str, Any], wallet: str) -> dict[str, Any] | None:
     """What `wallet` bought or sold in a confirmed transaction, read from balance changes:
     a token whose balance rose while the wallet's SOL (wrapped SOL, USDC or USDT) fell is a
-    buy, the reverse a sell. Returns {"side", "mint", "tokens", "sol", "stable_usd"} or None
-    when the wallet did not swap. Multi-hop routes report the token with the largest change."""
+    buy, the reverse a sell. Returns {"side", "mint", "tokens", "sol", "stable_usd"} plus
+    "held_before" (a buy added to a coin the wallet already held) or "fraction" (the share of
+    the wallet's stack a sell let go), or None when the wallet did not swap. Multi-hop routes
+    report the token with the largest change."""
     meta = tx.get("meta") or {}
     if meta.get("err") is not None:
         return None
@@ -646,6 +652,7 @@ def wallet_swap_from_transaction(tx: dict[str, Any], wallet: str) -> dict[str, A
         if idx < len(pre) and idx < len(post):
             sol_delta = (int(post[idx]) - int(pre[idx])) / LAMPORTS
     deltas: dict[str, int] = {}
+    before: dict[str, int] = {}
     for sign, rows in ((-1, meta.get("preTokenBalances") or []), (1, meta.get("postTokenBalances") or [])):
         for row in rows:
             if str(row.get("owner")) != wallet:
@@ -656,6 +663,8 @@ def wallet_swap_from_transaction(tx: dict[str, Any], wallet: str) -> dict[str, A
             except (TypeError, ValueError):
                 continue
             deltas[mint] = deltas.get(mint, 0) + sign * amount
+            if sign < 0:
+                before[mint] = before.get(mint, 0) + amount
     wsol_delta = deltas.pop(WSOL, 0) / LAMPORTS
     sol_delta += wsol_delta
     stable_delta = sum(deltas.pop(m, 0) / 10 ** dec for m, dec in STABLE_MINTS.items())
@@ -665,10 +674,13 @@ def wallet_swap_from_transaction(tx: dict[str, Any], wallet: str) -> dict[str, A
     mint, delta = max(deltas.items(), key=lambda kv: abs(kv[1]))
     paid_sol = -sol_delta if sol_delta < 0 else 0.0
     paid_stable = -stable_delta if stable_delta < 0 else 0.0
+    held = before.get(mint, 0)
     if delta > 0 and (paid_sol > 0 or paid_stable > 0):
-        return {"side": "buy", "mint": mint, "tokens": delta, "sol": paid_sol, "stable_usd": paid_stable}
+        return {"side": "buy", "mint": mint, "tokens": delta, "sol": paid_sol, "stable_usd": paid_stable,
+                "held_before": held > 0}
     if delta < 0 and (sol_delta > 0 or stable_delta > 0):
-        return {"side": "sell", "mint": mint, "tokens": -delta, "sol": max(sol_delta, 0.0), "stable_usd": max(stable_delta, 0.0)}
+        return {"side": "sell", "mint": mint, "tokens": -delta, "sol": max(sol_delta, 0.0), "stable_usd": max(stable_delta, 0.0),
+                "fraction": min(1.0, -delta / held) if held > 0 else 1.0}
     return None
 
 
@@ -2651,16 +2663,29 @@ class Executor:
                 if swap["side"] == "sell":
                     if not cfg.copy_follow_sells:
                         continue
-                    # Any followed wallet selling a coin we hold is our cue to sell it too, whichever
-                    # lane or wallet got us in (close_position still keeps the moon bag).
+                    # Any followed wallet selling a coin we hold is our cue to do the same, whichever
+                    # lane or wallet got us in: selling most of its stack closes our position
+                    # (close_position still keeps the moon bag), trimming part of it trims ours by
+                    # the same share.
+                    fraction = float(swap.get("fraction") or 1.0)
                     for pos in list(self.state["positions"]):
-                        if pos.get("mint") == mint:
-                            how = "our copy" if pos.get("copy") == wallet else "our position"
-                            log(f"COPY {wallet[:8]} sold {mint} (${usd:,.0f}); closing {how}")
-                            try:
+                        if pos.get("mint") != mint:
+                            continue
+                        how = "our copy" if pos.get("copy") == wallet else "our position"
+                        try:
+                            if fraction >= cfg.copy_full_sell_fraction:
+                                log(f"COPY {wallet[:8]} sold {fraction:.0%} of {mint} (${usd:,.0f}); closing {how}")
                                 self.close_position(pos, "copy_sell", sol_price)
-                            except Exception as exc:
-                                log(f"WARN copy sell {mint}: {describe_error(exc)}")
+                                continue
+                            worth = fraction * float(pos.get("last_value_usd") or pos.get("position_usd") or 0.0)
+                            if worth < 1.0:
+                                log(f"COPY {wallet[:8]} trimmed {fraction:.0%} of {mint} (${usd:,.0f}); "
+                                    f"the same trim of {how} is worth ${worth:.2f}, not worth the fees")
+                                continue
+                            log(f"COPY {wallet[:8]} trimmed {fraction:.0%} of {mint} (${usd:,.0f}); trimming {how} the same")
+                            self.scale_out(pos, sol_price, frac=fraction, reason="copy_trim")
+                        except Exception as exc:
+                            log(f"WARN copy sell {mint}: {describe_error(exc)}")
                     continue
                 minimum = cfg.copy_wallet_min_usd.get(wallet, cfg.copy_min_buy_usd)
                 if usd < minimum:
@@ -2671,7 +2696,8 @@ class Executor:
                     continue
                 if not self.rotate_for_copy(mint, sol_price):
                     continue
-                log(f"COPY {wallet[:8]} bought {mint} for ${usd:,.0f}; mirroring")
+                kind = "adding to a coin it holds" if swap.get("held_before") else "first buy of this coin"
+                log(f"COPY {wallet[:8]} bought {mint} for ${usd:,.0f} ({kind}); mirroring")
                 self.enter_with_retry({"mint": mint, "graduated_ts": int(block_time or now_ts()), "enter_at": now_ts(),
                                        "copy": wallet, "copy_buy_usd": round(usd)}, sol_price)
 

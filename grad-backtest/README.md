@@ -413,9 +413,9 @@ A second copy lane (`evm/` package, `python -m evm`, autostarted by the server) 
 | `EVM_<CHAIN>_RPC_URL` | public endpoints | Override a chain's RPC (e.g. `EVM_BASE_RPC_URL` for an Alchemy Base endpoint). `EVM_<CHAIN>_V3_QUOTER`, `_V3_ROUTER`, `_V2_ROUTER`, `_WRAPPED_NATIVE`, `_STABLE` override the contract table. |
 | `EVM_AUTOSTART` | `1` | `0` keeps the server from launching the lane. |
 | `COPY_MIN_BUY_USD` / `COPY_MAX_TX_AGE_SECONDS` | `300` / `90` | Ignore a copied wallet's buys below this size (only its conviction buys are mirrored; its $10-$100 sprays drove sixty losing round trips in six hours), or older than this when detected. Position size is the normal `ACCOUNT_FRACTION` of equity. |
-| `COPY_FAST` / `COPY_FOLLOW_SELLS` | `1` / `1` | Skip the slow holder/bundle analysis on copied entries (impact and round-trip checks still run); close any position we hold in a coin when one of the followed wallets sells it, whichever lane bought it. |
-| `COPY_TAKE_PROFIT` / `COPY_STOP_LOSS` / `COPY_TRAILING_STOP` / `COPY_TIME_STOP_MINUTES` | `0.75` / `0.30` / `0.25` / `240` | Exit thresholds for copied positions between the wallet's own sell and ours. With a ladder the take profit only backstops its top rung. |
-| `COPY_LADDER` | `2:40,3:30,5:30` | Phase profit out on copied positions: sell that percent of the entry tokens once the price reaches that multiple of the entry price. The last rung closes the position (moon bag applies). Empty disables it. |
+| `COPY_FAST` / `COPY_FOLLOW_SELLS` | `1` / `1` | Skip the slow holder/bundle analysis on copied entries (impact and round-trip checks still run); follow the followed wallets' sells of any coin we hold, whichever lane bought it: a sale of at least `COPY_FULL_SELL_FRACTION` (`0.8`) of their stack closes our position (moon bag applies), a smaller one trims ours by the same share (trims worth under $1 are skipped). |
+| `COPY_TAKE_PROFIT` / `COPY_STOP_LOSS` / `COPY_TRAILING_STOP` / `COPY_TIME_STOP_MINUTES` | `0.75` / `0.30` / `0.25` / `1440` | Exit thresholds for copied positions between the wallet's own sell and ours. With a ladder the take profit only backstops its top rung. |
+| `COPY_LADDER` | `1.4:40,1.8:30,3:30` | Phase profit out on copied positions: sell that percent of the entry tokens once the price reaches that multiple of the entry price (40% at +40%, 30% at +80%, the rest at 3x). The last rung closes the position (moon bag applies). Empty disables it. |
 
 ### 4.7 Restart safety and housekeeping (live mode)
 

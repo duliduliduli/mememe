@@ -28,6 +28,7 @@ class FakeRpc:
         self.head = 1000
         self.logs_by_block = []            # list of logs
         self.balances = {WALLET: int(1e18)}
+        self.token_balances = {}           # (owner) -> token balance; anyone else holds plenty
 
     def block_number(self):
         return self.head
@@ -56,7 +57,7 @@ class FakeRpc:
         return 18
 
     def erc20_balance(self, token, owner):
-        return 10**30
+        return self.token_balances.get(owner, 10**30)
 
 
 class FakeRouter:
@@ -132,16 +133,31 @@ class WatchTests(unittest.TestCase):
         self.ln.poll_wallets()
         self.assertEqual(len(self.ln.state["positions"]), 1)
         self.rpc.head = 1005
-        self.rpc.logs_by_block.append(transfer_log(TOKEN, WALLET, OTHER, 50_000 * 10**18, 1004, "0xsell"))
+        self.rpc.token_balances[WALLET] = 0                            # sold the whole stack
+        self.rpc.logs_by_block.append(transfer_log(TOKEN, WALLET, OTHER, 100_000 * 10**18, 1004, "0xsell"))
         self.ln._last_poll = 0
         self.ln.poll_wallets()
         self.assertEqual(self.ln.state["positions"], [])
         self.assertEqual(self.ln.state["bags"][0]["symbol"], "TOK")   # moon bag kept
 
+    def test_followed_partial_sell_trims_ours_by_the_same_share(self):
+        self.rpc.logs_by_block = [transfer_log(TOKEN, OTHER, WALLET, 100_000 * 10**18, 999, "0xbuy")]
+        self.ln.poll_wallets()
+        pos = self.ln.state["positions"][0]
+        tokens_before = int(pos["tokens"])
+        pos["last_value_usd"] = 20.0
+        self.rpc.head = 1005
+        self.rpc.token_balances[WALLET] = 50_000 * 10**18                # half is left: a 50% trim
+        self.rpc.logs_by_block.append(transfer_log(TOKEN, WALLET, OTHER, 50_000 * 10**18, 1004, "0xsell"))
+        self.ln._last_poll = 0
+        self.ln.poll_wallets()
+        self.assertEqual(len(self.ln.state["positions"]), 1)
+        self.assertEqual(int(self.ln.state["positions"][0]["tokens"]), tokens_before // 2)
+
 
 class ExitTests(unittest.TestCase):
     def setUp(self):
-        self.lane, self.ln, self.rpc, self.price, p = make_lane()
+        self.lane, self.ln, self.rpc, self.price, p = make_lane(COPY_LADDER="2:40,3:30,5:30")   # price steps assume these rungs
         self.addCleanup(p.stop)
         self.rpc.logs_by_block = [transfer_log(TOKEN, OTHER, WALLET, 100_000 * 10**18, 999, "0xbuy")]
         self.ln.poll_wallets()
@@ -200,7 +216,7 @@ class RotateAndRestartTests(unittest.TestCase):
         self.assertEqual(len(cfg.wallets), 3)
         self.assertEqual(cfg.wallet_min_usd, {WALLET: 500.0})
         self.assertEqual(cfg.mode, "paper")
-        self.assertEqual([(r["x"], r["pct"]) for r in cfg.copy_ladder], [(2.0, 40.0), (3.0, 30.0), (5.0, 30.0)])
+        self.assertEqual([(r["x"], r["pct"]) for r in cfg.copy_ladder], [(1.4, 40.0), (1.8, 30.0), (3.0, 30.0)])
 
 
 class WalletTests(unittest.TestCase):
