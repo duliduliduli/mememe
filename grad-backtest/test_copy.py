@@ -175,6 +175,48 @@ class DeploymentCapTests(unittest.TestCase):
         self.assertTrue(skips and "deployment cap" in skips[0][1], entered)
 
 
+class WalletSizeTests(unittest.TestCase):
+    def test_a_wallet_copied_at_half_size_gets_half_the_position(self):
+        executor, p = fresh(PAPER_BALANCE_USD="200", COPY_WALLETS=f"{WALLET}:300:0.5, {OTHER}")
+        self.addCleanup(p.stop)
+        ex = executor.Executor(executor.Config())
+        ex.state["paper_balance_usd"] = 200.0                     # $200 equity: 8% is $16
+        import time as _time
+        quotes = []
+        ex.jup.quote = lambda *a, **k: (quotes.append(a), {"outAmount": "1000000", "priceImpactPct": "0.01"})[1]
+        ex.skip = lambda mint, reason: quotes.append(("skip", reason))
+        ex.try_enter({"mint": MINT, "graduated_ts": _time.time(), "enter_at": _time.time(), "copy": WALLET,
+                      "copy_buy_usd": 500, "copy_size": ex.cfg.copy_wallet_size[WALLET]}, SOL)
+        self.assertAlmostEqual(quotes[0][2] / 1e9 * SOL, 8.0, places=2)      # half of $16
+        quotes.clear()
+        ex.try_enter({"mint": "Other", "graduated_ts": _time.time(), "enter_at": _time.time(), "copy": OTHER,
+                      "copy_buy_usd": 500, "copy_size": ex.cfg.copy_wallet_size.get(OTHER, 1.0)}, SOL)
+        self.assertAlmostEqual(quotes[0][2] / 1e9 * SOL, 16.0, places=2)     # the usual size
+        ex.state["paper_balance_usd"] = 80.0                      # $80 equity: half of $6.40 is under the $5 minimum
+        quotes.clear()
+        ex.try_enter({"mint": "Third", "graduated_ts": _time.time(), "enter_at": _time.time(), "copy": WALLET,
+                      "copy_buy_usd": 500, "copy_size": 0.5}, SOL)
+        self.assertAlmostEqual(quotes[0][2] / 1e9 * SOL, ex.cfg.min_position_usd, places=2)
+
+    def test_poll_passes_the_wallet_size_along(self):
+        executor, p = fresh(COPY_WALLETS=f"{WALLET}:50:0.5")
+        self.addCleanup(p.stop)
+        ex = executor.Executor(executor.Config())
+        now = int(executor.now_ts())
+        sigs = [{"signature": "base", "blockTime": now - 600}]
+        txs = {}
+        ex.rpc.call = lambda method, params, timeout=None: list(sigs) if method == "getSignaturesForAddress" else None
+        ex.rpc.transaction = lambda sig: txs.get(sig)
+        entered = []
+        ex.enter_with_retry = lambda item, sol_price: entered.append(item)
+        ex.poll_copy_wallets(SOL)
+        sigs.insert(0, {"signature": "buy", "blockTime": now})
+        txs["buy"] = tx(10.0, 5.0, 0, 9_000_000)
+        ex.state["copy_polled_ts"] = 0
+        ex.poll_copy_wallets(SOL)
+        self.assertEqual([(e["mint"], e["copy_size"]) for e in entered], [(MINT, 0.5)])
+
+
 class LaneTests(unittest.TestCase):
     def test_copy_only_is_the_default_with_wallets(self):
         executor, p = fresh()
@@ -324,6 +366,10 @@ class PollTests(unittest.TestCase):
         ex.poll_copy_wallets(SOL)
         self.assertEqual([e["copy_buy_usd"] for e in self.entered], [500])
         self.assertEqual(executor.parse_wallet_list("a:$1k; b\nc:250")[1], {"a": 1000.0, "c": 250.0})
+        wallets, minimums, sizes = executor.parse_wallet_list("a:500:0.5, b::25%, c:300:x2, d:100:junk")
+        self.assertEqual(wallets, ("a", "b", "c", "d"))
+        self.assertEqual(minimums, {"a": 500.0, "c": 300.0, "d": 100.0})
+        self.assertEqual(sizes, {"a": 0.5, "b": 0.25, "c": 2.0})
 
     def test_follow_sell_closes_our_copy(self):
         executor, ex = self.make()

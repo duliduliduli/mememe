@@ -345,7 +345,7 @@ class Config:
         # COPY_FOLLOW_SELLS=1 the position is closed when that wallet sells the token; the
         # COPY_* thresholds guard it in between. Trades older than COPY_MAX_TX_AGE_SECONDS at
         # detection are ignored, and the first poll of a wallet only takes a baseline.
-        self.copy_wallets, self.copy_wallet_min_usd = parse_wallet_list(os.getenv("COPY_WALLETS", ""))
+        self.copy_wallets, self.copy_wallet_min_usd, self.copy_wallet_size = parse_wallet_list(os.getenv("COPY_WALLETS", ""))
         # COPY_ONLY=1 (the default once COPY_WALLETS is set) turns graduation discovery and the
         # runner watchlist off: the only entries are mirrored buys. COPY_ONLY=0 runs all lanes.
         self.copy_only = os.getenv("COPY_ONLY", "1" if self.copy_wallets else "0") == "1" and bool(self.copy_wallets)
@@ -585,26 +585,37 @@ def describe_error(exc: BaseException) -> str:
     return text[:240] + "…" if len(text) > 240 else text
 
 
-def parse_wallet_list(spec: str) -> tuple[tuple[str, ...], dict[str, float]]:
-    """COPY_WALLETS entries are `address` or `address:min_usd`; the optional number is that
-    wallet's own minimum buy size to mirror (a whale's $100 buys are pocket change to it)."""
+def parse_wallet_list(spec: str) -> tuple[tuple[str, ...], dict[str, float], dict[str, float]]:
+    """COPY_WALLETS entries are `address`, `address:min_usd` or `address:min_usd:size`. The
+    minimum is that wallet's own smallest buy to mirror (a whale's $100 buys are pocket change
+    to it); the size scales our copies of that wallet against the usual position size (`0.5`
+    or `50%` halves them, to keep a riskier wallet small). Returns (wallets, minimums, sizes)."""
     wallets: list[str] = []
     minimums: dict[str, float] = {}
+    sizes: dict[str, float] = {}
     for raw in spec.replace("\n", ",").replace(";", ",").split(","):
-        raw = raw.strip()
-        if not raw:
-            continue
-        address, _, minimum = raw.partition(":")
-        address = address.strip()
+        parts = [p.strip() for p in raw.strip().split(":")]
+        address = parts[0]
         if not address:
             continue
         wallets.append(address)
+        minimum = parts[1] if len(parts) > 1 else ""
+        size = parts[2] if len(parts) > 2 else ""
         try:
-            if minimum.strip():
-                minimums[address] = float(minimum.strip().lstrip("$").replace("_", "").replace("k", "000").replace("K", "000"))
+            if minimum:
+                minimums[address] = float(minimum.lstrip("$").replace("_", "").replace("k", "000").replace("K", "000"))
         except ValueError:
             pass
-    return tuple(wallets), minimums
+        try:
+            if size:
+                value = float(size.lower().lstrip("x").rstrip("%"))
+                if size.endswith("%"):
+                    value /= 100.0
+                if value > 0:
+                    sizes[address] = value
+        except ValueError:
+            pass
+    return tuple(wallets), minimums, sizes
 
 
 def parse_sell_ladder(spec: str) -> list[dict[str, float]]:
@@ -2637,7 +2648,8 @@ class Executor:
                 fresh = [r for r in rows if r.get("blockTime") and now_ts() - int(r["blockTime"]) <= cfg.copy_max_tx_age_seconds]
                 seen.extend(r.get("signature") for r in rows if r.get("signature") and r not in fresh)
                 log(f"COPY watching {wallet} (baseline {len(seen)} signatures, {len(fresh)} fresh; "
-                    f"mirroring buys >= ${cfg.copy_wallet_min_usd.get(wallet, cfg.copy_min_buy_usd):,.0f})")
+                    f"mirroring buys >= ${cfg.copy_wallet_min_usd.get(wallet, cfg.copy_min_buy_usd):,.0f} "
+                    f"at {cfg.copy_wallet_size.get(wallet, 1.0):.0%} of the usual size)")
             for row in reversed(rows):
                 sig = row.get("signature")
                 if not sig or sig in seen:
@@ -2699,7 +2711,8 @@ class Executor:
                 kind = "adding to a coin it holds" if swap.get("held_before") else "first buy of this coin"
                 log(f"COPY {wallet[:8]} bought {mint} for ${usd:,.0f} ({kind}); mirroring")
                 self.enter_with_retry({"mint": mint, "graduated_ts": int(block_time or now_ts()), "enter_at": now_ts(),
-                                       "copy": wallet, "copy_buy_usd": round(usd)}, sol_price)
+                                       "copy": wallet, "copy_buy_usd": round(usd),
+                                       "copy_size": cfg.copy_wallet_size.get(wallet, 1.0)}, sol_price)
 
     def rotate_for_copy(self, mint: str, sol_price: float) -> bool:
         """Make room for a copied buy when every slot is taken: sell the oldest position we chose
@@ -2926,6 +2939,10 @@ class Executor:
         if size_usd <= 0:
             self.skip(mint, f"sizing guards (open={open_slots}, daily_pnl={daily_pnl:.2f})")
             return
+        scale = float(item.get("copy_size") or 1.0)
+        if scale != 1.0:
+            # A wallet copied at a reduced size; never below the minimum position, where fees win.
+            size_usd = max(self.cfg.min_position_usd, round(size_usd * scale, 2))
         deployed = self.deployed_usd()
         if deployed + size_usd > equity * self.cfg.max_deployed_fraction:
             self.skip(mint, f"deployment cap: ${deployed:,.2f} in positions + ${size_usd:,.2f} > "

@@ -74,9 +74,10 @@ class Config:
         self.api_key = env("UNISWAP_API_KEY", "").strip()
         self.chain_keys = [c for c in env("EVM_CHAINS", "robinhood,base,bnb").replace(" ", "").split(",") if c]
         from executor import parse_wallet_list
-        raw_wallets, raw_minimums = parse_wallet_list(env("EVM_COPY_WALLETS", ""))
+        raw_wallets, raw_minimums, raw_sizes = parse_wallet_list(env("EVM_COPY_WALLETS", ""))
         self.wallets = tuple(to_checksum_address(w) for w in raw_wallets)
         self.wallet_min_usd = {to_checksum_address(w): m for w, m in raw_minimums.items()}
+        self.wallet_size = {to_checksum_address(w): s for w, s in raw_sizes.items()}
         # Sizing: the same rules as the Solana lane, applied to this lane's own equity.
         self.account_fraction = float(env("ACCOUNT_FRACTION", "0.08"))
         self.max_position_usd = float(env("MAX_POSITION_USD", "20"))
@@ -434,6 +435,9 @@ class Lane:
         if size_usd <= 0:
             log(f"SKIP {key} {symbol}: {why}")
             return
+        scale = cfg.wallet_size.get(wallet, 1.0)
+        if scale != 1.0:                        # a wallet copied smaller; never below the minimum position
+            size_usd = max(cfg.min_position_usd, round(size_usd * scale, 2))
         price = self.native_price(key)
         amount_in = int(size_usd / price * 1e18)
         buy = router.quote(ZERO, token, amount_in)
