@@ -44,9 +44,13 @@ class DecodeTests(unittest.TestCase):
         self.assertEqual(buy["side"], "buy")
         self.assertEqual(buy["mint"], MINT)
         self.assertAlmostEqual(buy["sol"], 1.01)
+        self.assertFalse(buy["held_before"])
+        self.assertTrue(executor.wallet_swap_from_transaction(tx(10.0, 8.99, 100, 5_000_100), WALLET)["held_before"])
         sell = executor.wallet_swap_from_transaction(tx(8.99, 9.8, 5_000_000, 1_000_000), WALLET)
         self.assertEqual(sell["side"], "sell")
         self.assertEqual(sell["tokens"], 4_000_000)
+        self.assertAlmostEqual(sell["fraction"], 0.8)
+        self.assertEqual(executor.wallet_swap_from_transaction(tx(8.99, 9.8, 5_000_000, 0), WALLET)["fraction"], 1.0)
         self.assertIsNone(executor.wallet_swap_from_transaction(tx(10.0, 9.999, 5, 5), WALLET))   # no token change
         self.assertIsNone(executor.wallet_swap_from_transaction(tx(10.0, 9.0, 0, 5, owner=OTHER), WALLET))  # someone else
         self.assertIsNone(executor.wallet_swap_from_transaction(tx(10.0, 9.0, 0, 5, err={"x": 1}), WALLET))
@@ -85,7 +89,7 @@ class CheckCadenceTests(unittest.TestCase):
 
 class PriceFirstTests(unittest.TestCase):
     def make(self):
-        executor, p = fresh(POSITION_CHECK_SECONDS="0")
+        executor, p = fresh(POSITION_CHECK_SECONDS="0", COPY_LADDER="2:40,3:30,5:30")   # the price steps below assume these rungs
         self.addCleanup(p.stop)
         ex = executor.Executor(executor.Config())
         import time as _time
@@ -335,6 +339,36 @@ class PollTests(unittest.TestCase):
         ex.poll_copy_wallets(SOL)
         self.assertEqual(closed, [(MINT, "copy_sell")])
 
+    def test_partial_sell_trims_our_position_by_the_same_share(self):
+        executor, ex = self.make()
+        now = int(executor.now_ts())
+        self.sigs = [{"signature": "base", "blockTime": now}]
+        ex.poll_copy_wallets(SOL)
+        ex.state["positions"] = [{"mint": MINT, "tokens": 10, "position_usd": 8.0, "last_value_usd": 12.0,
+                                  "opened_ts": now, "copy": WALLET, "peak_usd": 12.0}]
+        closed, trimmed = [], []
+        ex.close_position = lambda pos, reason, sol_price: closed.append(reason)
+        ex.scale_out = lambda pos, sol_price, frac=None, reason="": trimmed.append((round(frac, 2), reason))
+        self.sigs = [{"signature": "trim", "blockTime": now}, {"signature": "base", "blockTime": now}]
+        self.txs["trim"] = tx(5.0, 6.0, 10_000_000, 7_000_000)          # sold 30% of its stack
+        ex.state["copy_polled_ts"] = 0
+        ex.poll_copy_wallets(SOL)
+        self.assertEqual(trimmed, [(0.3, "copy_trim")])
+        self.assertEqual(closed, [])
+        # A trim of our position worth under a dollar is not worth the fees.
+        ex.state["positions"][0]["last_value_usd"] = 2.0
+        self.sigs = [{"signature": "tiny", "blockTime": now}] + self.sigs
+        self.txs["tiny"] = tx(5.0, 6.0, 7_000_000, 6_000_000)            # sold ~14%
+        ex.state["copy_polled_ts"] = 0
+        ex.poll_copy_wallets(SOL)
+        self.assertEqual(len(trimmed), 1)
+        # Selling 80% or more of the stack closes ours.
+        self.sigs = [{"signature": "most", "blockTime": now}] + self.sigs
+        self.txs["most"] = tx(5.0, 6.0, 6_000_000, 1_000_000)
+        ex.state["copy_polled_ts"] = 0
+        ex.poll_copy_wallets(SOL)
+        self.assertEqual(closed, ["copy_sell"])
+
     def test_follow_sell_closes_any_position_in_that_coin(self):
         executor, ex = self.make()
         now = int(executor.now_ts())
@@ -426,17 +460,19 @@ class RotateTests(unittest.TestCase):
 class LadderTests(unittest.TestCase):
     def make(self, **env):
         env.setdefault("POSITION_CHECK_SECONDS", "0")     # these tests step the price between calls
+        env.setdefault("COPY_LADDER", "2:40,3:30,5:30")   # the price steps assume these rungs
         executor, p = fresh(**env)
         self.addCleanup(p.stop)
         ex = executor.Executor(executor.Config())
         return executor, ex
 
     def test_parse(self):
-        executor, ex = self.make()
+        executor, p = fresh(POSITION_CHECK_SECONDS="0")                 # the built-in ladder, not the pinned one
+        self.addCleanup(p.stop)
         self.assertEqual(executor.parse_sell_ladder("5:30, 2x:40%,3:30,bad,0.5:10"),
                          [{"x": 2.0, "pct": 40.0}, {"x": 3.0, "pct": 30.0}, {"x": 5.0, "pct": 30.0}])
         self.assertEqual(executor.parse_sell_ladder(""), [])
-        self.assertEqual([(r["x"], r["pct"]) for r in ex.cfg.copy_ladder], [(2.0, 40.0), (3.0, 30.0), (5.0, 30.0)])
+        self.assertEqual([(r["x"], r["pct"]) for r in executor.Config().copy_ladder], [(1.4, 40.0), (1.8, 30.0), (3.0, 30.0)])
 
     def position(self, ex, tokens=1000, basis=10.0):
         import time as _time

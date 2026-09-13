@@ -90,12 +90,13 @@ class Config:
         self.copy_max_tx_age_seconds = float(env("COPY_MAX_TX_AGE_SECONDS", "90"))
         self.copy_poll_seconds = max(1.0, float(env("COPY_POLL_SECONDS", "3")))
         self.copy_follow_sells = env("COPY_FOLLOW_SELLS", "1") == "1"
+        self.copy_full_sell_fraction = float(env("COPY_FULL_SELL_FRACTION", "0.8"))
         self.copy_rotate = env("COPY_ROTATE", "0") == "1"
-        self.copy_ladder = parse_sell_ladder(env("COPY_LADDER", "2:40,3:30,5:30"))
+        self.copy_ladder = parse_sell_ladder(env("COPY_LADDER", "1.4:40,1.8:30,3:30"))
         self.take_profit = float(env("COPY_TAKE_PROFIT", "0.75"))
         self.stop_loss = float(env("COPY_STOP_LOSS", "0.30"))
         self.trailing_stop = float(env("COPY_TRAILING_STOP", "0.25"))
-        self.time_stop_minutes = float(env("COPY_TIME_STOP_MINUTES", "240"))
+        self.time_stop_minutes = float(env("COPY_TIME_STOP_MINUTES", "1440"))
         self.moon_bag = float(env("MOON_BAG", "0.10"))
         self.moon_bag_target_x = float(env("MOON_BAG_TARGET_X", "100"))
         self.min_moon_bag_usd = float(env("MIN_MOON_BAG_USD", "0.50"))
@@ -342,23 +343,42 @@ class Lane:
             token, delta = max(deltas.items(), key=lambda kv: abs(kv[1]))
             wallet = ev["wallet"]
             if delta < 0:
-                self._follow_sell(key, wallet, token)
+                self._follow_sell(key, wallet, token, -delta)
                 continue
             if age > cfg.copy_max_tx_age_seconds:
                 log(f"COPY {key} {wallet[:8]}: buy of {token[:10]} is {age:.0f}s old; too late to mirror")
                 continue
             self._mirror_buy(key, wallet, token, delta, tx_hash)
 
-    def _follow_sell(self, key: str, wallet: str, token: str) -> None:
+    def _follow_sell(self, key: str, wallet: str, token: str, tokens_sold: int = 0) -> None:
+        """The followed wallet sold `tokens_sold`: selling most of its stack closes our position,
+        a partial sale trims ours by the same share (its stack before = balance now + sold)."""
         if not self.cfg.copy_follow_sells:
             return
-        for pos in list(self.state["positions"]):
-            if pos["chain"] == key and pos["token"].lower() == token.lower():
-                log(f"COPY {key} {wallet[:8]} sold {pos['symbol']}; closing our position")
-                try:
+        ours = [p for p in self.state["positions"] if p["chain"] == key and p["token"].lower() == token.lower()]
+        if not ours:
+            return
+        fraction = 1.0
+        if tokens_sold > 0:
+            try:
+                left = self.rpcs[key].erc20_balance(token, wallet)
+                fraction = min(1.0, tokens_sold / (left + tokens_sold)) if left + tokens_sold > 0 else 1.0
+            except Exception as exc:
+                log(f"WARN {key} copy sell: cannot read {wallet[:8]}'s balance ({describe_error(exc)}); treating as a full sale")
+        for pos in ours:
+            try:
+                if fraction >= self.cfg.copy_full_sell_fraction:
+                    log(f"COPY {key} {wallet[:8]} sold {fraction:.0%} of {pos['symbol']}; closing our position")
                     self.close_position(pos, "copy_sell")
-                except Exception as exc:
-                    log(f"WARN copy sell {pos['symbol']}: {describe_error(exc)}")
+                    continue
+                worth = fraction * float(pos.get("last_value_usd") or pos.get("position_usd") or 0.0)
+                if worth < 1.0:
+                    log(f"COPY {key} {wallet[:8]} trimmed {fraction:.0%} of {pos['symbol']}; our trim would be ${worth:.2f}, skipped")
+                    continue
+                log(f"COPY {key} {wallet[:8]} trimmed {fraction:.0%} of {pos['symbol']}; trimming ours the same")
+                self.scale_out(pos, fraction, "copy_trim")
+            except Exception as exc:
+                log(f"WARN copy sell {pos['symbol']}: {describe_error(exc)}")
 
     def _mirror_buy(self, key: str, wallet: str, token: str, tokens_bought: int, tx_hash: str) -> None:
         cfg = self.cfg
