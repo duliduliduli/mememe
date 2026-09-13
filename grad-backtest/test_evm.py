@@ -210,11 +210,12 @@ class RotateAndRestartTests(unittest.TestCase):
         self.assertEqual(again.state["last_block"]["base"], 1010)
 
     def test_copy_only_defaults_and_wallet_parsing(self):
-        lane, p = fresh(EVM_COPY_WALLETS=f"{WALLET}:500, {OTHER}\n{TOKEN}")
+        lane, p = fresh(EVM_COPY_WALLETS=f"{WALLET}:500:0.5, {OTHER}\n{TOKEN}")
         self.addCleanup(p.stop)
         cfg = lane.Config()
         self.assertEqual(len(cfg.wallets), 3)
         self.assertEqual(cfg.wallet_min_usd, {WALLET: 500.0})
+        self.assertEqual(cfg.wallet_size, {WALLET: 0.5})
         self.assertEqual(cfg.mode, "paper")
         self.assertEqual([(r["x"], r["pct"]) for r in cfg.copy_ladder], [(1.4, 40.0), (1.8, 30.0), (3.0, 30.0)])
 
