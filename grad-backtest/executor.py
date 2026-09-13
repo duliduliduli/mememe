@@ -2609,7 +2609,10 @@ class Executor:
         seen_all = self.state.setdefault("copy_seen", {})
         for wallet in cfg.copy_wallets:
             try:
-                rows = self.rpc.call("getSignaturesForAddress", [wallet, {"limit": 10, "commitment": "confirmed"}]) or []
+                # A busy wallet (the FOMO quick-buy button fires ten or more trades a minute in
+                # bursts) scrolls past a short window between polls, so read a long one; already
+                # seen signatures cost nothing.
+                rows = self.rpc.call("getSignaturesForAddress", [wallet, {"limit": 100, "commitment": "confirmed"}]) or []
             except Exception as exc:
                 log(f"WARN copy poll {wallet[:8]}: {describe_error(exc)}")
                 continue
@@ -2628,7 +2631,7 @@ class Executor:
                 if not sig or sig in seen:
                     continue
                 seen.append(sig)
-                del seen[:-200]
+                del seen[:-1000]
                 if row.get("err"):
                     continue
                 block_time = row.get("blockTime")
