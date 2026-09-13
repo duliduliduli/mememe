@@ -221,7 +221,7 @@ class PollTests(unittest.TestCase):
         ex = executor.Executor(executor.Config())
         self.sigs = []
         self.txs = {}
-        ex.rpc.call = lambda method, params, timeout=None: list(self.sigs) if method == "getSignaturesForAddress" else None
+        ex.rpc.call = lambda method, params, timeout=None: list(self.sigs)[:params[1]["limit"]] if method == "getSignaturesForAddress" else None
         ex.rpc.transaction = lambda sig: self.txs.get(sig)
         self.entered = []
         ex.enter_with_retry = lambda item, sol_price: self.entered.append(item)
@@ -244,6 +244,23 @@ class PollTests(unittest.TestCase):
         ex.state["copy_polled_ts"] = 0
         ex.poll_copy_wallets(SOL)                             # same signatures: nothing new
         self.assertEqual(len(self.entered), 1)
+
+    def test_burst_of_trades_between_polls_is_fully_processed(self):
+        """Beqv-style bursts: more than ten trades land between two polls; every big buy in the
+        burst must still be mirrored (the poll reads a 100-signature window, not 10)."""
+        executor, ex = self.make(COPY_MIN_BUY_USD="300")
+        now = int(executor.now_ts())
+        self.sigs = [{"signature": "old1", "blockTime": now - 600}]
+        ex.poll_copy_wallets(SOL)
+        burst = [{"signature": f"b{i}", "blockTime": now - 30 + i} for i in range(25)]
+        self.sigs = list(reversed(burst)) + [{"signature": "old1", "blockTime": now - 600}]
+        for i in range(25):
+            sol_after = 5.0 if i in (0, 12, 24) else 9.9                # three $500 buys among $10 clips
+            self.txs[f"b{i}"] = tx(10.0, sol_after, 0, 9_000_000, mint=f"Mint{i:02d}" + "1" * 38)
+        ex.state["copy_polled_ts"] = 0
+        ex.poll_copy_wallets(SOL)
+        self.assertEqual(len(self.entered), 3)
+        self.assertEqual(sum(1 for s in ex.state["copy_seen"][WALLET] if s.startswith("b")), 25)
 
     def test_first_poll_mirrors_a_buy_made_during_restart(self):
         executor, ex = self.make(COPY_MIN_BUY_USD="50")
