@@ -217,6 +217,30 @@ class WalletSizeTests(unittest.TestCase):
         self.assertEqual([(e["mint"], e["copy_size"]) for e in entered], [(MINT, 0.5)])
 
 
+class PanicOnStartTests(unittest.TestCase):
+    def test_panic_variable_raises_the_flag_at_boot(self):
+        executor, p = fresh(PANIC="1")
+        self.addCleanup(p.stop)
+        ex = executor.Executor(executor.Config())
+        executor.PANIC_FLAG.unlink(missing_ok=True)
+        ex.apply_startup_flags()
+        self.assertTrue(executor.PANIC_FLAG.exists())
+        # Panic completes only once the wallet reconcile is no longer pending, so adopted
+        # leftovers are sold too.
+        ex.state["positions"] = []
+        ex._reconcile_pending = True
+        ex.rpc.call = lambda *a, **k: None
+        ex.run_cycle()
+        self.assertTrue(executor.PANIC_FLAG.exists())
+        ex._reconcile_pending = False
+        ex.run_cycle()
+        self.assertFalse(executor.PANIC_FLAG.exists())
+        self.assertTrue(executor.STOP_FLAG.exists())
+        executor, p = fresh(PANIC="0")
+        self.addCleanup(p.stop)
+        self.assertFalse(executor.Config().panic_on_start)
+
+
 class LaneTests(unittest.TestCase):
     def test_copy_only_is_the_default_with_wallets(self):
         executor, p = fresh()
