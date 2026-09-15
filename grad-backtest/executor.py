@@ -473,6 +473,10 @@ class Config:
         # state["stuck"] so it stops blocking a slot; panic still tries to liquidate it.
         self.stuck_after_minutes = float(os.getenv("STUCK_AFTER_MINUTES", "15"))
         self.min_sol_reserve = float(os.getenv("MIN_SOL_RESERVE", "0.05"))
+        # PANIC=1 sells every position and moon bag at market as soon as the executor starts,
+        # then drains (no new buys): the "sell everything and stop" switch for people who set
+        # variables rather than call the API. Delete it once the log says "panic complete".
+        self.panic_on_start = os.getenv("PANIC", "0").strip() == "1"
         self.paper_start_balance = float(os.getenv("START_BALANCE", "100"))
         self.wallet_key = os.getenv("WALLET_PRIVATE_KEY") or ""
 
@@ -3724,7 +3728,8 @@ class Executor:
             price = sol_price or self.sol_price_usd()
             self.liquidate_bags(price, "moon_bags", "panic_moon_bag")
             self.liquidate_bags(price, "stuck", "panic_stuck")
-        if panic and not self.state["positions"] and not self.state.get("moon_bags") and not self.state.get("stuck"):
+        if (panic and not self.state["positions"] and not self.state.get("moon_bags") and not self.state.get("stuck")
+                and not getattr(self, "_reconcile_pending", False)):   # leftovers still to adopt must be sold too
             PANIC_FLAG.unlink(missing_ok=True)
             STOP_FLAG.touch()
             log("panic complete: all positions and moon bags closed, executor draining")
@@ -3750,6 +3755,14 @@ class Executor:
                 except Exception as exc:
                     log(f"WARN copy trading: {describe_error(exc)}")
         save_state(self.state)
+
+    def apply_startup_flags(self) -> None:
+        """PANIC=1 raises the panic flag at boot: everything the wallet holds (positions, moon
+        bags, leftovers adopted by the reconcile) is market-sold and the executor drains."""
+        if self.cfg.panic_on_start:
+            PANIC_FLAG.touch()
+            log("PANIC=1: selling every position and moon bag at market, then draining (no new buys). "
+                "Delete the PANIC variable once the log says 'panic complete'.")
 
     def run(self) -> None:
         log(f"executor starting: mode={self.cfg.mode} fraction={self.cfg.account_fraction} "
@@ -3825,6 +3838,7 @@ class Executor:
                         log(f"WARN wallet reconciliation provider unavailable; deferred for {delay:.0f}s")
                     else:
                         log(f"WARN wallet reconciliation failed: {describe_error(exc)}")
+        self.apply_startup_flags()
         if self.cfg.copy_only:
             log(f"copy-only: graduation discovery and runner watchlist off; mirroring {len(self.cfg.copy_wallets)} wallet(s)")
         elif self.cfg.discovery_mode == "websocket":

@@ -198,6 +198,7 @@ prints the important ones.
 |---|---|---|
 | `EXECUTOR_MODE` | `paper` | `paper` or `live`. |
 | `EXECUTOR_AUTOSTART` | `0` | `1` makes the dashboard container launch the executor at boot. |
+| `PANIC` | `0` | `1` sells every position and moon bag at market as soon as the executor starts (leftovers the reconcile adopts included), then drains with no new buys. The variable-only way to "sell everything and stop"; delete it once the log says `panic complete`, then set `EXECUTOR_AUTOSTART=0` to keep the bot off. |
 | `START_BALANCE` | `100` | Initial paper balance for a fresh state file; also the dashboard equity-curve start. |
 | `ACCOUNT_FRACTION` | `0.10` | Fraction of equity per position. Equity in live mode is spendable SOL (balance minus `MIN_SOL_RESERVE`) times the SOL price. |
 | `MAX_POSITION_USD` | `20` | Hard cap on position size. |
