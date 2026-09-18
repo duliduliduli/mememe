@@ -111,6 +111,23 @@ class ReconcileTests(unittest.TestCase):
         self.assertAlmostEqual(adopted["position_usd"], 6.0)
         self.assertEqual(len(closed), 2)  # the empty account closed and the worthless dust burned; $6 holding adopted
 
+    def test_hold_mints_are_left_alone(self):
+        executor, ex, p = live_executor(HOLD_MINTS=" HoldMe111, other")
+        self.addCleanup(p.stop)
+        held, other = "HoldMe111", str(Keypair().pubkey())
+        ex.rpc.token_accounts = lambda owner, mint=None: [acct(held, 1_000_000), acct(other, 1_000_000)]
+        quoted = []
+        ex.jup.quote = lambda i, o, amount, **kw: (quoted.append(i), {"outAmount": str(int(amount * 60))})[1]
+        with mock.patch.object(executor.time, "sleep"):
+            ex.reconcile_wallet(sol_price=100.0)
+        self.assertEqual([q["mint"] for q in ex.state["positions"]], [other])   # the held mint was not even quoted
+        self.assertEqual(quoted, [other])
+        skipped = []
+        ex.skip = lambda mint, reason: skipped.append((mint, reason))
+        ex.try_enter({"mint": held, "graduated_ts": 0, "enter_at": 0}, 100.0)
+        self.assertIn("HOLD_MINTS", skipped[0][1])
+        self.assertEqual(executor.Config().hold_mints, ("HoldMe111", "other"))
+
     def test_dust_is_burned_and_its_account_closed(self):
         executor, ex, p = live_executor()
         self.addCleanup(p.stop)

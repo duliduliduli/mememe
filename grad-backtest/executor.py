@@ -477,6 +477,9 @@ class Config:
         # then drains (no new buys): the "sell everything and stop" switch for people who set
         # variables rather than call the API. Delete it once the log says "panic complete".
         self.panic_on_start = os.getenv("PANIC", "0").strip() == "1"
+        # HOLD_MINTS: tokens in the wallet the executor must never touch (bought by hand, kept
+        # on purpose): not adopted at startup, not swept, not sold by panic, never entered.
+        self.hold_mints = tuple(m.strip() for m in os.getenv("HOLD_MINTS", "").replace("\n", ",").split(",") if m.strip())
         self.paper_start_balance = float(os.getenv("START_BALANCE", "100"))
         self.wallet_key = os.getenv("WALLET_PRIVATE_KEY") or ""
 
@@ -2926,6 +2929,9 @@ class Executor:
         return result(bundle)
 
     def try_enter(self, item: dict[str, Any], sol_price: float) -> None:
+        if item["mint"] in self.cfg.hold_mints:
+            self.skip(item["mint"], "in HOLD_MINTS (held by hand, never traded)")
+            return
         mint = item["mint"]
         graduated_ts = float(item["graduated_ts"])
         since_graduation = now_ts() - graduated_ts
@@ -3272,6 +3278,9 @@ class Executor:
         for acct in self.rpc.token_accounts(self.wallet.pubkey):
             mint = acct["mint"]
             if mint in KNOWN_QUOTES:
+                continue
+            if mint in self.cfg.hold_mints:
+                log(f"HOLD {mint}: in HOLD_MINTS; left alone")
                 continue
             if acct["amount"] == 0:
                 if self.cfg.close_empty_accounts:
