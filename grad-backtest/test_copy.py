@@ -7,8 +7,8 @@ import unittest
 from unittest import mock
 
 SOL = 100.0
-WALLET = "Wallet111111111111111111111111111111111111"
-OTHER = "Other1111111111111111111111111111111111111"
+WALLET = "FY6yG7cy886yAzndYue7Tb5q5mj3nWEHNi3PjGowd4Ns"   # any real-shaped (32-byte base58) address
+OTHER = "7u45jUVMBMGWe8Qw3ia1bCbDb1HkordapADgJc6kNaP4"
 MINT = "Mint11111111111111111111111111111111111111"
 WSOL = "So11111111111111111111111111111111111111112"
 
@@ -215,6 +215,28 @@ class WalletSizeTests(unittest.TestCase):
         ex.state["copy_polled_ts"] = 0
         ex.poll_copy_wallets(SOL)
         self.assertEqual([(e["mint"], e["copy_size"]) for e in entered], [(MINT, 0.5)])
+
+
+class WalletValidationTests(unittest.TestCase):
+    def test_mistyped_address_is_dropped_at_startup(self):
+        executor, p = fresh(COPY_WALLETS=f"9BMzTpSoShort, {WALLET}:300")
+        self.addCleanup(p.stop)
+        cfg = executor.Config()
+        self.assertEqual(cfg.copy_wallets, (WALLET,))
+        self.assertEqual(cfg.copy_wallet_min_usd, {WALLET: 300.0})
+        self.assertTrue(executor.valid_solana_address(WALLET))
+        self.assertFalse(executor.valid_solana_address("9BMzTpSoShort"))
+
+    def test_sizing_skip_says_the_account_is_too_small(self):
+        executor, p = fresh(PAPER_BALANCE_USD="45")
+        self.addCleanup(p.stop)
+        ex = executor.Executor(executor.Config())
+        ex.state["paper_balance_usd"] = 45.0                      # 8% of $45 is $3.60, under the $5 minimum
+        skipped = []
+        ex.skip = lambda mint, reason: skipped.append(reason)
+        import time as _time
+        ex.try_enter({"mint": MINT, "graduated_ts": _time.time(), "enter_at": _time.time(), "copy": WALLET, "copy_buy_usd": 500}, SOL)
+        self.assertIn("$3.60 < $5.00 minimum position", skipped[0])
 
 
 class PanicOnStartTests(unittest.TestCase):

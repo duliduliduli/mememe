@@ -346,6 +346,11 @@ class Config:
         # COPY_* thresholds guard it in between. Trades older than COPY_MAX_TX_AGE_SECONDS at
         # detection are ignored, and the first poll of a wallet only takes a baseline.
         self.copy_wallets, self.copy_wallet_min_usd, self.copy_wallet_size = parse_wallet_list(os.getenv("COPY_WALLETS", ""))
+        # A mistyped address would fail every poll with "WrongSize"; drop it once, loudly.
+        bad = tuple(w for w in self.copy_wallets if not valid_solana_address(w))
+        if bad:
+            log("WARN COPY_WALLETS ignored (not a valid Solana address, check for a typo or a missing character): " + ", ".join(bad))
+            self.copy_wallets = tuple(w for w in self.copy_wallets if w not in bad)
         # COPY_ONLY=1 (the default once COPY_WALLETS is set) turns graduation discovery and the
         # runner watchlist off: the only entries are mirrored buys. COPY_ONLY=0 runs all lanes.
         self.copy_only = os.getenv("COPY_ONLY", "1" if self.copy_wallets else "0") == "1" and bool(self.copy_wallets)
@@ -590,6 +595,16 @@ def describe_error(exc: BaseException) -> str:
     if "0x1770" in text or "'Custom': 6000" in text or '"Custom": 6000' in text:
         return "Jupiter 6000: route no longer valid"
     return text[:240] + "…" if len(text) > 240 else text
+
+
+def valid_solana_address(address: str) -> bool:
+    """32 bytes of base58: what getSignaturesForAddress accepts."""
+    try:
+        from solders.pubkey import Pubkey
+        Pubkey.from_string(address)
+        return True
+    except Exception:
+        return False
 
 
 def parse_wallet_list(spec: str) -> tuple[tuple[str, ...], dict[str, float], dict[str, float]]:
@@ -2947,7 +2962,11 @@ class Executor:
         equity = self.equity_usd(sol_price)
         size_usd = position_size_usd(self.cfg, equity, open_slots, daily_pnl)
         if size_usd <= 0:
-            self.skip(mint, f"sizing guards (open={open_slots}, daily_pnl={daily_pnl:.2f})")
+            base = equity * self.cfg.account_fraction
+            why = (f"{self.cfg.account_fraction:.0%} of ${equity:,.2f} equity = ${base:,.2f} < ${self.cfg.min_position_usd:,.2f} minimum position"
+                   if base < self.cfg.min_position_usd and open_slots < self.cfg.max_concurrent
+                   else f"sizing guards (open={open_slots}/{self.cfg.max_concurrent}, daily_pnl={daily_pnl:.2f})")
+            self.skip(mint, why)
             return
         scale = float(item.get("copy_size") or 1.0)
         if scale != 1.0:
