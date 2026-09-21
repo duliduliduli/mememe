@@ -482,6 +482,15 @@ def _start_evm() -> None:
     _evm_proc = subprocess.Popen([sys.executable, "-m", "evm"], cwd=Path(__file__).parent)
 
 
+@app.get("/api/copy/signals")
+def copy_signals(limit: int = 200) -> JSONResponse:
+    """Every qualifying buy the followed wallets made: first buy or add, mirrored or not, why."""
+    frame = read_csv("copy_signals.csv")
+    if not frame.empty and "timestamp" in frame.columns:
+        frame = frame.sort_values("timestamp", ascending=False)
+    return JSONResponse({"signals": frame_records(frame.head(limit))})
+
+
 @app.get("/api/gmgn/screen")
 def gmgn_screen(wallets: str = "", chain: str = "sol", period: str = "30d") -> JSONResponse:
     """Is a wallet worth copying? `wallets` is comma-separated; each comes back with a
