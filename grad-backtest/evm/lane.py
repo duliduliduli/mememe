@@ -84,7 +84,7 @@ class Config:
         self.min_position_usd = float(env("MIN_POSITION_USD", "5"))
         self.max_concurrent = int(env("MAX_CONCURRENT_POSITIONS", "10"))
         self.max_deployed_fraction = min(1.0, max(0.1, float(env("MAX_DEPLOYED_FRACTION", "0.80"))))
-        self.daily_loss_limit_usd = float(env("DAILY_LOSS_LIMIT_USD", "30"))
+        self.daily_loss_limit_usd = float(env("DAILY_LOSS_LIMIT_USD", "0"))
         self.paper_balance_usd = float(env("PAPER_BALANCE_USD", "500"))
         # Copy rules and exits: shared names with the Solana lane so one setting rules both.
         self.copy_min_buy_usd = float(env("COPY_MIN_BUY_USD", "300"))
@@ -279,7 +279,7 @@ class Lane:
         if open_positions >= self.cfg.max_concurrent:
             return 0.0, f"all {self.cfg.max_concurrent} slots full"
         daily = float(self.state["daily"]["realized_pnl_usd"])
-        if daily <= -self.cfg.daily_loss_limit_usd:
+        if self.cfg.daily_loss_limit_usd > 0 and daily <= -self.cfg.daily_loss_limit_usd:
             return 0.0, f"daily loss limit (${daily:,.2f})"
         equity = self.equity_usd()
         size = min(equity * self.cfg.account_fraction, self.cfg.max_position_usd)
@@ -431,7 +431,7 @@ class Lane:
         if not cfg.copy_rotate:
             log(f"COPY {symbol}: all {cfg.max_concurrent} slots full and COPY_ROTATE=0; skipped")
             return False
-        if float(self.state["daily"]["realized_pnl_usd"]) <= -cfg.daily_loss_limit_usd:
+        if cfg.daily_loss_limit_usd > 0 and float(self.state["daily"]["realized_pnl_usd"]) <= -cfg.daily_loss_limit_usd:
             log(f"COPY {symbol}: daily loss limit reached; not rotating")
             return False
         oldest = min(held, key=lambda p: float(p.get("opened_ts") or 0))

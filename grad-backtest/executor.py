@@ -13,7 +13,7 @@ Modes (EXECUTOR_MODE):
 Safety rails, enforced in both modes:
   * position size = ACCOUNT_FRACTION of equity, hard-capped by MAX_POSITION_USD
   * MAX_CONCURRENT_POSITIONS open at once
-  * DAILY_LOSS_LIMIT_USD of realized losses stops new entries until next UTC day
+  * DAILY_LOSS_LIMIT_USD of realized losses stops new entries until next UTC day (0 = never pause)
   * touch DATA_DIR/executor.stop  -> drain: manage open positions, no new buys
   * touch DATA_DIR/executor.panic -> market-sell everything now, then drain
 
@@ -258,7 +258,8 @@ class Config:
         self.max_position_usd = float(os.getenv("MAX_POSITION_USD", "20"))
         self.min_position_usd = float(os.getenv("MIN_POSITION_USD", "5"))
         self.max_concurrent = int(os.getenv("MAX_CONCURRENT_POSITIONS", "5"))
-        self.daily_loss_limit_usd = float(os.getenv("DAILY_LOSS_LIMIT_USD", "30"))
+        # 0 disables the pause: a copy book of small clips expects strings of losses before a runner pays.
+        self.daily_loss_limit_usd = float(os.getenv("DAILY_LOSS_LIMIT_USD", "0"))
         self.take_profit = float(os.getenv("TAKE_PROFIT", "0.75"))
         self.stop_loss = float(os.getenv("STOP_LOSS", "0.30"))
         self.trailing_stop = float(os.getenv("TRAILING_STOP", "0"))  # fraction off peak; 0 disables
@@ -1151,7 +1152,7 @@ def position_size_usd(cfg: Config, equity_usd: float, open_positions: int, daily
     """Sizing with every guard applied; 0 means 'do not enter'."""
     if open_positions >= cfg.max_concurrent:
         return 0.0
-    if daily_pnl <= -cfg.daily_loss_limit_usd:
+    if cfg.daily_loss_limit_usd > 0 and daily_pnl <= -cfg.daily_loss_limit_usd:
         return 0.0
     size = min(equity_usd * cfg.account_fraction, cfg.max_position_usd)
     if size < cfg.min_position_usd:
@@ -3025,7 +3026,7 @@ class Executor:
         if not cfg.copy_rotate:
             log(f"COPY {mint}: all {cfg.max_concurrent} slots full and COPY_ROTATE=0; skipped")
             return False
-        if float(self.state["daily"]["realized_pnl_usd"]) <= -cfg.daily_loss_limit_usd:
+        if cfg.daily_loss_limit_usd > 0 and float(self.state["daily"]["realized_pnl_usd"]) <= -cfg.daily_loss_limit_usd:
             log(f"COPY {mint}: daily loss limit reached; not rotating")
             return False
         # Adopted positions were bought before this process started, so they are the oldest.

@@ -207,7 +207,7 @@ prints the important ones.
 | `MAX_POSITION_USD` | `20` | Hard cap on position size. |
 | `MIN_POSITION_USD` | `5` | If the computed size is below this, no entry. Lower it if you want small fractional sizing on a small account. |
 | `MAX_CONCURRENT_POSITIONS` | `5` | Maximum bot-opened positions at once. Adopted holdings do not count. |
-| `DAILY_LOSS_LIMIT_USD` | `30` | Once realized P&L for the UTC day is at or below minus this, no new entries until the next UTC day. Measured from quoted closes and reset by a restart. Use a huge number to effectively disable; `0` would block after any loss. |
+| `DAILY_LOSS_LIMIT_USD` | `0` | Once realized P&L for the UTC day is at or below minus this, no new entries until the next UTC day. Measured from quoted closes and reset by a restart. `0` (the default) never pauses: a copy book of small clips takes strings of losses before a runner pays, so set this only as a circuit breaker well above a normal bad day. |
 | `MIN_SOL_RESERVE` | `0.05` | SOL kept back for fees when computing live equity. |
 
 ### 4.3 Strategy parameters
@@ -544,7 +544,7 @@ entry can land.
 
 `try_enter`, in order:
 
-1. **Sizing guards** (`position_size_usd`): open bot-opened positions must be below `MAX_CONCURRENT_POSITIONS` (adopted holdings don't count); daily realized P&L must be above −`DAILY_LOSS_LIMIT_USD`; size = `min(equity × ACCOUNT_FRACTION, MAX_POSITION_USD)` must be at least `MIN_POSITION_USD` and at most equity. Failure: `SKIP …: sizing guards (open=N, daily_pnl=X)`.
+1. **Sizing guards** (`position_size_usd`): open bot-opened positions must be below `MAX_CONCURRENT_POSITIONS` (adopted holdings don't count); daily realized P&L must be above −`DAILY_LOSS_LIMIT_USD` when that is set (0 skips the check); size = `min(equity × ACCOUNT_FRACTION, MAX_POSITION_USD)` must be at least `MIN_POSITION_USD` and at most equity. Failure: `SKIP …: sizing guards (open=N, daily_pnl=X)`.
 2. **Buy quote** WSOL → token for the sized amount at `SLIPPAGE_BPS`. A zero-token quote raises and is retried.
 3. **Metadata lookups** (`entry_metadata`):
    - raw token supply → executable quote-implied FDV = USD in × raw supply ÷ raw tokens out; raw units cancel so decimals cannot skew the result;
