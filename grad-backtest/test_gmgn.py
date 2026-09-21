@@ -104,16 +104,42 @@ class ExecutorHookTests(unittest.TestCase):
         logged = []
         with mock.patch.object(gmgn.Gmgn, "wallet_stats", lambda self, chain, wallets, period: [stats_row(WALLET, 900, 0.6, 30, 20), stats_row(OTHER, -50, 0.2, 30, 20)]), \
              mock.patch.object(executor, "log", lambda msg: logged.append(msg)):
-            ex.screen_copy_wallets()
+            ex.screen_copy_wallets(wait=True)
         self.assertTrue(any(f"GMGN OK   {WALLET}" in m for m in logged), logged)
+        self.assertEqual(ex.state["gmgn_verdicts"][OTHER]["verdict"], "skip")
+        self.assertGreater(float(ex.state["gmgn_success_ts"]), 0)
         self.assertTrue(any("not worth copying" in m and OTHER[:8] in m for m in logged), logged)
         # No key: nothing happens, nothing breaks.
         executor2, p2 = fresh(GMGN_API_KEY="")
         self.addCleanup(p2.stop)
         logged.clear()
         with mock.patch.object(executor2, "log", lambda msg: logged.append(msg)):
-            executor2.Executor(executor2.Config()).screen_copy_wallets()
+            executor2.Executor(executor2.Config()).screen_copy_wallets(wait=True)
         self.assertEqual(logged, [])
+
+    def test_failed_screening_keeps_old_verdicts_and_retries_sooner(self):
+        from test_copy import fresh, WALLET
+        executor, p = fresh(GMGN_API_KEY="k", COPY_WALLETS=WALLET, GMGN_RETRY_MINUTES="60", GMGN_REFRESH_HOURS="24")
+        self.addCleanup(p.stop)
+        ex = executor.Executor(executor.Config())
+        ex.state["gmgn_verdicts"] = {WALLET: {"verdict": "copy", "why": "old", "evaluated_at": "2026-09-20T00:00:00Z"}}
+        logged = []
+        def boom(self, chain, wallets, period):
+            raise RuntimeError("GMGN 500")
+        with mock.patch.object(gmgn.Gmgn, "wallet_stats", boom), mock.patch.object(executor, "log", lambda m: logged.append(m)):
+            ex.screen_copy_wallets(wait=True)
+        self.assertEqual(ex.state["gmgn_verdicts"][WALLET]["verdict"], "copy")     # previous verdicts kept
+        self.assertTrue(any("keeping the previous verdicts" in m for m in logged), logged)
+        self.assertGreater(float(ex.state["gmgn_attempt_ts"]), 0)
+        self.assertEqual(float(ex.state.get("gmgn_success_ts") or 0), 0)
+        # Next attempt is due after the retry interval, not the full refresh interval.
+        started = []
+        ex.screen_copy_wallets = lambda wait=False: started.append(1)
+        ex.maybe_refresh_gmgn()
+        self.assertEqual(started, [])
+        ex.state["gmgn_attempt_ts"] = executor.now_ts() - 61 * 60
+        ex.maybe_refresh_gmgn()
+        self.assertEqual(started, [1])
 
 
 class ServerEndpointTests(unittest.TestCase):
