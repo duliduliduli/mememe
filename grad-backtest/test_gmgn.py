@@ -25,19 +25,19 @@ def stats_row(wallet, realized, winrate, buys, sells, tags=None):
 class ClientTests(unittest.TestCase):
     def test_request_carries_key_timestamp_and_client_id(self):
         client = gmgn.Gmgn(api_key="k123")
+        client.pause_seconds = 0
         calls = []
-        client.session.request = lambda method, url, **kw: (calls.append((method, url, kw)), FakeResponse({"code": 0, "data": {"list": [{"wallet_address": "w1"}]}}))[1]
+        client.session.request = lambda method, url, **kw: (calls.append((method, url, kw)), FakeResponse({"code": 0, "data": {"wallet_address": dict(kw["params"])["wallet_address"]}}))[1]
         rows = client.wallet_stats("sol", ["w1", "w2"], "30d")
-        self.assertEqual(rows, [{"wallet_address": "w1"}])
+        self.assertEqual(rows, [{"wallet_address": "w1"}, {"wallet_address": "w2"}])
         method, url, kw = calls[0]
         self.assertEqual((method, url), ("GET", "https://openapi.gmgn.ai/v1/user/wallet_stats"))
         self.assertEqual(kw["headers"]["X-APIKEY"], "k123")
-        params = dict((k, v) for k, v in kw["params"] if k not in ("wallet_address",))
-        self.assertEqual(params["chain"], "sol")
-        self.assertEqual(params["period"], "30d")
+        params = dict(kw["params"])
+        self.assertEqual((params["chain"], params["period"], params["wallet_address"]), ("sol", "30d", "w1"))
         self.assertIn("timestamp", params)
         self.assertIn("client_id", params)
-        self.assertEqual([v for k, v in kw["params"] if k == "wallet_address"], ["w1", "w2"])
+        self.assertNotEqual(dict(calls[0][2]["params"])["client_id"], dict(calls[1][2]["params"])["client_id"])
 
     def test_api_error_and_rate_limit_retry(self):
         client = gmgn.Gmgn(api_key="k")
@@ -65,6 +65,35 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(summary[0]["wallet"], "trader1")
         self.assertEqual(summary[0]["tags"], ["smart_degen", "top_holder"])
         self.assertEqual(summary[0]["realized_profit"], 1234.5)
+
+
+REAL_ROW = {"wallet_address": "EC2f", "native_balance": "0", "realized_profit": "787901.678", "realized_profit_pnl": "0.505",
+            "buy": 608, "sell": 792, "bought_cost": "2104329.36", "total_cost": "2405884.80",
+            "pnl_stat": {"token_num": 293, "winrate": 0.3766, "avg_holding_period": 597867.39},
+            "common": {"tags": ["padre", "arbitrager", "fomo"]}}
+
+
+class RealShapeTests(unittest.TestCase):
+    def test_wallet_stats_asks_once_per_wallet_and_parses_the_real_shape(self):
+        client = gmgn.Gmgn(api_key="k")
+        client.pause_seconds = 0
+        calls = []
+        def request(method, url, **kw):
+            params = dict(kw["params"])
+            calls.append(params["wallet_address"])
+            return FakeResponse({"code": 0, "data": dict(REAL_ROW, wallet_address=params["wallet_address"])})
+        client.session.request = request
+        rows = client.wallet_stats("sol", ["a", "b"], "30d")
+        self.assertEqual(calls, ["a", "b"])                                  # one request per wallet, not one with two
+        self.assertEqual([r["wallet_address"] for r in rows], ["a", "b"])
+        result = gmgn.screen_rows(rows, 30)[0]
+        self.assertEqual(result["verdict"], "copy")
+        self.assertAlmostEqual(result["winrate"], 0.3766)                    # from pnl_stat, not the top level
+        self.assertEqual((result["buys"], result["sells"], result["tokens"]), (608, 792, 293))
+        self.assertEqual(result["hold_hours"], 166.1)
+        self.assertEqual(result["tags"], ["padre", "arbitrager", "fomo"])
+        self.assertIn("38% of tokens won", result["why"])
+        self.assertIn("avg hold 166h", result["why"])
 
 
 class ScreenTests(unittest.TestCase):

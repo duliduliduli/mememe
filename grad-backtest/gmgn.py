@@ -33,6 +33,7 @@ class Gmgn:
             raise GmgnError("GMGN_API_KEY is not set")
         self.host = host.rstrip("/")
         self.timeout = timeout
+        self.pause_seconds = 0.7            # free tier: 5 units/s, wallet_stats weighs 3
         self.session = requests.Session()
 
     # ---- transport ------------------------------------------------------
@@ -71,9 +72,18 @@ class Gmgn:
 
     # ---- endpoints ---------------------------------------------------------
     def wallet_stats(self, chain: str, wallets: list[str], period: str = "30d") -> list[dict[str, Any]]:
-        """Per-wallet realized profit, win rate and trade counts over 7d or 30d."""
-        data = self.request("GET", "/v1/user/wallet_stats", {"chain": chain, "wallet_address": list(wallets), "period": period})
-        return _rows(data)
+        """Per-wallet realized profit, win rate, trade counts, tokens traded and average hold
+        over 7d or 30d. The endpoint answers for one wallet at a time (extra addresses are
+        ignored), so this asks once per wallet, spaced for the free tier's rate limit."""
+        rows: list[dict[str, Any]] = []
+        for i, wallet in enumerate(wallets):
+            if i:
+                time.sleep(self.pause_seconds)
+            data = self.request("GET", "/v1/user/wallet_stats", {"chain": chain, "wallet_address": wallet, "period": period})
+            for row in _rows(data):
+                row.setdefault("wallet_address", wallet)
+                rows.append(row)
+        return rows
 
     def wallet_profits(self, chain: str, wallets: list[str], period: str = "30d") -> list[dict[str, Any]]:
         data = self.request("POST", "/v1/user/wallet_profits", {}, {"chain": chain, "period": period, "wallet_addresses": list(wallets)})
@@ -141,12 +151,15 @@ def screen_rows(rows: list[dict[str, Any]], period_days: int = 30) -> list[dict[
     """Turn wallet_stats rows into a verdict per wallet: copy / skip / thin, with the reason."""
     out = []
     for row in rows:
+        stat = row.get("pnl_stat") if isinstance(row.get("pnl_stat"), dict) else {}
         realized = _num(row, "realized_profit", "realized_pnl_usd")
-        winrate = _num(row, "winrate", "win_rate")
-        buys = int(_num(row, "buy_count", "buy", "history_total_buys"))
-        sells = int(_num(row, "sell_count", "sell", "history_total_sells"))
-        pnl = _num(row, "pnl", "realized_pnl", "total_profit_pnl")
-        cost = _num(row, "total_cost", "cost")
+        winrate = _num(stat, "winrate") or _num(row, "winrate", "win_rate")
+        buys = int(_num(row, "buy", "buy_count", "history_total_buys"))
+        sells = int(_num(row, "sell", "sell_count", "history_total_sells"))
+        pnl = _num(row, "realized_profit_pnl", "pnl", "realized_pnl", "total_profit_pnl")
+        cost = _num(row, "bought_cost", "total_cost", "cost")
+        tokens = int(_num(stat, "token_num"))
+        hold_hours = _num(stat, "avg_holding_period") / 3600.0
         tags = _tags(row)
         per_day = buys / max(1, period_days)
         if buys < THIN_TRADES:
@@ -158,10 +171,11 @@ def screen_rows(rows: list[dict[str, Any]], period_days: int = 30) -> list[dict[
         elif any(t in ("wash_trader", "sandwich_bot", "mev_bot", "bundler", "rat_trader") for t in tags):
             verdict, why = "skip", "tagged " + ", ".join(t for t in tags if t in ("wash_trader", "sandwich_bot", "mev_bot", "bundler", "rat_trader"))
         else:
-            verdict, why = "copy", f"+${realized:,.0f} realized, {winrate:.0%} win rate, {buys} buys / {sells} sells"
+            verdict, why = "copy", (f"+${realized:,.0f} realized ({pnl:+.0%}), {winrate:.0%} of tokens won, "
+                                    f"{buys} buys / {sells} sells over {tokens} tokens, avg hold {hold_hours:.0f}h")
         out.append({"wallet": wallet_of(row), "verdict": verdict, "why": why, "realized_profit": round(realized, 2),
-                    "pnl": round(pnl, 4), "winrate": round(winrate, 4), "buys": buys, "sells": sells,
-                    "total_cost": round(cost, 2), "tags": tags, "period_days": period_days})
+                    "pnl": round(pnl, 4), "winrate": round(winrate, 4), "buys": buys, "sells": sells, "tokens": tokens,
+                    "hold_hours": round(hold_hours, 1), "total_cost": round(cost, 2), "tags": tags, "period_days": period_days})
     return out
 
 
