@@ -297,11 +297,19 @@ class LaneTests(unittest.TestCase):
         calls = []
         ex.poll_graduations = lambda: calls.append("grad")
         ex.manage_watchlist = lambda price: calls.append("watch")
-        ex.poll_copy_wallets = lambda price: calls.append("copy")
+        ex.poll_copy_wallets = lambda price, allow_buys=True: calls.append(("copy", allow_buys))
         ex.sol_price_usd = lambda: SOL
         ex.state["watchlist"] = [{"mint": "x"}]
         ex.run_cycle()
-        self.assertEqual(calls, ["copy"])
+        self.assertEqual(calls, [("copy", True)])
+        # Draining still polls the followed wallets (their sells are followed) but allows no buys.
+        executor.STOP_FLAG.touch()
+        try:
+            calls.clear()
+            ex.run_cycle()
+            self.assertEqual(calls, [("copy", False)])
+        finally:
+            executor.STOP_FLAG.unlink(missing_ok=True)
 
 
 class GuardTests(unittest.TestCase):
@@ -379,10 +387,12 @@ class PollTests(unittest.TestCase):
         self.assertEqual(sorted(e["mint"] for e in self.entered), sorted([mint_dust, mint_first]))
         import csv
         rows = list(csv.DictReader(open(executor.SIGNALS_FILE)))
-        by_mint = {r["mint"]: r for r in rows}
-        self.assertEqual((by_mint[mint_add]["kind"], by_mint[mint_add]["mirrored"], by_mint[mint_add]["reason"]), ("add", "0", "add"))
-        self.assertEqual((by_mint[mint_first]["kind"], by_mint[mint_first]["mirrored"]), ("first", "1"))
-        self.assertEqual(by_mint[mint_add]["pre_pct"], "900.0")
+        statuses = [(r["mint"], r["status"], r["reason"]) for r in rows]
+        self.assertIn((mint_add, "blocked", "add"), statuses)
+        self.assertIn((mint_first, "attempted", "mirrored"), statuses)
+        self.assertIn((mint_first, "failed", "entry_failed"), statuses)     # entry is mocked away: no position appeared
+        self.assertEqual(next(r for r in rows if r["mint"] == mint_add)["pre_pct"], "900.0")
+        self.assertTrue(all(r["signal_id"].startswith(WALLET[:8] + ":") for r in rows))
         # With the rule off, adds are copied too.
         executor2, ex2 = self.make(COPY_MIN_BUY_USD="50", COPY_FIRST_BUY_ONLY="0")
         self.sigs = [{"signature": "old1", "blockTime": now - 600}]
@@ -398,7 +408,8 @@ class PollTests(unittest.TestCase):
         now = int(executor.now_ts())
         self.sigs = [{"signature": "base", "blockTime": now - 600}]
         ex.poll_copy_wallets(SOL)
-        ex.state["positions"] = [{"mint": MINT, "tokens": 10, "position_usd": 5.0, "opened_ts": now, "copy": WALLET, "peak_usd": 5.0}]
+        ex.state["positions"] = [{"mint": MINT, "tokens": 10, "position_usd": 5.0, "opened_ts": now - 1800, "copy": WALLET,
+                                  "peak_usd": 5.0, "buy_signature": "ours"}]
         closed = []
         ex.close_position = lambda pos, reason, sol_price: closed.append(reason)
         self.sigs = [{"signature": "oldsell", "blockTime": now - 900}, {"signature": "oldbuy", "blockTime": now - 900}] + self.sigs
@@ -425,10 +436,31 @@ class PollTests(unittest.TestCase):
         ex.state["copy_polled_ts"] = 0
         ex.poll_copy_wallets(SOL)
         self.assertEqual(self.entered, [])
-        self.assertNotIn("flaky", ex.state["copy_seen"][WALLET])      # forgotten so the next poll retries
+        self.assertIn("flaky", ex.state["copy_unresolved"])            # durable, with a retry time
+        self.assertEqual(ex.state["copy_unresolved"]["flaky"]["attempts"], 1)
+        ex.state["copy_polled_ts"] = 0
+        ex.poll_copy_wallets(SOL)
+        self.assertEqual(self.entered, [])                              # not due yet (backoff)
+        ex.state["copy_unresolved"]["flaky"]["next_ts"] = 0
         ex.state["copy_polled_ts"] = 0
         ex.poll_copy_wallets(SOL)
         self.assertEqual([e["mint"] for e in self.entered], [MINT])
+        self.assertNotIn("flaky", ex.state["copy_unresolved"])
+
+    def test_missing_transaction_is_unresolved_then_parked_as_failed(self):
+        executor, ex = self.make(COPY_MAX_DECODE_ATTEMPTS="3")
+        now = int(executor.now_ts())
+        self.sigs = [{"signature": "base", "blockTime": now - 600}]
+        ex.poll_copy_wallets(SOL)
+        self.sigs = [{"signature": "ghost", "blockTime": now}] + self.sigs      # rpc returns None for it
+        for _ in range(3):
+            ex.state["copy_polled_ts"] = 0
+            for e in ex.state.get("copy_unresolved", {}).values():
+                e["next_ts"] = 0
+            ex.poll_copy_wallets(SOL)
+        self.assertNotIn("ghost", ex.state.get("copy_unresolved", {}))
+        self.assertEqual([f["signature"] for f in ex.state["copy_failed"]], ["ghost"])
+        self.assertEqual(ex.state["copy_failed"][0]["attempts"], 3)
 
     def test_pages_back_after_an_outage(self):
         executor, ex = self.make(COPY_MIN_BUY_USD="50")
@@ -467,7 +499,7 @@ class PollTests(unittest.TestCase):
         now = int(executor.now_ts())
         self.sigs = [{"signature": "base", "blockTime": now - 600}]
         ex.poll_copy_wallets(SOL)
-        ex.state["gmgn_verdicts"] = {WALLET: {"verdict": "skip", "why": "lost $800 in 30d", "evaluated_at": "t"}}
+        ex.state["gmgn_verdicts"] = {WALLET: {"verdict": "skip", "why": "lost $800 in 30d", "evaluated_at": executor.utc_iso()}}
         self.sigs = [{"signature": "b1", "blockTime": now}] + self.sigs
         self.txs["b1"] = tx(10.0, 5.0, 0, 9_000_000)
         ex.state["copy_polled_ts"] = 0
@@ -483,7 +515,109 @@ class PollTests(unittest.TestCase):
         ex.poll_copy_wallets(SOL)
         self.assertEqual(len(self.entered), 1)                # enforce: blocked
         rows = list(csv.DictReader(open(executor.SIGNALS_FILE)))
-        self.assertEqual(rows[-1]["reason"], "gmgn_skip")
+        self.assertEqual((rows[-1]["status"], rows[-1]["reason"]), ("blocked", "gmgn_skip"))
+        # A stale verdict is treated as unknown even in enforce mode.
+        ex.state["gmgn_verdicts"][WALLET]["evaluated_at"] = "2026-01-01T00:00:00Z"
+        self.sigs = [{"signature": "b3", "blockTime": now}] + self.sigs
+        self.txs["b3"] = tx(10.0, 5.0, 0, 9_000_000, mint="Third" + "1" * 37)
+        ex.state["copy_polled_ts"] = 0
+        ex.poll_copy_wallets(SOL)
+        self.assertEqual(len(self.entered), 2)
+
+    def test_draining_follows_sells_but_opens_nothing(self):
+        executor, ex = self.make(COPY_MIN_BUY_USD="50")
+        now = int(executor.now_ts())
+        self.sigs = [{"signature": "base", "blockTime": now - 600}]
+        ex.poll_copy_wallets(SOL)
+        ex.state["positions"] = [{"mint": MINT, "tokens": 10, "position_usd": 5.0, "opened_ts": now - 600, "copy": WALLET,
+                                  "peak_usd": 5.0, "buy_signature": "ours"}]
+        closed = []
+        ex.close_position = lambda pos, reason, sol_price: closed.append(reason)
+        self.sigs = [{"signature": "sell1", "blockTime": now}, {"signature": "buy1", "blockTime": now}] + self.sigs
+        self.txs["sell1"] = tx(5.0, 9.0, 9_000_000, 0)
+        self.txs["buy1"] = tx(10.0, 5.0, 0, 9_000_000, mint="Other" + "1" * 37)
+        ex.state["copy_polled_ts"] = 0
+        ex.poll_copy_wallets(SOL, allow_buys=False)
+        self.assertEqual(closed, ["copy_sell"])
+        self.assertEqual(self.entered, [])
+        import csv
+        rows = list(csv.DictReader(open(executor.SIGNALS_FILE)))
+        self.assertEqual((rows[-1]["status"], rows[-1]["reason"]), ("blocked", "draining"))
+
+    def test_sale_from_an_earlier_episode_does_not_close_a_newer_entry(self):
+        executor, ex = self.make()
+        now = int(executor.now_ts())
+        self.sigs = [{"signature": "base", "blockTime": now - 600}]
+        ex.poll_copy_wallets(SOL)
+        ex.state["positions"] = [{"mint": MINT, "tokens": 10, "position_usd": 5.0, "opened_ts": now - 60, "copy": WALLET,
+                                  "peak_usd": 5.0, "buy_signature": "ours"}]
+        closed = []
+        ex.close_position = lambda pos, reason, sol_price: closed.append(reason)
+        self.sigs = [{"signature": "oldsale", "blockTime": now - 300}] + self.sigs      # they sold 5 minutes ago, we entered 1 minute ago
+        self.txs["oldsale"] = tx(5.0, 9.0, 9_000_000, 0)
+        ex.state["copy_polled_ts"] = 0
+        ex.poll_copy_wallets(SOL)
+        self.assertEqual(closed, [])
+        # An adopted position has no known acquisition time: the sale is applied.
+        ex.state["positions"] = [{"mint": MINT, "tokens": 10, "position_usd": 5.0, "opened_ts": now - 60,
+                                  "peak_usd": 5.0, "buy_signature": "adopted", "adopted": True}]
+        self.sigs = [{"signature": "oldsale2", "blockTime": now - 300}] + self.sigs
+        self.txs["oldsale2"] = tx(5.0, 9.0, 9_000_000, 0)
+        ex.state["copy_polled_ts"] = 0
+        ex.poll_copy_wallets(SOL)
+        self.assertEqual(closed, ["copy_sell"])
+
+    def test_failed_copied_exit_is_kept_and_retried_until_done(self):
+        executor, ex = self.make(COPY_MAX_EXIT_ATTEMPTS="3")
+        now = int(executor.now_ts())
+        self.sigs = [{"signature": "base", "blockTime": now - 600}]
+        ex.poll_copy_wallets(SOL)
+        ex.state["positions"] = [{"mint": MINT, "tokens": 1000, "position_usd": 10.0, "last_value_usd": 10.0, "opened_ts": now - 600,
+                                  "copy": WALLET, "peak_usd": 10.0, "buy_signature": "ours"}]
+        attempts = []
+        def scale_out(pos, sol_price, frac=None, reason=""):
+            attempts.append(round(frac, 2))
+            if len(attempts) < 2:
+                raise RuntimeError("Jupiter 429")
+            pos["tokens"] = int(pos["tokens"] * (1 - frac))
+        ex.scale_out = scale_out
+        self.sigs = [{"signature": "trim", "blockTime": now}] + self.sigs
+        self.txs["trim"] = tx(5.0, 6.0, 10_000_000, 7_000_000)          # they trimmed 30%
+        ex.state["copy_polled_ts"] = 0
+        ex.poll_copy_wallets(SOL)
+        self.assertEqual(attempts, [0.3])
+        self.assertEqual(len(ex.state["copy_pending_exits"]), 1)         # kept for retry
+        ex.state["copy_pending_exits"][0]["next_ts"] = 0
+        ex.state["copy_polled_ts"] = 0
+        ex.poll_copy_wallets(SOL)
+        self.assertEqual(attempts, [0.3, 0.3])
+        self.assertEqual(ex.state["copy_pending_exits"], [])              # done and cleared
+        self.assertEqual(ex.state["positions"][0]["tokens"], 700)
+        ex.state["copy_polled_ts"] = 0
+        ex.poll_copy_wallets(SOL)
+        self.assertEqual(attempts, [0.3, 0.3])                            # never replayed
+
+    def test_backfill_cursor_survives_a_backlog_longer_than_three_pages(self):
+        executor, ex = self.make(COPY_MIN_BUY_USD="50", COPY_DECODE_BUDGET="1000")
+        now = int(executor.now_ts())
+        self.sigs = [{"signature": "base", "blockTime": now - 600}]
+        ex.poll_copy_wallets(SOL)
+        backlog = [{"signature": f"n{i:03d}", "blockTime": now - i} for i in range(420)]    # 420 unseen, newest first
+        def page(before):
+            if before is None:
+                return backlog[:100]
+            idx = next(i for i, r in enumerate(backlog) if r["signature"] == before)
+            rows = backlog[idx + 1: idx + 101]
+            return rows if rows else [{"signature": "base", "blockTime": now - 600}]
+        ex.rpc.call = lambda method, params, timeout=None: list(page(params[1].get("before")))
+        ex.state["copy_polled_ts"] = 0
+        ex.poll_copy_wallets(SOL)
+        self.assertEqual(ex.state["copy_backfill"][WALLET], "n299")       # three pages read, cursor kept
+        for _ in range(3):
+            ex.state["copy_polled_ts"] = 0
+            ex.poll_copy_wallets(SOL)
+        self.assertNotIn(WALLET, ex.state["copy_backfill"])                # reached known ground
+        self.assertIn("n419", ex.state["copy_seen"][WALLET])
 
     def test_first_poll_mirrors_a_buy_made_during_restart(self):
         executor, ex = self.make(COPY_MIN_BUY_USD="50")
