@@ -898,6 +898,17 @@ class RotateTests(unittest.TestCase):
         self.assertFalse(ex.rotate_for_copy("New", SOL))
         self.assertEqual(self.closed, [])
 
+    def test_daily_loss_limit_off_by_default_never_pauses(self):
+        executor, ex = self.make()
+        self.assertEqual(ex.cfg.daily_loss_limit_usd, 0.0)
+        ex.state["daily"]["realized_pnl_usd"] = -500.0
+        self.assertGreater(executor.position_size_usd(ex.cfg, 200.0, 0, -500.0), 0.0)
+        ex.state["positions"].pop(0)
+        self.assertTrue(ex.rotate_for_copy("New", SOL))
+        executor, ex = self.make(DAILY_LOSS_LIMIT_USD="25")
+        self.assertEqual(executor.position_size_usd(ex.cfg, 200.0, 0, -29.4), 0.0)
+        self.assertGreater(executor.position_size_usd(ex.cfg, 200.0, 0, -24.0), 0.0)
+
     def test_copy_only_counts_adopted_positions_and_rotates_them_first(self):
         executor, ex = self.make(MAX_CONCURRENT_POSITIONS="3", COPY_ONLY="1")   # 3 held including the adopted bag
         self.assertTrue(ex.cfg.copy_only)
