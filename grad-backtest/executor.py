@@ -1108,7 +1108,13 @@ def position_size_usd(cfg: Config, equity_usd: float, open_positions: int, daily
     if daily_pnl <= -cfg.daily_loss_limit_usd:
         return 0.0
     size = min(equity_usd * cfg.account_fraction, cfg.max_position_usd)
-    if size < cfg.min_position_usd or size > equity_usd:
+    if size < cfg.min_position_usd:
+        # A small account trades at the minimum position rather than not at all, as long as
+        # that minimum still fits inside the deployable share of the account.
+        if cfg.min_position_usd > equity_usd * cfg.max_deployed_fraction:
+            return 0.0
+        size = cfg.min_position_usd
+    if size > equity_usd:
         return 0.0
     return round(size, 2)
 
@@ -2963,7 +2969,7 @@ class Executor:
         size_usd = position_size_usd(self.cfg, equity, open_slots, daily_pnl)
         if size_usd <= 0:
             base = equity * self.cfg.account_fraction
-            why = (f"{self.cfg.account_fraction:.0%} of ${equity:,.2f} equity = ${base:,.2f} < ${self.cfg.min_position_usd:,.2f} minimum position"
+            why = (f"${self.cfg.min_position_usd:,.2f} minimum position does not fit in {self.cfg.max_deployed_fraction:.0%} of ${equity:,.2f} equity"
                    if base < self.cfg.min_position_usd and open_slots < self.cfg.max_concurrent
                    else f"sizing guards (open={open_slots}/{self.cfg.max_concurrent}, daily_pnl={daily_pnl:.2f})")
             self.skip(mint, why)

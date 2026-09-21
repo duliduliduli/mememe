@@ -35,7 +35,8 @@ class ExecutorTests(unittest.TestCase):
         cfg = self.cfg  # fraction 0.10, max $20, min $5, max 5 concurrent, daily limit $30
         self.assertEqual(f(cfg, 100.0, 0, 0.0), 10.0)
         self.assertEqual(f(cfg, 1000.0, 0, 0.0), 20.0)      # capped by MAX_POSITION_USD
-        self.assertEqual(f(cfg, 30.0, 0, 0.0), 0.0)          # below MIN_POSITION_USD
+        self.assertEqual(f(cfg, 30.0, 0, 0.0), 5.0)          # 10% is $3: a small account trades the $5 minimum
+        self.assertEqual(f(cfg, 6.0, 0, 0.0), 0.0)           # $5 does not fit in the deployable share of $6
         self.assertEqual(f(cfg, 100.0, 4, 0.0), 10.0)        # one slot remains
         self.assertEqual(f(cfg, 100.0, 5, 0.0), 0.0)         # concurrency cap
         self.assertEqual(f(cfg, 100.0, 0, -31.0), 0.0)       # daily loss limit hit
