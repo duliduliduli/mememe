@@ -227,16 +227,25 @@ class WalletValidationTests(unittest.TestCase):
         self.assertTrue(executor.valid_solana_address(WALLET))
         self.assertFalse(executor.valid_solana_address("9BMzTpSoShort"))
 
-    def test_sizing_skip_says_the_account_is_too_small(self):
+    def test_small_account_trades_at_the_minimum_position(self):
         executor, p = fresh(PAPER_BALANCE_USD="45")
         self.addCleanup(p.stop)
         ex = executor.Executor(executor.Config())
-        ex.state["paper_balance_usd"] = 45.0                      # 8% of $45 is $3.60, under the $5 minimum
-        skipped = []
+        ex.state["paper_balance_usd"] = 45.0                      # 8% of $45 is $3.60: trade the $5 minimum instead
+        quotes, skipped = [], []
+        ex.jup.quote = lambda *a, **k: (quotes.append(a), {"outAmount": str(a[2]), "priceImpactPct": "0.01"})[1]   # 1:1 both ways
         ex.skip = lambda mint, reason: skipped.append(reason)
         import time as _time
         ex.try_enter({"mint": MINT, "graduated_ts": _time.time(), "enter_at": _time.time(), "copy": WALLET, "copy_buy_usd": 500}, SOL)
-        self.assertIn("$3.60 < $5.00 minimum position", skipped[0])
+        self.assertEqual(skipped, [])
+        self.assertAlmostEqual(quotes[0][2] / 1e9 * SOL, 5.0, places=2)
+        self.assertEqual(executor.position_size_usd(ex.cfg, 45.0, 0, 0.0), 5.0)
+        self.assertEqual(executor.position_size_usd(ex.cfg, 6.0, 0, 0.0), 0.0)      # $5 does not fit in 80% of $6
+        ex.state["positions"] = []
+        ex.state["paper_balance_usd"] = 6.0
+        quotes.clear()
+        ex.try_enter({"mint": "Other", "graduated_ts": _time.time(), "enter_at": _time.time(), "copy": WALLET, "copy_buy_usd": 500}, SOL)
+        self.assertIn("minimum position does not fit", skipped[0])
 
 
 class PanicOnStartTests(unittest.TestCase):
