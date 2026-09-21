@@ -262,6 +262,10 @@ class Config:
         self.take_profit = float(os.getenv("TAKE_PROFIT", "0.75"))
         self.stop_loss = float(os.getenv("STOP_LOSS", "0.30"))
         self.trailing_stop = float(os.getenv("TRAILING_STOP", "0"))  # fraction off peak; 0 disables
+        # The trailing stop only arms once the position has been up at least this much; before
+        # that a small pop followed by an ordinary pullback is left to the stop loss, instead of
+        # selling a coin at -18% because it was briefly +12% (every lane, every trailing stop).
+        self.trailing_arm_gain = float(os.getenv("TRAILING_ARM_GAIN", "0.30"))
         # Never sell the whole position: a slice stays in the wallet in case the token runs
         # after the exit. MOON_BAG=0 restores full exits.
         # 10% of a winning exit is the lottery ticket: 28 bags kept from losing exits in one
@@ -1174,7 +1178,8 @@ def decide_exit(
         return "take_profit"
     if current_usd <= entry_usd * (1.0 - cfg.stop_loss):
         return "stop_loss"
-    if cfg.trailing_stop > 0 and peak_usd and current_usd <= peak_usd * (1.0 - cfg.trailing_stop):
+    armed = bool(peak_usd) and peak_usd >= entry_usd * (1.0 + float(getattr(cfg, "trailing_arm_gain", 0.0) or 0.0))
+    if cfg.trailing_stop > 0 and armed and current_usd <= peak_usd * (1.0 - cfg.trailing_stop):
         return "trailing_stop"
     if now - opened_ts >= cfg.time_stop_minutes * 60:
         return "time_stop"
@@ -4154,7 +4159,8 @@ class Executor:
             f"{'fast' if self.cfg.copy_fast else 'full-checks'} {'follow-sells' if self.cfg.copy_follow_sells else 'own-exits'} "
             f"{'rotate' if self.cfg.copy_rotate else 'no-rotate'} {'first-buys-only' if self.cfg.copy_first_buy_only else 'first-buys+adds'} "
             f"ladder={ladder_text(self.cfg.copy_ladder)} "
-            f"tp=+{self.cfg.copy_take_profit:.0%} sl=-{self.cfg.copy_stop_loss:.0%} trail={self.cfg.copy_trailing_stop:.0%} "
+            f"tp=+{self.cfg.copy_take_profit:.0%} sl=-{self.cfg.copy_stop_loss:.0%} trail={self.cfg.copy_trailing_stop:.0%}"
+            f"(armed at +{self.cfg.trailing_arm_gain:.0%}) "
             f"time_stop={self.cfg.copy_time_stop_minutes:.0f}m) "
             f"curve_age>={self.cfg.min_curve_age_seconds:.0f}s top_holder<={self.cfg.max_top_holder_pct:.0f}% "
             f"curve_txs>={self.cfg.min_curve_transactions} early_sell<={self.cfg.max_early_sell_pct:.0f}% "
