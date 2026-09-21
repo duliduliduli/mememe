@@ -49,6 +49,20 @@ class ExecutorTests(unittest.TestCase):
         self.assertEqual(d(10.0, 10.5, 0, 30 * 60 + 1, cfg), "time_stop")
         self.assertIsNone(d(10.0, 10.5, 0, 60, cfg))
 
+    def test_trailing_stop_arms_only_after_the_position_was_up_enough(self):
+        d = self.executor.decide_exit
+        cfg = self.cfg
+        cfg.trailing_stop = 0.25
+        cfg.trailing_arm_gain = 0.30
+        # CALI: peaked +12.6%, then fell 27% off that peak (-18% net). Not armed: no exit.
+        self.assertIsNone(d(18.21, 14.96, 0, 60, cfg, peak_usd=20.51))
+        # Same fall past the stop loss is still caught by the stop loss.
+        self.assertEqual(d(18.21, 12.5, 0, 60, cfg, peak_usd=20.51), "stop_loss")
+        # Up 35% at the peak, then 27% off it: armed, trailing stop fires.
+        self.assertEqual(d(10.0, 9.85, 0, 60, cfg, peak_usd=13.5), "trailing_stop")
+        cfg.trailing_arm_gain = 0.0                                  # 0 arms from entry (the old behaviour)
+        self.assertEqual(d(18.21, 14.96, 0, 60, cfg, peak_usd=20.51), "trailing_stop")
+
     def test_state_roundtrip_and_daily_roll(self):
         state = self.executor.load_state(self.cfg)
         self.assertEqual(state["paper_balance_usd"], 100.0)

@@ -99,6 +99,7 @@ class Config:
         self.take_profit = float(env("COPY_TAKE_PROFIT", "0.75"))
         self.stop_loss = float(env("COPY_STOP_LOSS", "0.30"))
         self.trailing_stop = float(env("COPY_TRAILING_STOP", "0.25"))
+        self.trailing_arm_gain = float(env("TRAILING_ARM_GAIN", "0.30"))
         self.time_stop_minutes = float(env("COPY_TIME_STOP_MINUTES", "1440"))
         self.moon_bag = float(env("MOON_BAG", "0.10"))
         self.moon_bag_target_x = float(env("MOON_BAG_TARGET_X", "100"))
@@ -117,7 +118,7 @@ class Config:
         if pos.get("ladder"):
             tp = max(tp, max(r["x"] for r in pos["ladder"]) - 1.0)
         return SimpleNamespace(take_profit=tp, stop_loss=self.stop_loss, trailing_stop=self.trailing_stop,
-                               time_stop_minutes=self.time_stop_minutes)
+                               trailing_arm_gain=self.trailing_arm_gain, time_stop_minutes=self.time_stop_minutes)
 
 
 def roll_daily(state: dict[str, Any]) -> None:

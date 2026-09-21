@@ -179,6 +179,12 @@ class ExitTests(unittest.TestCase):
         self.ln.poll_wallets()
         self.pos = self.ln.state["positions"][0]
 
+    def test_exit_cfg_carries_the_trailing_arm_gain(self):
+        cfg = self.ln.cfg.exit_cfg(self.pos)
+        self.assertAlmostEqual(cfg.trailing_arm_gain, 0.30)
+        self.assertIsNone(self.lane.decide_exit(18.21, 14.96, 0, 60, cfg, 20.51))     # +12.6% peak: not armed
+        self.assertEqual(self.lane.decide_exit(10.0, 9.85, 0, 60, cfg, 13.5), "trailing_stop")
+
     def test_ladder_phases_out_then_closes(self):
         entry_tokens = self.pos["tokens"]
         self.price["v"] *= 2.1
