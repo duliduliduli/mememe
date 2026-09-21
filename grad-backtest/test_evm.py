@@ -28,7 +28,8 @@ class FakeRpc:
         self.head = 1000
         self.logs_by_block = []            # list of logs
         self.balances = {WALLET: int(1e18)}
-        self.token_balances = {}           # (owner) -> token balance; anyone else holds plenty
+        self.token_balances = {}           # owner -> token balance; our own wallet holds plenty, others what tests set
+        self.our = ""
 
     def block_number(self):
         return self.head
@@ -57,7 +58,9 @@ class FakeRpc:
         return 18
 
     def erc20_balance(self, token, owner):
-        return self.token_balances.get(owner, 10**30)
+        if owner in self.token_balances:
+            return self.token_balances[owner]
+        return 10**30 if owner == self.our else 0
 
 
 class FakeRouter:
@@ -94,6 +97,7 @@ def make_lane(**env):
     lane, patcher = fresh(**env)
     ln = lane.Lane(lane.Config())
     rpc = FakeRpc()
+    rpc.our = ln.address
     ln.rpcs["base"] = rpc
     price = {"v": 1e-6}                    # 1 token = 0.000001 ETH  ($0.003)
     ln.routers["base"] = FakeRouter(price)
@@ -139,6 +143,18 @@ class WatchTests(unittest.TestCase):
         self.ln.poll_wallets()
         self.assertEqual(self.ln.state["positions"], [])
         self.assertEqual(self.ln.state["bags"][0]["symbol"], "TOK")   # moon bag kept
+
+    def test_add_on_buys_are_not_mirrored(self):
+        self.rpc.token_balances[WALLET] = 300_000 * 10**18                # it already holds 200k when 100k arrives
+        self.rpc.logs_by_block = [transfer_log(TOKEN, OTHER, WALLET, 100_000 * 10**18, 999, "0xadd")]
+        self.ln.poll_wallets()
+        self.assertEqual(self.ln.state["positions"], [])
+        self.rpc.token_balances[WALLET] = 100_000 * 10**18                # a fresh stack: first buy
+        self.rpc.head = 1005
+        self.rpc.logs_by_block.append(transfer_log(TOKEN, OTHER, WALLET, 100_000 * 10**18, 1004, "0xfirst"))
+        self.ln._last_poll = 0
+        self.ln.poll_wallets()
+        self.assertEqual(len(self.ln.state["positions"]), 1)
 
     def test_followed_partial_sell_trims_ours_by_the_same_share(self):
         self.rpc.logs_by_block = [transfer_log(TOKEN, OTHER, WALLET, 100_000 * 10**18, 999, "0xbuy")]

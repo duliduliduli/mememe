@@ -91,6 +91,8 @@ class Config:
         self.copy_max_tx_age_seconds = float(env("COPY_MAX_TX_AGE_SECONDS", "90"))
         self.copy_poll_seconds = max(1.0, float(env("COPY_POLL_SECONDS", "3")))
         self.copy_follow_sells = env("COPY_FOLLOW_SELLS", "1") == "1"
+        self.copy_first_buy_only = env("COPY_FIRST_BUY_ONLY", "1") == "1"
+        self.copy_add_dust_ratio = float(env("COPY_ADD_DUST_RATIO", "0.02"))
         self.copy_full_sell_fraction = float(env("COPY_FULL_SELL_FRACTION", "0.8"))
         self.copy_rotate = env("COPY_ROTATE", "0") == "1"
         self.copy_ladder = parse_sell_ladder(env("COPY_LADDER", "1.4:40,1.8:30,3:30"))
@@ -396,6 +398,18 @@ class Lane:
         if usd < minimum:
             log(f"COPY {key} {wallet[:8]} bought {symbol} for ~${usd:,.0f} < ${minimum:,.0f} minimum; ignored")
             return
+        if cfg.copy_first_buy_only:
+            # The wallet's stack before this buy is its balance now minus what just arrived.
+            try:
+                pre = self.rpcs[key].erc20_balance(token, wallet) - tokens_bought
+            except Exception as exc:
+                log(f"COPY {key} {wallet[:8]} bought {symbol} (~${usd:,.0f}); cannot tell a first buy from an add "
+                    f"({describe_error(exc)}); ignored")
+                return
+            if pre > tokens_bought * cfg.copy_add_dust_ratio:
+                log(f"COPY {key} {wallet[:8]} bought {symbol} (~${usd:,.0f}): adding to a coin it holds "
+                    f"(held {pre / tokens_bought:.0%} of what it just bought); not a first buy; ignored")
+                return
         if any(p["chain"] == key and p["token"].lower() == token.lower() for p in self.state["positions"]):
             log(f"COPY {key} {wallet[:8]} bought {symbol} (~${usd:,.0f}); already held")
             return

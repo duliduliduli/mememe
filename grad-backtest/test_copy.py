@@ -363,6 +363,36 @@ class PollTests(unittest.TestCase):
         self.assertEqual(len(self.entered), 3)
         self.assertEqual(sum(1 for s in ex.state["copy_seen"][WALLET] if s.startswith("b")), 25)
 
+    def test_only_first_buys_are_mirrored_and_every_signal_is_recorded(self):
+        executor, ex = self.make(COPY_MIN_BUY_USD="50")
+        now = int(executor.now_ts())
+        self.sigs = [{"signature": "old1", "blockTime": now - 600}]
+        ex.poll_copy_wallets(SOL)
+        mint_add, mint_dust, mint_first = ("Add" + "1" * 39, "Dust" + "1" * 38, "First" + "1" * 37)
+        self.sigs = [{"signature": "b_first", "blockTime": now}, {"signature": "b_dust", "blockTime": now},
+                     {"signature": "b_add", "blockTime": now}, {"signature": "old1", "blockTime": now - 600}]
+        self.txs["b_add"] = tx(10.0, 5.0, 9_000_000, 10_000_000, mint=mint_add)      # held 9M, bought 1M: an add
+        self.txs["b_dust"] = tx(10.0, 5.0, 10_000, 1_010_000, mint=mint_dust)        # 1% dust left over: a first buy
+        self.txs["b_first"] = tx(10.0, 5.0, 0, 1_000_000, mint=mint_first)
+        ex.state["copy_polled_ts"] = 0
+        ex.poll_copy_wallets(SOL)
+        self.assertEqual(sorted(e["mint"] for e in self.entered), sorted([mint_dust, mint_first]))
+        import csv
+        rows = list(csv.DictReader(open(executor.SIGNALS_FILE)))
+        by_mint = {r["mint"]: r for r in rows}
+        self.assertEqual((by_mint[mint_add]["kind"], by_mint[mint_add]["mirrored"], by_mint[mint_add]["reason"]), ("add", "0", "add"))
+        self.assertEqual((by_mint[mint_first]["kind"], by_mint[mint_first]["mirrored"]), ("first", "1"))
+        self.assertEqual(by_mint[mint_add]["pre_pct"], "900.0")
+        # With the rule off, adds are copied too.
+        executor2, ex2 = self.make(COPY_MIN_BUY_USD="50", COPY_FIRST_BUY_ONLY="0")
+        self.sigs = [{"signature": "old1", "blockTime": now - 600}]
+        ex2.poll_copy_wallets(SOL)
+        self.sigs = [{"signature": "b_add", "blockTime": now}, {"signature": "old1", "blockTime": now - 600}]
+        self.txs["b_add"] = tx(10.0, 5.0, 9_000_000, 10_000_000, mint=mint_add)
+        ex2.state["copy_polled_ts"] = 0
+        ex2.poll_copy_wallets(SOL)
+        self.assertEqual([e["mint"] for e in self.entered], [mint_add])
+
     def test_first_poll_mirrors_a_buy_made_during_restart(self):
         executor, ex = self.make(COPY_MIN_BUY_USD="50")
         now = int(executor.now_ts())

@@ -376,6 +376,12 @@ class Config:
         # six hours, each paying the buy and sell slippage on a coin that did not move.
         self.copy_min_buy_usd = float(os.getenv("COPY_MIN_BUY_USD", "300"))
         self.copy_follow_sells = os.getenv("COPY_FOLLOW_SELLS", "1") == "1"
+        # Mirror only a wallet's FIRST buy of a coin (its stack before the swap was empty, or
+        # dust under COPY_ADD_DUST_RATIO of what it just bought). A buy into a coin it already
+        # holds is an add, usually averaging down, and is logged but not copied. A wallet that
+        # sold out completely and buys again starts a new episode and is copied again.
+        self.copy_first_buy_only = os.getenv("COPY_FIRST_BUY_ONLY", "1") == "1"
+        self.copy_add_dust_ratio = float(os.getenv("COPY_ADD_DUST_RATIO", "0.02"))
         # A followed wallet selling at least this share of its stack closes our position; a
         # smaller sale trims ours by the same share (a trim worth under a dollar is skipped).
         self.copy_full_sell_fraction = float(os.getenv("COPY_FULL_SELL_FRACTION", "0.8"))
@@ -565,6 +571,16 @@ def record_trade(row: dict[str, Any]) -> None:
     _append_row(TRADES_FILE, TRADE_COLUMNS, row)
 
 
+SIGNALS_FILE = DATA_DIR / "copy_signals.csv"
+SIGNAL_COLUMNS = ["timestamp", "wallet", "mint", "kind", "usd", "pre_pct", "mirrored", "reason", "signature"]
+
+
+def record_copy_signal(row: dict[str, Any]) -> None:
+    """Every qualifying buy a followed wallet made, whether we mirrored it or not and why:
+    the forward record that says whether first buys beat adds under our own exits."""
+    _append_row(SIGNALS_FILE, SIGNAL_COLUMNS, {"timestamp": utc_iso(), **row})
+
+
 def record_skip(mint: str, reason: str, meta: dict[str, Any] | None = None) -> None:
     """Audit trail of everything the bot passed on, why, and what was known at the time, so a
     day of skips can be scored against what the tokens did next."""
@@ -710,7 +726,7 @@ def wallet_swap_from_transaction(tx: dict[str, Any], wallet: str) -> dict[str, A
     held = before.get(mint, 0)
     if delta > 0 and (paid_sol > 0 or paid_stable > 0):
         return {"side": "buy", "mint": mint, "tokens": delta, "sol": paid_sol, "stable_usd": paid_stable,
-                "held_before": held > 0}
+                "held_before": held > 0, "pre_tokens": held}
     if delta < 0 and (sol_delta > 0 or stable_delta > 0):
         return {"side": "sell", "mint": mint, "tokens": -delta, "sol": max(sol_delta, 0.0), "stable_usd": max(stable_delta, 0.0),
                 "fraction": min(1.0, -delta / held) if held > 0 else 1.0}
@@ -2731,13 +2747,26 @@ class Executor:
                 if usd < minimum:
                     log(f"COPY {wallet[:8]} bought {mint} for ${usd:,.0f} < ${minimum:,.0f} minimum; ignored")
                     continue
+                pre, bought = int(swap.get("pre_tokens") or 0), int(swap.get("tokens") or 0)
+                pre_pct = pre / bought * 100 if bought > 0 else 0.0
+                is_add = bought > 0 and pre > bought * cfg.copy_add_dust_ratio
+                kind = "add" if is_add else "first"
+                signal = {"wallet": wallet, "mint": mint, "kind": kind, "usd": round(usd), "pre_pct": round(pre_pct, 1), "signature": sig}
+                if is_add and cfg.copy_first_buy_only:
+                    log(f"COPY {wallet[:8]} bought {mint} for ${usd:,.0f}: adding to a coin it holds "
+                        f"(held {pre_pct:.0f}% of what it just bought); not a first buy; ignored")
+                    record_copy_signal({**signal, "mirrored": 0, "reason": "add"})
+                    continue
                 if any(p.get("mint") == mint for p in self.state["positions"]) or any(p.get("mint") == mint for p in self.pending):
                     log(f"COPY {wallet[:8]} bought {mint} (${usd:,.0f}); already held or pending")
+                    record_copy_signal({**signal, "mirrored": 0, "reason": "already_held"})
                     continue
                 if not self.rotate_for_copy(mint, sol_price):
+                    record_copy_signal({**signal, "mirrored": 0, "reason": "no_slot"})
                     continue
-                kind = "adding to a coin it holds" if swap.get("held_before") else "first buy of this coin"
-                log(f"COPY {wallet[:8]} bought {mint} for ${usd:,.0f} ({kind}); mirroring")
+                label = "adding to a coin it holds" if is_add else ("first buy of this coin" if pre == 0 else f"first buy (dust {pre_pct:.1f}% left over)")
+                log(f"COPY {wallet[:8]} bought {mint} for ${usd:,.0f} ({label}); mirroring")
+                record_copy_signal({**signal, "mirrored": 1, "reason": "mirrored"})
                 self.enter_with_retry({"mint": mint, "graduated_ts": int(block_time or now_ts()), "enter_at": now_ts(),
                                        "copy": wallet, "copy_buy_usd": round(usd),
                                        "copy_size": cfg.copy_wallet_size.get(wallet, 1.0)}, sol_price)
@@ -3836,7 +3865,7 @@ class Executor:
             f"time_stop={self.cfg.runner_time_stop_minutes:.0f}m) "
             f"copy={'only,' if self.cfg.copy_only else ''}{len(self.cfg.copy_wallets)}wallets(min${self.cfg.copy_min_buy_usd:,.0f} "
             f"{'fast' if self.cfg.copy_fast else 'full-checks'} {'follow-sells' if self.cfg.copy_follow_sells else 'own-exits'} "
-            f"{'rotate' if self.cfg.copy_rotate else 'no-rotate'} "
+            f"{'rotate' if self.cfg.copy_rotate else 'no-rotate'} {'first-buys-only' if self.cfg.copy_first_buy_only else 'first-buys+adds'} "
             f"ladder={ladder_text(self.cfg.copy_ladder)} "
             f"tp=+{self.cfg.copy_take_profit:.0%} sl=-{self.cfg.copy_stop_loss:.0%} trail={self.cfg.copy_trailing_stop:.0%} "
             f"time_stop={self.cfg.copy_time_stop_minutes:.0f}m) "
