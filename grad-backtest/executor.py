@@ -381,6 +381,14 @@ class Config:
         # holds is an add, usually averaging down, and is logged but not copied. A wallet that
         # sold out completely and buys again starts a new episode and is copied again.
         self.copy_first_buy_only = os.getenv("COPY_FIRST_BUY_ONLY", "1") == "1"
+        # Whose sells we follow for a position: "any" followed wallet selling the coin (the
+        # original instruction: if an address sells a token we hold, sell it), or only the
+        # "source" wallet whose buy we copied (adopted positions then rely on their own exits).
+        self.copy_sell_scope = os.getenv("COPY_SELL_SCOPE", "any").strip().lower()
+        # GMGN wallet verdicts as an entry gate: "shadow" logs what the gate would have blocked
+        # and mirrors anyway, "enforce" blocks buys from wallets GMGN marks skip, "off" ignores.
+        self.copy_gmgn_gate = os.getenv("COPY_GMGN_GATE", "shadow").strip().lower()
+        self.gmgn_refresh_hours = float(os.getenv("GMGN_REFRESH_HOURS", "24"))
         self.copy_add_dust_ratio = float(os.getenv("COPY_ADD_DUST_RATIO", "0.02"))
         # A followed wallet selling at least this share of its stack closes our position; a
         # smaller sale trims ours by the same share (a trim worth under a dollar is skipped).
@@ -572,7 +580,7 @@ def record_trade(row: dict[str, Any]) -> None:
 
 
 SIGNALS_FILE = DATA_DIR / "copy_signals.csv"
-SIGNAL_COLUMNS = ["timestamp", "wallet", "mint", "kind", "usd", "pre_pct", "mirrored", "reason", "signature"]
+SIGNAL_COLUMNS = ["timestamp", "wallet", "mint", "kind", "usd", "pre_pct", "mirrored", "reason", "signature", "gmgn"]
 
 
 def record_copy_signal(row: dict[str, Any]) -> None:
@@ -2675,16 +2683,28 @@ class Executor:
         self.state["copy_polled_ts"] = now_ts()
         seen_all = self.state.setdefault("copy_seen", {})
         for wallet in cfg.copy_wallets:
+            seen = seen_all.setdefault(wallet, [])
+            baselined = self.state.setdefault("copy_baselined", [])
             try:
                 # A busy wallet (the FOMO quick-buy button fires ten or more trades a minute in
                 # bursts) scrolls past a short window between polls, so read a long one; already
-                # seen signatures cost nothing.
+                # seen signatures cost nothing. After an outage the newest page may hold nothing
+                # we have seen: page back (a few pages at most) until we reach known ground.
                 rows = self.rpc.call("getSignaturesForAddress", [wallet, {"limit": 100, "commitment": "confirmed"}]) or []
+                pages = 1
+                while (wallet in baselined and len(rows) >= 100 * pages and pages < 3
+                       and not any(r.get("signature") in seen for r in rows)):
+                    older = self.rpc.call("getSignaturesForAddress",
+                                          [wallet, {"limit": 100, "commitment": "confirmed", "before": rows[-1]["signature"]}]) or []
+                    if not older:
+                        break
+                    rows.extend(older)
+                    pages += 1
+                if wallet in baselined and pages > 1:
+                    log(f"COPY {wallet[:8]}: {len(rows)} signatures across {pages} pages since the last poll; catching up")
             except Exception as exc:
                 log(f"WARN copy poll {wallet[:8]}: {describe_error(exc)}")
                 continue
-            seen = seen_all.setdefault(wallet, [])
-            baselined = self.state.setdefault("copy_baselined", [])
             if wallet not in baselined:
                 # Baseline: everything older than the mirror window is history. Trades inside the
                 # window (a buy made while we were restarting) are handled like any new trade.
@@ -2694,6 +2714,9 @@ class Executor:
                 log(f"COPY watching {wallet} (baseline {len(seen)} signatures, {len(fresh)} fresh; "
                     f"mirroring buys >= ${cfg.copy_wallet_min_usd.get(wallet, cfg.copy_min_buy_usd):,.0f} "
                     f"at {cfg.copy_wallet_size.get(wallet, 1.0):.0%} of the usual size)")
+            retries = getattr(self, "_copy_decode_retries", None)
+            if retries is None:
+                retries = self._copy_decode_retries = {}
             for row in reversed(rows):
                 sig = row.get("signature")
                 if not sig or sig in seen:
@@ -2703,14 +2726,20 @@ class Executor:
                 if row.get("err"):
                     continue
                 block_time = row.get("blockTime")
-                if block_time and now_ts() - int(block_time) > cfg.copy_max_tx_age_seconds:
-                    log(f"COPY {wallet[:8]}: trade {sig[:12]}… is {now_ts() - int(block_time):.0f}s old; too late to mirror")
-                    continue
+                age = now_ts() - int(block_time) if block_time else 0.0
                 try:
                     tx = self.rpc.transaction(sig)
                 except Exception as exc:
-                    log(f"WARN copy decode {sig[:12]}…: {describe_error(exc)}")
+                    # A transient fetch failure must not turn into a permanently dropped trade:
+                    # forget the signature so the next poll retries it, a few times.
+                    retries[sig] = retries.get(sig, 0) + 1
+                    if retries[sig] < 3:
+                        seen.remove(sig)
+                        log(f"WARN copy decode {sig[:12]}…: {describe_error(exc)}; will retry")
+                    else:
+                        log(f"WARN copy decode {sig[:12]}…: {describe_error(exc)}; giving up after {retries[sig]} attempts")
                     continue
+                retries.pop(sig, None)
                 swap = wallet_swap_from_transaction(tx or {}, wallet)
                 if not swap:
                     continue
@@ -2719,13 +2748,18 @@ class Executor:
                 if swap["side"] == "sell":
                     if not cfg.copy_follow_sells:
                         continue
-                    # Any followed wallet selling a coin we hold is our cue to do the same, whichever
-                    # lane or wallet got us in: selling most of its stack closes our position
-                    # (close_position still keeps the moon bag), trimming part of it trims ours by
-                    # the same share.
+                    # A followed wallet selling a coin we hold is our cue to do the same, however
+                    # late we learn of it (an old sell still says the coin should be gone): selling
+                    # most of its stack closes our position (close_position still keeps the moon
+                    # bag), trimming part of it trims ours by the same share. COPY_SELL_SCOPE=source
+                    # limits this to the wallet whose buy we copied.
                     fraction = float(swap.get("fraction") or 1.0)
+                    late = f" ({age:.0f}s ago)" if age > cfg.copy_max_tx_age_seconds else ""
                     for pos in list(self.state["positions"]):
                         if pos.get("mint") != mint:
+                            continue
+                        if cfg.copy_sell_scope == "source" and pos.get("copy") != wallet:
+                            log(f"COPY {wallet[:8]} sold {fraction:.0%} of {mint}{late}; not our source for it, own exits apply")
                             continue
                         how = "our copy" if pos.get("copy") == wallet else "our position"
                         try:
@@ -2743,6 +2777,9 @@ class Executor:
                         except Exception as exc:
                             log(f"WARN copy sell {mint}: {describe_error(exc)}")
                     continue
+                if age > cfg.copy_max_tx_age_seconds:
+                    log(f"COPY {wallet[:8]}: buy of {mint} is {age:.0f}s old; too late to mirror")
+                    continue
                 minimum = cfg.copy_wallet_min_usd.get(wallet, cfg.copy_min_buy_usd)
                 if usd < minimum:
                     log(f"COPY {wallet[:8]} bought {mint} for ${usd:,.0f} < ${minimum:,.0f} minimum; ignored")
@@ -2751,7 +2788,16 @@ class Executor:
                 pre_pct = pre / bought * 100 if bought > 0 else 0.0
                 is_add = bought > 0 and pre > bought * cfg.copy_add_dust_ratio
                 kind = "add" if is_add else "first"
-                signal = {"wallet": wallet, "mint": mint, "kind": kind, "usd": round(usd), "pre_pct": round(pre_pct, 1), "signature": sig}
+                verdict = (self.state.get("gmgn_verdicts") or {}).get(wallet, {}).get("verdict", "")
+                signal = {"wallet": wallet, "mint": mint, "kind": kind, "usd": round(usd), "pre_pct": round(pre_pct, 1),
+                          "signature": sig, "gmgn": verdict}
+                if verdict == "skip" and cfg.copy_gmgn_gate == "enforce":
+                    log(f"COPY {wallet[:8]} bought {mint} for ${usd:,.0f}; GMGN marks this wallet skip; not mirrored")
+                    record_copy_signal({**signal, "mirrored": 0, "reason": "gmgn_skip"})
+                    continue
+                if verdict == "skip" and cfg.copy_gmgn_gate == "shadow":
+                    log(f"COPY {wallet[:8]} bought {mint} for ${usd:,.0f}; GMGN marks this wallet skip "
+                        f"(shadow gate: would be blocked with COPY_GMGN_GATE=enforce)")
                 if is_add and cfg.copy_first_buy_only:
                     log(f"COPY {wallet[:8]} bought {mint} for ${usd:,.0f}: adding to a coin it holds "
                         f"(held {pre_pct:.0f}% of what it just bought); not a first buy; ignored")
@@ -3778,6 +3824,9 @@ class Executor:
         draining = STOP_FLAG.exists() or panic
         self.state["draining"] = draining
         self.log_heartbeat()
+        if (self.cfg.copy_wallets and os.getenv("GMGN_API_KEY", "").strip()
+                and now_ts() - float(self.state.get("gmgn_screened_ts") or 0) > self.cfg.gmgn_refresh_hours * 3600):
+            self.screen_copy_wallets()
         sol_price = None
 
         # Capital already at risk always goes first.  The old loop analyzed every due entry before
@@ -3825,12 +3874,18 @@ class Executor:
         effort: a failure here never stops the lane."""
         if not self.cfg.copy_wallets or not os.getenv("GMGN_API_KEY", "").strip():
             return
+        self.state["gmgn_screened_ts"] = now_ts()
         try:
             import gmgn
             client = gmgn.Gmgn()
             results = gmgn.screen(client, list(self.cfg.copy_wallets), "sol", "30d")
             for line in gmgn.screen_lines(results):
                 log(line)
+            # Verdicts are kept with their evaluation time; an API failure keeps the last ones.
+            stamp = utc_iso()
+            self.state["gmgn_verdicts"] = {r["wallet"]: {"verdict": r["verdict"], "why": r["why"], "evaluated_at": stamp,
+                                                         "window_days": r.get("period_days", 30)} for r in results}
+            save_state(self.state)
             bad = [r["wallet"][:8] for r in results if r["verdict"] == "skip"]
             if bad:
                 log(f"WARN GMGN says {len(bad)} followed wallet(s) are not worth copying: {', '.join(bad)}; "
