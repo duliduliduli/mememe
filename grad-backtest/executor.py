@@ -3790,6 +3790,25 @@ class Executor:
                     log(f"WARN copy trading: {describe_error(exc)}")
         save_state(self.state)
 
+    def screen_copy_wallets(self) -> None:
+        """With GMGN_API_KEY set, log each followed wallet's 30-day record (realized profit,
+        win rate, trade counts, tags) and flag the ones not worth copying. Read-only, best
+        effort: a failure here never stops the lane."""
+        if not self.cfg.copy_wallets or not os.getenv("GMGN_API_KEY", "").strip():
+            return
+        try:
+            import gmgn
+            client = gmgn.Gmgn()
+            results = gmgn.screen(client, list(self.cfg.copy_wallets), "sol", "30d")
+            for line in gmgn.screen_lines(results):
+                log(line)
+            bad = [r["wallet"][:8] for r in results if r["verdict"] == "skip"]
+            if bad:
+                log(f"WARN GMGN says {len(bad)} followed wallet(s) are not worth copying: {', '.join(bad)}; "
+                    f"give them a small size (address:min:0.5) or drop them")
+        except Exception as exc:
+            log(f"WARN GMGN screening skipped: {describe_error(exc)}")
+
     def apply_startup_flags(self) -> None:
         """PANIC=1 raises the panic flag at boot: everything the wallet holds (positions, moon
         bags, leftovers adopted by the reconcile) is market-sold and the executor drains."""
@@ -3881,6 +3900,7 @@ class Executor:
             log(f"graduation discovery: WebSocket stream + {self.cfg.discovery_catchup_seconds:.0f}s RPC catch-up")
         else:
             log(f"graduation discovery: RPC polling every {self.cfg.discovery_catchup_seconds:.0f}s")
+        self.screen_copy_wallets()
         while True:
             try:
                 self.run_cycle()

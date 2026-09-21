@@ -198,6 +198,7 @@ prints the important ones.
 |---|---|---|
 | `EXECUTOR_MODE` | `paper` | `paper` or `live`. |
 | `EXECUTOR_AUTOSTART` | `0` | `1` makes the dashboard container launch the executor at boot. |
+| `GMGN_API_KEY` | (empty) | Read-only GMGN OpenAPI key (create one at gmgn.ai/ai with Enable Reading only). At startup the executor screens every `COPY_WALLETS` entry through GMGN and logs its 30-day realized profit, win rate, trade counts and tags with a copy / skip / thin verdict. The dashboard gains `GET /api/gmgn/screen?wallets=a,b` (same verdicts on demand) and `GET /api/gmgn/traders?token=<mint>&tag=smart_degen` (the wallets that made money on a coin, to pick new ones to copy). No private key is needed or used. |
 | `HOLD_MINTS` | (empty) | Comma-separated mints the executor never touches: not adopted at startup, not swept, not sold by panic or a followed wallet's sell, never entered. For tokens bought by hand in the bot's wallet and kept on purpose. |
 | `PANIC` | `0` | `1` sells every position and moon bag at market as soon as the executor starts (leftovers the reconcile adopts included), then drains with no new buys. The variable-only way to "sell everything and stop"; delete it once the log says `panic complete`, then set `EXECUTOR_AUTOSTART=0` to keep the bot off. |
 | `START_BALANCE` | `100` | Initial paper balance for a fresh state file; also the dashboard equity-curve start. |

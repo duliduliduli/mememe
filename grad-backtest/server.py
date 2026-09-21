@@ -482,6 +482,39 @@ def _start_evm() -> None:
     _evm_proc = subprocess.Popen([sys.executable, "-m", "evm"], cwd=Path(__file__).parent)
 
 
+@app.get("/api/gmgn/screen")
+def gmgn_screen(wallets: str = "", chain: str = "sol", period: str = "30d") -> JSONResponse:
+    """Is a wallet worth copying? `wallets` is comma-separated; each comes back with a
+    copy / skip / thin verdict and the 30-day numbers behind it (GMGN data)."""
+    import gmgn
+    if not gmgn.configured():
+        raise HTTPException(503, "GMGN_API_KEY is not configured")
+    addresses = [w.strip() for w in wallets.replace("\n", ",").replace(" ", ",").split(",") if w.strip()]
+    if not addresses:
+        raise HTTPException(400, "pass ?wallets=addr1,addr2")
+    try:
+        results = gmgn.screen(gmgn.Gmgn(), addresses[:100], chain, period)
+    except gmgn.GmgnError as exc:
+        raise HTTPException(502, str(exc))
+    return JSONResponse({"chain": chain, "period": period, "results": results})
+
+
+@app.get("/api/gmgn/traders")
+def gmgn_traders(token: str = "", chain: str = "sol", tag: str = "", limit: int = 20) -> JSONResponse:
+    """Who made money on a token: the wallets to consider copying, with GMGN's tags.
+    `tag` narrows to smart_degen, renowned, sniper, bundler, rat_trader..."""
+    import gmgn
+    if not gmgn.configured():
+        raise HTTPException(503, "GMGN_API_KEY is not configured")
+    if not token.strip():
+        raise HTTPException(400, "pass ?token=<mint>")
+    try:
+        rows = gmgn.Gmgn().top_traders(chain, token.strip(), tag.strip() or None, limit=max(1, min(100, limit)))
+    except gmgn.GmgnError as exc:
+        raise HTTPException(502, str(exc))
+    return JSONResponse({"chain": chain, "token": token.strip(), "traders": gmgn.traders_summary(rows)})
+
+
 @app.get("/api/evm")
 def evm_status(limit: int = 100) -> JSONResponse:
     state = read_json("evm_state.json") or {}
