@@ -68,6 +68,10 @@ PANIC_FLAG = DATA_DIR / "executor.panic"
 WALLET_GRAPH_CACHE_FILE = DATA_DIR / "wallet_graph_cache.json"
 
 USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+# Solana ships transaction version 1; a client that declares 0 is refused those transactions
+# outright ("not supported by the requesting client"), and a followed wallet's trade in one of
+# them would never be decoded. jsonParsed balance changes are the same for every version.
+MAX_TX_VERSION = 1
 LAMPORTS = 1_000_000_000
 TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
@@ -1459,7 +1463,7 @@ class Rpc:
         sample = rows[: self.cfg.creator_history_decode_limit]
         calls = [
             ("getTransaction", [r["signature"], {"encoding": "jsonParsed", "commitment": "confirmed",
-                                                "maxSupportedTransactionVersion": 0}])
+                                                "maxSupportedTransactionVersion": MAX_TX_VERSION}])
             for r in sample
         ]
         bodies: list[Any] = []
@@ -1504,7 +1508,7 @@ class Rpc:
             return None
         calls = [
             ("getTransaction", [r["signature"], {"encoding": "jsonParsed", "commitment": "confirmed",
-                                                "maxSupportedTransactionVersion": 0}])
+                                                "maxSupportedTransactionVersion": MAX_TX_VERSION}])
             for r in rows
         ]
         bodies: list[Any] = []
@@ -1683,7 +1687,7 @@ class Rpc:
                 {
                     "encoding": "jsonParsed",
                     "commitment": "confirmed",
-                    "maxSupportedTransactionVersion": 0,
+                    "maxSupportedTransactionVersion": MAX_TX_VERSION,
                 },
             ],
         )
@@ -1775,7 +1779,7 @@ class Rpc:
                     {
                         "encoding": "jsonParsed",
                         "commitment": "confirmed",
-                        "maxSupportedTransactionVersion": 0,
+                        "maxSupportedTransactionVersion": MAX_TX_VERSION,
                     },
                 ],
             )
@@ -4129,7 +4133,8 @@ class Executor:
                 "Delete the PANIC variable once the log says 'panic complete'.")
 
     def run(self) -> None:
-        log(f"executor starting: mode={self.cfg.mode} fraction={self.cfg.account_fraction} "
+        log(f"executor starting: commit={os.getenv('RAILWAY_GIT_COMMIT_SHA', 'unknown')[:10]} "
+            f"mode={self.cfg.mode} fraction={self.cfg.account_fraction} "
             f"max_pos=${self.cfg.max_position_usd} slots={self.cfg.max_concurrent} "
             f"tp=+{self.cfg.take_profit:.0%} sl=-{self.cfg.stop_loss:.0%} "
             f"time_stop={self.cfg.time_stop_minutes:.0f}m trail={self.cfg.trailing_stop:.0%} "

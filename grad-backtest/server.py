@@ -133,8 +133,17 @@ def equity_curve(trades: pd.DataFrame, fraction: float) -> list[dict[str, Any]]:
 
 
 @app.get("/healthz")
-def healthz() -> dict[str, str]:
-    return {"status": "ok"}
+def healthz() -> dict[str, Any]:
+    """Liveness plus the deployed commit and the raw values of the settings that decide what
+    the copy lane does (no secrets), so "why did it skip" can be answered from a browser."""
+    settings = ["EXECUTOR_MODE", "EXECUTOR_AUTOSTART", "DATA_DIR", "MAX_CONCURRENT_POSITIONS", "ACCOUNT_FRACTION",
+                "MAX_DEPLOYED_FRACTION", "MIN_POSITION_USD", "COPY_MIN_BUY_USD", "COPY_FIRST_BUY_ONLY", "COPY_ADD_DUST_RATIO",
+                "COPY_SELL_SCOPE", "COPY_GMGN_GATE", "COPY_ROTATE", "COPY_TIME_STOP_MINUTES", "COPY_LADDER", "HOLD_MINTS",
+                "DAILY_LOSS_LIMIT_USD", "PANIC"]
+    return {"status": "ok", "commit": os.getenv("RAILWAY_GIT_COMMIT_SHA", "unknown"),
+            "settings": {k: os.getenv(k) for k in settings if os.getenv(k) is not None},
+            "copy_wallets": [w.strip()[:8] + "…" for w in os.getenv("COPY_WALLETS", "").replace("\n", ",").split(",") if w.strip()],
+            "gmgn_key_set": bool(os.getenv("GMGN_API_KEY", "").strip())}
 
 
 @app.get("/")

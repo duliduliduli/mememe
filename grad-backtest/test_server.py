@@ -19,6 +19,18 @@ class ServerTests(unittest.TestCase):
         self.client = TestClient(server.app)
         self.data_dir = Path(os.environ["DATA_DIR"])
 
+    def test_healthz_shows_commit_and_copy_settings_without_secrets(self):
+        with mock.patch.dict(os.environ, {"RAILWAY_GIT_COMMIT_SHA": "abc123def", "MAX_CONCURRENT_POSITIONS": "5",
+                                          "COPY_WALLETS": "FY6yG7cy886yAzndYue7Tb5q5mj3nWEHNi3PjGowd4Ns", "GMGN_API_KEY": "secret",
+                                          "WALLET_PRIVATE_KEY": "never"}):
+            body = self.client.get("/healthz").json()
+        self.assertEqual(body["commit"], "abc123def")
+        self.assertEqual(body["settings"]["MAX_CONCURRENT_POSITIONS"], "5")
+        self.assertEqual(body["copy_wallets"], ["FY6yG7cy…"])
+        self.assertTrue(body["gmgn_key_set"])
+        self.assertNotIn("secret", str(body))
+        self.assertNotIn("never", str(body))
+
     def test_evm_status_reports_unconfigured_lane(self):
         with mock.patch.dict(os.environ, {"EVM_COPY_WALLETS": "", "EVM_PRIVATE_KEY": ""}):
             resp = self.client.get("/api/evm")
@@ -42,7 +54,7 @@ class ServerTests(unittest.TestCase):
             self.assertTrue(server._mm_autostart())
 
     def test_health(self):
-        self.assertEqual(self.client.get("/healthz").json(), {"status": "ok"})
+        self.assertEqual(self.client.get("/healthz").json()["status"], "ok")
 
     def test_overview_with_no_data(self):
         body = self.client.get("/api/overview").json()
