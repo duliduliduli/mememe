@@ -4000,6 +4000,7 @@ class Executor:
                     time.sleep(self.cfg.entry_retry_seconds)
                 else:
                     log(f"WARN entry {item['mint']} failed after {attempts} attempts: {reason}")
+                    self.last_skip = (item["mint"], f"entry failed after {attempts} attempts: {reason}")
 
     # ---- main loop -------------------------------------------------------
     def run_cycle(self) -> None:

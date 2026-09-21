@@ -403,6 +403,26 @@ class PollTests(unittest.TestCase):
         ex2.poll_copy_wallets(SOL)
         self.assertEqual([e["mint"] for e in self.entered], [mint_add])
 
+    def test_entry_exception_reason_reaches_the_signal_record(self):
+        executor, ex = self.make(COPY_MIN_BUY_USD="50")
+        now = int(executor.now_ts())
+        self.sigs = [{"signature": "base", "blockTime": now - 600}]
+        ex.poll_copy_wallets(SOL)
+        def boom(item, sol_price):
+            raise RuntimeError("Jupiter 429 rate limited")
+        ex.try_enter = boom
+        ex.cfg.entry_retries = 0
+        del ex.enter_with_retry                                          # use the real retry wrapper
+        self.sigs = [{"signature": "b1", "blockTime": now}] + self.sigs
+        self.txs["b1"] = tx(10.0, 5.0, 0, 9_000_000)
+        ex.state["copy_polled_ts"] = 0
+        with mock.patch.object(executor.time, "sleep"):
+            ex.poll_copy_wallets(SOL)
+        import csv
+        rows = list(csv.DictReader(open(executor.SIGNALS_FILE)))
+        self.assertEqual(rows[-1]["status"], "failed")
+        self.assertIn("Jupiter 429", rows[-1]["reason"])
+
     def test_old_sells_are_still_followed_but_old_buys_are_not(self):
         executor, ex = self.make()
         now = int(executor.now_ts())
