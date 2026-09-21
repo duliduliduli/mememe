@@ -34,6 +34,7 @@ import re
 import sys
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -558,9 +559,11 @@ def roll_daily(state: dict[str, Any]) -> None:
 
 
 def _append_row(path: Path, columns: list[str], row: dict[str, Any]) -> None:
-    """Append one CSV row. A file written by an older version (a header missing columns we now
-    record) is rotated to <name>.<timestamp>.csv so no metadata is silently dropped and no
-    column is ever misaligned; a file with extra or reordered columns keeps its own header."""
+    """Append one CSV row. A file whose header lacks any column we now record (an older
+    version's file, whether columns were added, renamed or removed since) is rotated to
+    <name>.<timestamp>.csv and a fresh file started, so no field is ever silently dropped and
+    no column misaligned. A file that has every required column, with extras or in another
+    order, keeps its own header."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     fieldnames = columns
     new = not path.exists()
@@ -568,10 +571,10 @@ def _append_row(path: Path, columns: list[str], row: dict[str, Any]) -> None:
         with path.open() as fh:
             existing = fh.readline().strip().split(",")
         if existing and existing != [""]:
-            if set(existing) < set(columns):
+            if not set(columns) <= set(existing):
                 rotated = path.with_name(f"{path.stem}.{int(now_ts())}{path.suffix}")
                 os.replace(path, rotated)
-                log(f"rotated {path.name} (older header) to {rotated.name}")
+                log(f"rotated {path.name} (header lacks {', '.join(sorted(set(columns) - set(existing)))}) to {rotated.name}")
                 new = True
             else:
                 fieldnames = existing
@@ -2715,19 +2718,29 @@ class Executor:
                 log(f"COPY watching {wallet} (baseline {len(seen)} signatures, {len(fresh)} fresh; "
                     f"mirroring buys >= ${cfg.copy_wallet_min_usd.get(wallet, cfg.copy_min_buy_usd):,.0f} "
                     f"at {cfg.copy_wallet_size.get(wallet, 1.0):.0%} of the usual size)")
-            budget = cfg.copy_decode_budget
+            # Discovery and decoding are separate steps. Every unseen row goes into a durable
+            # per-wallet inbox first (so a moved cursor or a restart can never lose it), then the
+            # inbox is worked oldest-first under the decode budget.
+            inbox = self.state.setdefault("copy_inbox", {}).setdefault(wallet, [])
+            queued = {e["signature"] for e in inbox}
             for row in reversed(rows):
                 sig = row.get("signature")
-                if not sig or sig in seen:
+                if not sig or sig in seen or sig in queued:
                     continue
-                if budget <= 0:
-                    break                       # the rest stays unseen and is picked up next poll
-                budget -= 1
                 seen.append(sig)
                 del seen[:-1000]
                 if row.get("err"):
                     continue
-                self.copy_fetch_and_handle(wallet, sig, row.get("blockTime"), sol_price, allow_buys)
+                inbox.append({"signature": sig, "blockTime": row.get("blockTime")})
+                queued.add(sig)
+            inbox.sort(key=lambda e: int(e.get("blockTime") or 0))
+            budget = cfg.copy_decode_budget
+            while inbox and budget > 0:
+                entry = inbox.pop(0)
+                budget -= 1
+                self.copy_fetch_and_handle(wallet, entry["signature"], entry.get("blockTime"), sol_price, allow_buys)
+            if inbox:
+                log(f"COPY {wallet[:8]}: {len(inbox)} discovered event(s) still queued for the next poll")
 
     def copy_fetch_rows(self, wallet: str, seen: list[str], baselined: bool) -> list[dict[str, Any]]:
         """The wallet's newest signatures, paging back (a few pages per poll) until a signature
@@ -2913,10 +2926,19 @@ class Executor:
                 target = int(int(pos["tokens"]) * (1.0 - fraction))
             self.copy_execute_exit(pos, wallet, sig, fraction, target, sol_price)
 
+    @staticmethod
+    def position_id(pos: dict[str, Any]) -> str:
+        """An immutable identity for one acquisition, assigned once and kept in state: a
+        position that closes and a later re-entry into the same coin never share it."""
+        if not pos.get("position_id"):
+            pos["position_id"] = uuid.uuid4().hex[:16]
+        return pos["position_id"]
+
     def copy_execute_exit(self, pos: dict[str, Any], wallet: str, sig: str, fraction: float, target_tokens: int,
                           sol_price: float, attempt: int = 1) -> bool:
         """Close (target 0) or trim to `target_tokens`. Returns True when done; otherwise the
-        intent is stored in state["copy_pending_exits"] keyed by source signature and mint."""
+        intent is stored in state["copy_pending_exits"] bound to this position's identity."""
+        pid = self.position_id(pos)
         try:
             if target_tokens <= 0:
                 self.close_position(pos, "copy_sell", sol_price)
@@ -2928,11 +2950,11 @@ class Executor:
             return True
         except Exception as exc:
             pending = self.state.setdefault("copy_pending_exits", [])
-            key = f"{sig}:{pos['mint']}"
+            key = f"{sig}:{pos['mint']}:{pid}"
             entry = next((e for e in pending if e.get("key") == key), None)
             if entry is None:
-                entry = {"key": key, "signature": sig, "wallet": wallet, "mint": pos["mint"], "fraction": fraction,
-                         "target_tokens": target_tokens, "attempts": 0, "created_at": utc_iso()}
+                entry = {"key": key, "signature": sig, "wallet": wallet, "mint": pos["mint"], "position_id": pid,
+                         "fraction": fraction, "target_tokens": target_tokens, "attempts": 0, "created_at": utc_iso()}
                 pending.append(entry)
             entry["attempts"] = attempt if entry.get("attempts", 0) < attempt else entry["attempts"] + 1
             entry["next_ts"] = now_ts() + 10.0 * entry["attempts"]
@@ -2950,15 +2972,23 @@ class Executor:
 
     def copy_drop_pending_exit(self, sig: str, mint: str) -> None:
         pending = self.state.get("copy_pending_exits") or []
-        pending[:] = [e for e in pending if e.get("key") != f"{sig}:{mint}"]
+        pending[:] = [e for e in pending if not (e.get("signature") == sig and e.get("mint") == mint)]
 
     def copy_retry_pending_exits(self, sol_price: float) -> None:
         for entry in list(self.state.get("copy_pending_exits") or []):
             if now_ts() < float(entry.get("next_ts") or 0):
                 continue
-            pos = next((p for p in self.state["positions"] if p.get("mint") == entry["mint"]), None)
+            pid = entry.get("position_id")
+            if not pid:
+                # An intent from before positions carried an identity: it cannot be tied to the
+                # position it was meant for, so it is retired rather than applied to whatever
+                # holds that coin now.
+                log(f"COPY retiring pending exit of {entry['mint']} with no position identity")
+                self.copy_drop_pending_exit(entry["signature"], entry["mint"])
+                continue
+            pos = next((p for p in self.state["positions"] if p.get("position_id") == pid), None)
             if pos is None or (entry["target_tokens"] > 0 and int(pos["tokens"]) <= entry["target_tokens"] * 1.02):
-                self.copy_drop_pending_exit(entry["signature"], entry["mint"])     # already gone or already trimmed
+                self.copy_drop_pending_exit(entry["signature"], entry["mint"])     # that position is gone or already trimmed
                 continue
             log(f"COPY retrying pending exit of {entry['mint']} (attempt {entry['attempts'] + 1})")
             self.copy_execute_exit(pos, entry["wallet"], entry["signature"], entry["fraction"], entry["target_tokens"],
@@ -3390,6 +3420,7 @@ class Executor:
                 "copy": copied or None,
                 "copy_buy_usd": item.get("copy_buy_usd"),
                 "copy_signature": item.get("copy_signature"),
+                "position_id": uuid.uuid4().hex[:16],
                 "entry_tokens": tokens,
                 "entry_basis_usd": size_usd,
                 "ladder": [dict(r, done=False) for r in self.cfg.copy_ladder] if copied and self.cfg.copy_ladder else None,
@@ -3592,6 +3623,7 @@ class Executor:
                     "entry_top_holder_pct": None,
                     "peak_usd": value,
                     "adopted": True,
+                    "position_id": uuid.uuid4().hex[:16],
                 }
             )
             adopted += 1

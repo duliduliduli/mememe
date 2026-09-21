@@ -597,27 +597,115 @@ class PollTests(unittest.TestCase):
         ex.poll_copy_wallets(SOL)
         self.assertEqual(attempts, [0.3, 0.3])                            # never replayed
 
-    def test_backfill_cursor_survives_a_backlog_longer_than_three_pages(self):
-        executor, ex = self.make(COPY_MIN_BUY_USD="50", COPY_DECODE_BUDGET="1000")
+    def test_backlog_of_420_is_fully_processed_at_the_default_budget_with_a_restart(self):
+        executor, ex = self.make(COPY_MIN_BUY_USD="50")                 # COPY_DECODE_BUDGET stays at its default of 40
+        self.assertEqual(ex.cfg.copy_decode_budget, 40)
         now = int(executor.now_ts())
-        self.sigs = [{"signature": "base", "blockTime": now - 600}]
+        self.sigs = [{"signature": "base", "blockTime": now - 6000}]
         ex.poll_copy_wallets(SOL)
-        backlog = [{"signature": f"n{i:03d}", "blockTime": now - i} for i in range(420)]    # 420 unseen, newest first
+        ex.state["positions"] = [{"mint": MINT, "tokens": 10, "position_usd": 5.0, "opened_ts": now - 9000, "copy": WALLET,
+                                  "peak_usd": 5.0, "buy_signature": "ours"}]
+        backlog = [{"signature": f"n{i:03d}", "blockTime": now - 10 * i} for i in range(420)]    # newest first, ~70 min of trades
         def page(before):
             if before is None:
                 return backlog[:100]
             idx = next(i for i, r in enumerate(backlog) if r["signature"] == before)
             rows = backlog[idx + 1: idx + 101]
-            return rows if rows else [{"signature": "base", "blockTime": now - 600}]
-        ex.rpc.call = lambda method, params, timeout=None: list(page(params[1].get("before")))
-        ex.state["copy_polled_ts"] = 0
-        ex.poll_copy_wallets(SOL)
-        self.assertEqual(ex.state["copy_backfill"][WALLET], "n299")       # three pages read, cursor kept
-        for _ in range(3):
+            return rows if rows else [{"signature": "base", "blockTime": now - 6000}]
+        call = lambda method, params, timeout=None: list(page(params[1].get("before")))
+        ex.rpc.call = call
+        closed = []
+        ex.close_position = lambda pos, reason, sol_price: (closed.append(pos["mint"]), ex.state["positions"].remove(pos))
+        transaction = lambda sig: tx(5.0, 9.0, 9_000_000, 0) if sig == "n200" else {"meta": {}}   # n200, deep in the middle, is a full sell
+        ex.rpc.transaction = transaction
+        handled = set()
+        original = ex.copy_handle_event
+        def spy(wallet, sig, block_time, tx_, sol_price, allow_buys):
+            handled.add(sig)
+            return original(wallet, sig, block_time, tx_, sol_price, allow_buys)
+        ex.copy_handle_event = spy
+        for _ in range(4):
             ex.state["copy_polled_ts"] = 0
             ex.poll_copy_wallets(SOL)
-        self.assertNotIn(WALLET, ex.state["copy_backfill"])                # reached known ground
-        self.assertIn("n419", ex.state["copy_seen"][WALLET])
+        self.assertLess(len(handled), 420)                             # budgeted: not all in four polls
+        executor.save_state(ex.state)                                  # restart midway through the queue
+        ex2 = executor.Executor(executor.Config())
+        ex2.rpc.call = call
+        ex2.rpc.transaction = transaction
+        ex2.close_position = lambda pos, reason, sol_price: (closed.append(pos["mint"]), ex2.state["positions"].remove(pos))
+        original2 = ex2.copy_handle_event
+        def spy2(wallet, sig, block_time, tx_, sol_price, allow_buys):
+            handled.add(sig)
+            return original2(wallet, sig, block_time, tx_, sol_price, allow_buys)
+        ex2.copy_handle_event = spy2
+        ex2.enter_with_retry = lambda item, sol_price: None
+        for _ in range(20):
+            ex2.state["copy_polled_ts"] = 0
+            ex2.poll_copy_wallets(SOL)
+        expected = {f"n{i:03d}" for i in range(420)}
+        self.assertEqual(expected - handled, set())                    # every discovered event was decoded
+        self.assertEqual(ex2.state["copy_inbox"].get(WALLET, []), [])
+        self.assertEqual(ex2.state.get("copy_unresolved", {}), {})
+        self.assertNotIn(WALLET, ex2.state.get("copy_backfill", {}))
+        self.assertEqual(closed, [MINT])                               # the sell in the middle interval was followed
+
+    def test_stale_pending_exit_never_touches_a_new_position_in_the_same_coin(self):
+        executor, ex = self.make(COPY_MAX_EXIT_ATTEMPTS="5")
+        now = int(executor.now_ts())
+        self.sigs = [{"signature": "base", "blockTime": now - 600}]
+        ex.poll_copy_wallets(SOL)
+        old = {"mint": MINT, "tokens": 1000, "position_usd": 10.0, "opened_ts": now - 600, "copy": WALLET,
+               "peak_usd": 10.0, "buy_signature": "OLD_ENTRY"}
+        ex.state["positions"] = [old]
+        closes = []
+        def close_position(pos, reason, sol_price):
+            closes.append(pos.get("buy_signature"))
+            raise RuntimeError("Jupiter 429")
+        ex.close_position = close_position
+        self.sigs = [{"signature": "sell1", "blockTime": now}] + self.sigs
+        self.txs["sell1"] = tx(5.0, 9.0, 9_000_000, 0)
+        ex.state["copy_polled_ts"] = 0
+        ex.poll_copy_wallets(SOL)
+        self.assertEqual(closes, ["OLD_ENTRY"])
+        self.assertEqual(len(ex.state["copy_pending_exits"]), 1)
+        self.assertEqual(ex.state["copy_pending_exits"][0]["position_id"], old["position_id"])
+        # The old position leaves through its own exits; the same coin is bought again.
+        ex.state["positions"] = [{"mint": MINT, "tokens": 500, "position_usd": 8.0, "opened_ts": now, "copy": WALLET,
+                                  "peak_usd": 8.0, "buy_signature": "NEW_ENTRY", "position_id": "fresh-id"}]
+        ex.state["copy_pending_exits"][0]["next_ts"] = 0
+        ex.state["copy_polled_ts"] = 0
+        ex.poll_copy_wallets(SOL)
+        self.assertEqual(closes, ["OLD_ENTRY"])                        # the new position was not touched
+        self.assertEqual(ex.state["copy_pending_exits"], [])            # the stale intent was retired
+        # An intent from before position identities existed is retired, never applied.
+        ex.state["copy_pending_exits"] = [{"key": "x", "signature": "s", "wallet": WALLET, "mint": MINT, "fraction": 1.0,
+                                           "target_tokens": 0, "attempts": 1, "next_ts": 0}]
+        ex.state["copy_polled_ts"] = 0
+        ex.poll_copy_wallets(SOL)
+        self.assertEqual(closes, ["OLD_ENTRY"])
+        self.assertEqual(ex.state["copy_pending_exits"], [])
+
+    def test_old_signal_file_with_renamed_column_is_rotated_not_truncated(self):
+        executor, ex = self.make()
+        import csv
+        old_header = ["timestamp", "wallet", "mint", "kind", "usd", "pre_pct", "mirrored", "reason", "signature", "gmgn"]
+        executor.SIGNALS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with executor.SIGNALS_FILE.open("w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=old_header)
+            w.writeheader()
+            w.writerow({"timestamp": "2026-09-21T11:00:00Z", "wallet": WALLET, "mint": MINT, "kind": "first", "usd": 500,
+                        "pre_pct": 0, "mirrored": 1, "reason": "mirrored", "signature": "old", "gmgn": ""})
+        executor.record_copy_signal({"signal_id": "id1", "wallet": WALLET, "mint": MINT, "kind": "first", "status": "filled",
+                                     "reason": "filled", "mirrored": 1, "source_usd": 500, "fill_usd": 17.6, "fill_tokens": 123,
+                                     "fill_signature": "FILLSIG", "signature": "src", "gmgn": "copy"})
+        rows = list(csv.DictReader(open(executor.SIGNALS_FILE)))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["signal_id"], rows[0]["status"], rows[0]["source_usd"], rows[0]["fill_usd"],
+                          rows[0]["fill_tokens"], rows[0]["fill_signature"]), ("id1", "filled", "500", "17.6", "123", "FILLSIG"))
+        rotated = [p for p in executor.SIGNALS_FILE.parent.glob("copy_signals.*.csv")]
+        self.assertEqual(len(rotated), 1)                                # the old file and its record are preserved
+        old_rows = list(csv.DictReader(open(rotated[0])))
+        self.assertEqual(old_rows[0]["usd"], "500")
 
     def test_first_poll_mirrors_a_buy_made_during_restart(self):
         executor, ex = self.make(COPY_MIN_BUY_USD="50")
