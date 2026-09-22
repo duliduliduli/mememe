@@ -701,6 +701,22 @@ class LaneTests(unittest.TestCase):
         self.assertEqual(ev["missing"], ["leaderboard"])
         self.assertFalse(ev["qualified"])
 
+    def test_policy_change_re_evaluates_known_candidates_at_startup(self):
+        executor, ex = self.make(SCOUT_FAST_TRACK="1")
+        lane = ex.scout
+        cand = self.seed(ex, OTHER, state="shadow")
+        cand["rank_snapshots"], cand["holdings"] = [], None
+        cand["evaluation"] = {"qualified": False, "policy_version": "old", "gates": {}, "failed": [], "missing": ["leaderboard"], "evaluated_at": 0}
+        lane.st["policy_version"] = "2000-01-01.0"                                # state written by an older deploy
+        lane.maybe_discover = lambda force=False: None                            # no network
+        lane.tick(SOL)
+        self.assertEqual(lane.st["policy_version"], scout.POLICY_VERSION)
+        self.assertEqual(cand["evaluation"]["policy_version"], scout.POLICY_VERSION)
+        self.assertEqual(cand["state"], "qualified")                              # scored under the fast track right away
+        lane.st["candidates"][OTHER]["state"] = "shadow"
+        lane.tick(SOL)                                                            # same policy: not re-scored every tick
+        self.assertEqual(cand["state"], "shadow")
+
     def test_discovery_reruns_at_retry_interval_until_something_is_enriched(self):
         executor, ex = self.make()
         lane = ex.scout
