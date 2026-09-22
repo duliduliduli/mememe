@@ -29,6 +29,7 @@ What the GMGN OpenAPI can and cannot evidence (verified against the live API, Se
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 import os
@@ -42,7 +43,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-POLICY_VERSION = "2026-09-22.2"
+POLICY_VERSION = "2026-09-22.3"
+# Every threshold that decides a gate. `policy_key` fingerprints them, so changing one (in
+# code or by variable) re-scores the stored candidates instead of leaving stale verdicts.
+POLICY_FIELDS = (
+    "fast_track", "fast_track_min_history_days", "fast_track_dense_episodes", "fast_track_min_episodes_30d",
+    "fast_track_min_tokens_30d", "fast_track_min_active_days_30d", "min_history_days", "min_episodes_30d",
+    "min_tokens_30d", "min_active_days_30d", "min_profit_factor", "max_best_token_share", "max_drawdown",
+    "min_median_hold_minutes", "max_fast_exit_fraction", "leaderboard_top_fraction", "leaderboard_top_n",
+    "leaderboard_min_snapshots", "leaderboard_span_days", "shadow_min_days", "shadow_min_trades",
+    "shadow_min_tokens", "shadow_min_active_days", "shadow_min_profit_factor", "shadow_max_drawdown",
+)
+
+
+def policy_key(cfg: "ScoutConfig") -> str:
+    raw = "|".join(f"{f}={getattr(cfg, f, '')}" for f in POLICY_FIELDS)
+    return f"{POLICY_VERSION}+{hashlib.sha1(raw.encode()).hexdigest()[:8]}"
 STATES = ("discovered", "research", "shadow", "qualified", "live", "paused", "rejected")
 BAD_TAGS = ("wash_trader", "sandwich_bot", "mev_bot", "bundler", "rat_trader")
 WSOL = "So11111111111111111111111111111111111111112"
@@ -509,7 +525,7 @@ def evaluate_candidate(cand: dict[str, Any], cfg: ScoutConfig, now: float, min_f
     missing_deciding = [k for k, g in deciding.items() if g["status"] == "missing"]
     qualified = not failed and not missing_deciding
     score = score_candidate(cand, m30, sh, lb)
-    return {"policy_version": POLICY_VERSION, "evaluated_at": now, "gates": gates, "failed": failed, "missing": missing_deciding,
+    return {"policy_version": policy_key(cfg), "evaluated_at": now, "gates": gates, "failed": failed, "missing": missing_deciding,
             "waived": waived, "track": "fast" if cfg.fast_track else "full", "qualified": qualified, "score": score}
 
 
@@ -613,7 +629,7 @@ class ScoutLane:
                              ("baselined", []), ("inbox", {}), ("unresolved", {}), ("failed", []), ("token_sample", []),
                              ("errors", []), ("live", {})):
             self.st.setdefault(key, default if not isinstance(default, (dict, list)) else type(default)())
-        self.st.setdefault("policy_version", POLICY_VERSION)
+        self.st.setdefault("policy_version", policy_key(self.cfg))
         self._thread: threading.Thread | None = None
         self._result: tuple[str, Any] | None = None
         self._poll_ts = 0.0
@@ -700,12 +716,13 @@ class ScoutLane:
     def tick(self, sol_price: float) -> None:
         if not self.enabled:
             return
-        if self.st.get("policy_version") != POLICY_VERSION and self.st["candidates"]:
+        key = policy_key(self.cfg)
+        if self.st.get("policy_version") != key and self.st["candidates"]:
             # A deploy changed the policy: re-score what is already known now, not at the
             # next discovery cycle hours away.
-            self.log(f"policy {self.st.get('policy_version')} -> {POLICY_VERSION}: re-evaluating {len(self.st['candidates'])} candidate(s)")
+            self.log(f"policy {self.st.get('policy_version')} -> {key}: re-evaluating {len(self.st['candidates'])} candidate(s)")
             self.evaluate_all()
-        self.st["policy_version"] = POLICY_VERSION
+        self.st["policy_version"] = key
         self.apply_discovery()
         self.maybe_discover()
         if self.now() - self._poll_ts >= self.cfg.poll_seconds:
@@ -1245,7 +1262,7 @@ class ScoutLane:
                 f"live_loss_budget=${c.live_loss_budget_usd:,.0f}{' (promotion refused until set)' if c.live_loss_budget_usd <= 0 else ''} "
                 f"shadow>={c.shadow_min_days}d/{c.shadow_min_trades}trades/{c.shadow_min_tokens}tokens PF>={c.shadow_min_profit_factor} "
                 f"DD<={c.shadow_max_drawdown:.0%} history>={c.min_history_days}d PF>={c.min_profit_factor} "
-                f"tracked={len(self.st['candidates'])} policy={POLICY_VERSION}")
+                f"tracked={len(self.st['candidates'])} policy={policy_key(c)}")
 
     # ---- report --------------------------------------------------------------------------
     def report(self) -> dict[str, Any]:
@@ -1290,7 +1307,7 @@ def candidate_report(st: dict[str, Any], cfg: ScoutConfig, now: float) -> dict[s
     counts: dict[str, int] = defaultdict(int)
     for r in rows:
         counts[r["state"]] += 1
-    return {"policy_version": POLICY_VERSION, "mode": cfg.mode, "live_switch": cfg.live, "elite_only": cfg.elite_only,
+    return {"policy_version": policy_key(cfg), "mode": cfg.mode, "live_switch": cfg.live, "elite_only": cfg.elite_only,
             "track": "fast" if cfg.fast_track else "full", "live_loss_budget_usd": cfg.live_loss_budget_usd,
             "counts": dict(counts), "candidates": rows, "shadow_positions": st.get("positions", []),
             "last_selection": st.get("last_selection"), "discovered_at": st.get("discovered_ts"), "errors": (st.get("errors") or [])[-10:],
