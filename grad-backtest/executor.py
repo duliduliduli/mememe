@@ -365,6 +365,12 @@ class Config:
         # COPY_* thresholds guard it in between. Trades older than COPY_MAX_TX_AGE_SECONDS at
         # detection are ignored, and the first poll of a wallet only takes a baseline.
         self.copy_wallets, self.copy_wallet_min_usd, self.copy_wallet_size = parse_wallet_list(os.getenv("COPY_WALLETS", ""))
+        # Built-in terms for wallets we know, so they need no editing in Railway. Terms written
+        # in COPY_WALLETS (address:min:size) still win.
+        for wallet, (minimum, size) in BUILTIN_WALLET_TERMS.items():
+            if wallet in self.copy_wallets:
+                self.copy_wallet_min_usd.setdefault(wallet, minimum)
+                self.copy_wallet_size.setdefault(wallet, size)
         # A mistyped address would fail every poll with "WrongSize"; drop it once, loudly.
         bad = tuple(w for w in self.copy_wallets if not valid_solana_address(w))
         if bad:
@@ -404,9 +410,11 @@ class Config:
         # original instruction: if an address sells a token we hold, sell it), or only the
         # "source" wallet whose buy we copied (adopted positions then rely on their own exits).
         self.copy_sell_scope = os.getenv("COPY_SELL_SCOPE", "any").strip().lower()
-        # GMGN wallet verdicts as an entry gate: "shadow" logs what the gate would have blocked
-        # and mirrors anyway, "enforce" blocks buys from wallets GMGN marks skip, "off" ignores.
-        self.copy_gmgn_gate = os.getenv("COPY_GMGN_GATE", "shadow").strip().lower()
+        # GMGN wallet verdicts as an entry gate: "enforce" (default) blocks buys from wallets
+        # GMGN marks skip, and lets them back in once a daily re-check rates them better (their
+        # sells are always followed); "shadow" logs what it would block and mirrors anyway;
+        # "off" ignores it.
+        self.copy_gmgn_gate = os.getenv("COPY_GMGN_GATE", "enforce").strip().lower()
         self.gmgn_refresh_hours = float(os.getenv("GMGN_REFRESH_HOURS", "24"))
         self.gmgn_retry_minutes = float(os.getenv("GMGN_RETRY_MINUTES", "60"))
         # Source-event bookkeeping: how many source transactions to decode per wallet per poll
@@ -673,6 +681,14 @@ def valid_solana_address(address: str) -> bool:
         return True
     except Exception:
         return False
+
+
+# Per-wallet (minimum source buy in USD, size multiplier) for followed wallets whose record
+# calls for it. 498g1rVn: the biggest winner and the biggest loser of the ledger (13 positions,
+# -$20), with many small buys; only its $300+ conviction buys are copied, at half size.
+BUILTIN_WALLET_TERMS: dict[str, tuple[float, float]] = {
+    "498g1rVnFcnjBjpfw1xyqA1WvgQXUU8RWuELjxkjAayQ": (300.0, 0.5),
+}
 
 
 def parse_wallet_list(spec: str) -> tuple[tuple[str, ...], dict[str, float], dict[str, float]]:
