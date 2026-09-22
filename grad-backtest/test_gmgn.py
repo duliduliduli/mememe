@@ -5,6 +5,7 @@ import unittest
 from unittest import mock
 
 os.environ.setdefault("DATA_DIR", tempfile.mkdtemp(prefix="grad-gmgn-test-"))
+os.environ["GMGN_UNITS_PER_SECOND"] = "100000"      # the shared limiter never waits in tests unless one sets a rate
 
 import gmgn
 
@@ -23,6 +24,10 @@ def stats_row(wallet, realized, winrate, buys, sells, tags=None):
 
 
 class ClientTests(unittest.TestCase):
+    def setUp(self):
+        gmgn.LIMITER.reset()
+        self.addCleanup(gmgn.LIMITER.reset)
+
     def test_request_carries_key_timestamp_and_client_id(self):
         client = gmgn.Gmgn(api_key="k123")
         client.pause_seconds = 0
@@ -65,6 +70,71 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(summary[0]["wallet"], "trader1")
         self.assertEqual(summary[0]["tags"], ["smart_degen", "top_holder"])
         self.assertEqual(summary[0]["realized_profit"], 1234.5)
+
+
+class LimiterTests(unittest.TestCase):
+    """Every GMGN call in the process shares one budget, and a ban holds every caller."""
+
+    def setUp(self):
+        gmgn.LIMITER.reset()
+        self.addCleanup(gmgn.LIMITER.reset)
+        self.clock = [1000.0]
+        self.slept = []
+        def sleep(seconds):
+            self.slept.append(round(seconds, 3))
+            self.clock[0] += seconds
+        for target, value in (("time", lambda: self.clock[0]), ("sleep", sleep)):
+            patcher = mock.patch.object(gmgn.time, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def client(self, responses):
+        c = gmgn.Gmgn(api_key="k")
+        c.pause_seconds = 0
+        c.session.request = lambda *a, **k: responses.pop(0)
+        return c
+
+    def test_separate_clients_share_one_budget(self):
+        ok = lambda: FakeResponse({"code": 0, "data": {}})
+        with mock.patch.dict(os.environ, {"GMGN_UNITS_PER_SECOND": "5"}):
+            a, b = self.client([ok()]), self.client([ok(), ok()])
+            a.request("GET", "/v1/user/wallet_stats")       # weight 3: the next call waits 0.6s
+            b.request("GET", "/v1/user/wallet_stats")
+            b.request("GET", "/v1/market/token_top_traders")  # after weight 3 again: 0.6s
+        self.assertEqual(self.slept, [0.6, 0.6])
+
+    def test_a_ban_holds_every_caller_until_it_lifts(self):
+        banned = FakeResponse({"code": 429, "message": "IP is temporarily banned due to repeated rate limit violations",
+                               "reset_at": 1100}, 429)
+        a = self.client([banned, FakeResponse({"code": 0, "data": []})])
+        self.assertEqual(a.smart_money("sol"), [])
+        self.assertEqual(self.slept, [101.0])               # waited out the ban once, then retried
+        self.clock[0] = 1050.0                              # another thread, mid-ban
+        gmgn.LIMITER.block(1101.0)
+        b = self.client([FakeResponse({"code": 0, "data": []})])
+        b.kol("sol")
+        self.assertEqual(self.slept[-1], 51.0)
+
+    def test_ban_wait_is_capped_and_a_second_refusal_gives_up(self):
+        refused = lambda: FakeResponse({"code": 429, "message": "banned", "reset_at": 1_000_000_000_000_000}, 429)
+        c = self.client([refused(), refused()])
+        with self.assertRaises(gmgn.GmgnError) as err:
+            c.smart_money("sol")
+        self.assertEqual(self.slept, [gmgn.MAX_BAN_WAIT_SECONDS])
+        self.assertIn("rate limited", str(err.exception))
+        import scout
+        self.assertTrue(scout.rate_limited(err.exception))
+
+    def test_reset_in_milliseconds_and_header(self):
+        self.clock[0] = 1_800_000_000.0
+        c = self.client([FakeResponse({"code": 429, "message": "slow", "reset_at": 1_800_000_010_000}, 429),
+                         FakeResponse({"code": 0, "data": []})])
+        c.smart_money("sol")
+        self.assertEqual(self.slept, [11.0])
+        c = self.client([FakeResponse({"code": 429, "message": "slow"}, 429, {"x-ratelimit-reset": "1800000030"}),
+                         FakeResponse({"code": 0, "data": []})])
+        c.smart_money("sol")
+        self.assertEqual(self.slept[-1], 20.0)
 
 
 REAL_ROW = {"wallet_address": "EC2f", "native_balance": "0", "realized_profit": "787901.678", "realized_profit_pnl": "0.505",

@@ -126,7 +126,8 @@ class ScoutConfig:
         self.token_sample = _env_int("SCOUT_TOKEN_SAMPLE", 12)
         self.gmgn_units_per_cycle = _env_int("SCOUT_GMGN_UNITS_PER_CYCLE", 1800)
         self.pause_seconds = _env_float("SCOUT_PAUSE_SECONDS", 2.0)          # between GMGN calls; the free tier bans an IP that sustains too much
-        self.rate_limit_cooldown_hours = _env_float("SCOUT_RATE_LIMIT_COOLDOWN_HOURS", 3)
+        # GMGN bans last at most 5 minutes; the pause is a margin over that, not a penalty.
+        self.rate_limit_cooldown_hours = _env_float("SCOUT_RATE_LIMIT_COOLDOWN_HOURS", 0.25)
         self.requalify_hours = _env_float("SCOUT_REQUALIFY_HOURS", 24)
         # Historical qualification (30d window unless named otherwise)
         self.min_history_days = _env_float("SCOUT_MIN_HISTORY_DAYS", 60)
@@ -751,7 +752,11 @@ class ScoutLane:
         retry_ok = self.now() - float(self.st.get("attempt_ts") or 0) >= 1800
         # GMGN bans an IP that keeps pushing after a rate-limit warning, so a cycle that hit
         # one buys silence rather than retrying into the ban.
-        cooling = self.now() < float(self.st.get("rate_limited_until") or 0)
+        # A pause stored under an older, longer setting is cut back to the current one.
+        until = float(self.st.get("rate_limited_until") or 0)
+        if until > self.now() + self.cfg.rate_limit_cooldown_hours * 3600:
+            until = self.st["rate_limited_until"] = self.now() + self.cfg.rate_limit_cooldown_hours * 3600
+        cooling = self.now() < until
         if cooling and not force:
             return
         if not force and not (due and retry_ok):
@@ -812,13 +817,15 @@ class ScoutLane:
             del self.st["errors"][:-50]
             self.log(f"WARN discovery failed: {payload}; retrying in 30m")
             return
-        self.st["discovered_ts"] = self.now()
         if payload.get("rate_limited"):
+            # Not a finished cycle: pick the backlog back up after the pause (and the 30m
+            # retry spacing) instead of waiting out a whole discovery period.
             until = self.now() + self.cfg.rate_limit_cooldown_hours * 3600
             self.st["rate_limited_until"] = until
             self.log(f"WARN GMGN rate-limited this cycle; pausing discovery for "
-                     f"{self.cfg.rate_limit_cooldown_hours:.0f}h and resuming at a slower pace")
+                     f"{self.cfg.rate_limit_cooldown_hours * 60:.0f}m and resuming at a slower pace")
         else:
+            self.st["discovered_ts"] = self.now()
             self.st.pop("rate_limited_until", None)
         self.st["token_sample"] = payload.get("token_sample", [])
         self.st["last_units"] = payload.get("units", 0)

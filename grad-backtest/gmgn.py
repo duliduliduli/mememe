@@ -3,11 +3,17 @@ the wallets we copy), a token's top traders (to find wallets worth copying) and 
 Money trade feed. Auth is the API key plus a timestamp and a fresh client id on every
 request; the private key GMGN issues is only needed for trading and is never used here.
 
-GMGN_API_KEY turns the integration on. Rate limits are per plan (Free 5/5); a 429 waits
-for the reset once and then gives up, so a screening never blocks the trading loop."""
+GMGN_API_KEY turns the integration on. Rate limits are per plan: a leaky bucket per IP,
+Free 5 units a second with room for 5, and each route has a weight (wallet_stats 3,
+token_top_traders 5). Every call this process makes, from any thread, goes through one
+shared limiter (GMGN_UNITS_PER_SECOND, half the free rate by default), so the wallet
+screening and the scout can never burst past the bucket together. A 429 or a ban pauses
+every thread until GMGN's reset time instead of retrying into it: each request during a
+ban extends it."""
 from __future__ import annotations
 
 import os
+import threading
 import time
 import uuid
 from typing import Any
@@ -20,6 +26,51 @@ USER_AGENT = "mememe-copy-lane/1.0"
 
 class GmgnError(RuntimeError):
     pass
+
+
+# Route weights from GMGN's OpenAPI docs. Unknown routes are charged the common weight.
+WEIGHTS = {
+    "/v1/user/smartmoney": 1, "/v1/user/kol": 1, "/v1/user/info": 2, "/v1/user/wallet_holdings": 2,
+    "/v1/user/wallet_stats": 3, "/v1/user/wallet_activity": 3, "/v1/market/rank": 3,
+    "/v1/market/token_kline": 3, "/v1/market/token_top_traders": 5, "/v1/market/token_top_holders": 5,
+}
+DEFAULT_WEIGHT = 3
+MAX_BAN_WAIT_SECONDS = 330.0          # GMGN bans last up to 5 minutes
+
+
+class _Limiter:
+    """One request budget for the whole process. Each call reserves `weight / rate` seconds
+    of it, so the sustained rate stays under GMGN's bucket however many threads call, and a
+    ban holds every caller until it lifts instead of letting one thread extend it."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.next_free = 0.0
+        self.blocked_until = 0.0
+
+    @staticmethod
+    def rate() -> float:
+        return max(0.1, float(os.getenv("GMGN_UNITS_PER_SECOND", "2.5")))
+
+    def acquire(self, weight: float) -> None:
+        with self.lock:
+            start = max(time.time(), self.next_free, self.blocked_until)
+            self.next_free = start + weight / self.rate()
+        wait = start - time.time()
+        if wait > 0:
+            time.sleep(wait)
+
+    def block(self, until: float) -> None:
+        with self.lock:
+            self.blocked_until = max(self.blocked_until, until)
+            self.next_free = max(self.next_free, until)
+
+    def reset(self) -> None:
+        with self.lock:
+            self.next_free = self.blocked_until = 0.0
+
+
+LIMITER = _Limiter()
 
 
 def configured() -> bool:
@@ -47,7 +98,9 @@ class Gmgn:
             else:
                 params.append((key, str(value)))
         headers = {"X-APIKEY": self.api_key, "Content-Type": "application/json", "User-Agent": USER_AGENT}
+        weight = WEIGHTS.get(path, DEFAULT_WEIGHT)
         for attempt in (1, 2):
+            LIMITER.acquire(weight)
             params_now = params + [("timestamp", str(int(time.time()))), ("client_id", str(uuid.uuid4()))]
             resp = self.session.request(method, f"{self.host}{path}", params=params_now, json=body, headers=headers, timeout=self.timeout)
             try:
@@ -57,15 +110,19 @@ class Gmgn:
             if data.get("code") == 0:
                 return data.get("data")
             message = str(data.get("message") or data.get("error") or data)
-            if resp.status_code == 429 and attempt == 1:
-                reset = resp.headers.get("x-ratelimit-reset")
-                wait = 2.0
+            if resp.status_code == 429 or str(data.get("code")) == "429":
+                # A ban carries `reset_at` in the body; an ordinary limit, the reset header.
+                # Hold every thread until then: a request during a ban extends it.
+                reset = data.get("reset_at") or resp.headers.get("x-ratelimit-reset")
                 try:
-                    wait = min(30.0, max(1.0, float(reset) - time.time() + 1.0)) if reset else 2.0
-                except ValueError:
-                    pass
-                time.sleep(wait)
-                continue
+                    until = float(reset)
+                    until = (until / 1000.0 if until > 1e11 else until) + 1.0   # seconds or milliseconds
+                except (TypeError, ValueError):
+                    until = time.time() + 5.0
+                LIMITER.block(min(until, time.time() + MAX_BAN_WAIT_SECONDS))
+                if attempt == 1:
+                    continue
+                raise GmgnError(f"{method} {path}: rate limited: {message}")
             upgrade = data.get("upgrade_url")
             raise GmgnError(f"{method} {path}: {message}" + (f" (upgrade: {upgrade})" if upgrade else ""))
         raise GmgnError(f"{method} {path}: rate limited")

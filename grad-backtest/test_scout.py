@@ -12,6 +12,7 @@ os.environ.setdefault("DATA_DIR", tempfile.mkdtemp(prefix="grad-scout-test-"))
 # The tests below exercise the full policy (every gate decides). The fast track, on by default
 # in production, has its own tests that switch it on explicitly.
 os.environ["SCOUT_FAST_TRACK"] = "0"
+os.environ["GMGN_UNITS_PER_SECOND"] = "100000"      # the shared GMGN limiter never waits in tests
 os.environ["SCOUT_LIVE"] = "0"                      # promotion is on in production; tests that need it set it explicitly
 
 import scout
@@ -288,7 +289,7 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(cfg.discovery_hours, 2.0)
             self.assertEqual(cfg.enrich_per_cycle, 12)
             self.assertEqual(cfg.pause_seconds, 2.0)
-            self.assertEqual(cfg.rate_limit_cooldown_hours, 3.0)
+            self.assertEqual(cfg.rate_limit_cooldown_hours, 0.25)
             self.assertEqual(cfg.tripwire_trades, 10)
             self.assertFalse(cfg.enabled)                                        # no key: nothing runs
         self.assertTrue(cfg_with(GMGN_API_KEY="k").enabled)
@@ -781,6 +782,15 @@ class LaneTests(unittest.TestCase):
         lane._result = ("ok", {"candidates": {}, "token_sample": [], "units": 9, "errors": [], "rate_limited": False})
         lane.apply_discovery()
         self.assertNotIn("rate_limited_until", lane.st)                            # a clean cycle clears it
+
+    def test_a_pause_stored_under_the_old_longer_setting_is_cut_back(self):
+        executor, ex = self.make()
+        lane = ex.scout
+        lane.st["rate_limited_until"] = time.time() + 3 * 3600                    # set by the old 3h default
+        with mock.patch("threading.Thread") as thread:
+            lane.maybe_discover()
+            self.assertEqual(thread.call_count, 0)
+        self.assertLessEqual(lane.st["rate_limited_until"], time.time() + 15 * 60 + 1)
 
     def test_discovery_reruns_at_retry_interval_until_something_is_enriched(self):
         executor, ex = self.make()
