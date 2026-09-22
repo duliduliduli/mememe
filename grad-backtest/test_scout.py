@@ -284,6 +284,9 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(cfg.live_loss_budget_usd, 25.0)
             self.assertTrue(cfg.fast_track)
             self.assertEqual(cfg.fast_track_min_history_days, 15.0)
+            self.assertEqual(cfg.fast_track_dense_episodes, 40)
+            self.assertEqual(cfg.discovery_hours, 2.0)
+            self.assertEqual(cfg.enrich_per_cycle, 25)
             self.assertEqual(cfg.tripwire_trades, 10)
             self.assertFalse(cfg.enabled)                                        # no key: nothing runs
         self.assertTrue(cfg_with(GMGN_API_KEY="k").enabled)
@@ -692,6 +695,28 @@ class LaneTests(unittest.TestCase):
         self.assertEqual(cand["state"], "paused")
         self.assertIn("tripwire", cand["lifecycle"][-1]["reason"])
         self.assertEqual(ex.scout.live_wallets(), {})
+
+    def test_dense_history_counts_when_the_page_cap_cut_the_window_short(self):
+        """A wallet trading hundreds of times a day can never show 15 calendar days inside the
+        activity page cap. Its episodes are the evidence, so they qualify it instead."""
+        cfg = cfg_with(GMGN_API_KEY="k", SCOUT_FAST_TRACK="1")
+        cand = good_candidate(OTHER)
+        cand["rank_snapshots"], cand["holdings"] = [], None
+        cand["history"].update({"coverage_days": 6.0, "truncated": True})          # 800 events, 6 days
+        ev = scout.evaluate_candidate(cand, cfg, NOW, 300.0)
+        self.assertEqual(ev["gates"]["history_days_fast"]["status"], "pass")       # 40 closed episodes
+        self.assertIn("dense evidence", ev["gates"]["history_days_fast"]["detail"])
+        self.assertTrue(ev["qualified"])
+        # Thin and truncated is still missing evidence, not a pass.
+        cand["history"]["metrics_30d"] = scout.history_metrics(good_episodes(tokens=12, winners=9), NOW, 30, 300.0, set(), 20000.0)
+        ev = scout.evaluate_candidate(cand, cfg, NOW, 300.0)
+        self.assertEqual(ev["gates"]["history_days_fast"]["status"], "missing")
+        self.assertFalse(ev["qualified"])
+        # A short history that was NOT truncated is a fail: the wallet is simply too new.
+        cand["history"]["metrics_30d"] = scout.history_metrics(good_episodes(), NOW, 30, 300.0, set(), 20000.0)
+        cand["history"]["truncated"] = False
+        ev = scout.evaluate_candidate(cand, cfg, NOW, 300.0)
+        self.assertEqual(ev["gates"]["history_days_fast"]["status"], "fail")
 
     def test_full_policy_still_needs_every_gate(self):
         cand = good_candidate(OTHER)
