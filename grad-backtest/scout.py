@@ -683,6 +683,12 @@ class ScoutLane:
     def tick(self, sol_price: float) -> None:
         if not self.enabled:
             return
+        if self.st.get("policy_version") != POLICY_VERSION and self.st["candidates"]:
+            # A deploy changed the policy: re-score what is already known now, not at the
+            # next discovery cycle hours away.
+            self.log(f"policy {self.st.get('policy_version')} -> {POLICY_VERSION}: re-evaluating {len(self.st['candidates'])} candidate(s)")
+            self.evaluate_all()
+        self.st["policy_version"] = POLICY_VERSION
         self.apply_discovery()
         self.maybe_discover()
         if self.now() - self._poll_ts >= self.cfg.poll_seconds:
