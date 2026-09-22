@@ -9,6 +9,9 @@ import unittest
 from unittest import mock
 
 os.environ.setdefault("DATA_DIR", tempfile.mkdtemp(prefix="grad-scout-test-"))
+# The tests below exercise the full policy (every gate decides). The fast track, on by default
+# in production, has its own tests that switch it on explicitly.
+os.environ["SCOUT_FAST_TRACK"] = "0"
 
 import scout
 from test_copy import MINT, OTHER, SOL, WALLET, WSOL, fresh, tx
@@ -276,7 +279,10 @@ class ConfigTests(unittest.TestCase):
             self.assertFalse(cfg.elite_only)
             self.assertEqual(cfg.max_live, 3)
             self.assertEqual(cfg.live_size, 0.25)
-            self.assertEqual(cfg.live_loss_budget_usd, 0.0)
+            self.assertEqual(cfg.live_loss_budget_usd, 25.0)
+            self.assertTrue(cfg.fast_track)
+            self.assertEqual(cfg.fast_track_min_history_days, 15.0)
+            self.assertEqual(cfg.tripwire_trades, 10)
             self.assertFalse(cfg.enabled)                                        # no key: nothing runs
         self.assertTrue(cfg_with(GMGN_API_KEY="k").enabled)
         self.assertFalse(cfg_with(GMGN_API_KEY="k", SCOUT_MODE="off").enabled)
@@ -316,7 +322,7 @@ class LaneTests(unittest.TestCase):
         self.assertIn("no wallet passes every mandatory gate", ex.scout.st["last_selection"]["reason"])
 
     def test_promotion_needs_switch_and_budget(self):
-        executor, ex = self.make()                                               # SCOUT_LIVE unset
+        executor, ex = self.make(SCOUT_LIVE_LOSS_BUDGET_USD="0")                 # SCOUT_LIVE unset, budget cleared
         self.seed(ex, OTHER, state="shadow")
         ex.scout.evaluate_all()
         self.assertEqual(ex.scout.st["candidates"][OTHER]["state"], "qualified")
@@ -611,13 +617,70 @@ class LaneTests(unittest.TestCase):
         self.assertEqual(ex.followed_wallets(), [WALLET])
 
     def test_heartbeat_and_startup_line(self):
-        executor, ex = self.make()
+        executor, ex = self.make(SCOUT_LIVE_LOSS_BUDGET_USD="0")
         self.seed(ex, OTHER, state="shadow")
         self.assertIn("shadow:cand=1,shadow=1", ex.scout.heartbeat())
         line = ex.scout.startup_line()
         self.assertIn("live_promotion=off", line)
+        self.assertIn("track=full", line)
         self.assertIn("promotion refused until set", line)
         self.assertIn(scout.POLICY_VERSION, line)
+
+    # -- fast track --------------------------------------------------------------------------
+    def test_fast_track_qualifies_on_history_alone_but_never_promotes_with_the_switch_off(self):
+        executor, ex = self.make(SCOUT_FAST_TRACK="1")
+        cand = self.seed(ex, OTHER, state="shadow")
+        cand["rank_snapshots"] = []                                               # no leaderboard evidence
+        cand["holdings"] = None                                                   # holdings need signed auth
+        cand["history"]["coverage_days"] = 16.0
+        ex.scout.st["trades"] = []                                                # and no shadow sample at all
+        ex.scout.evaluate_all()
+        ev = cand["evaluation"]
+        self.assertEqual(ev["track"], "fast")
+        self.assertIn("leaderboard", ev["waived"])
+        self.assertIn("shadow_sample", ev["waived"])
+        self.assertEqual(ev["failed"], [])
+        self.assertEqual(ev["missing"], [])
+        self.assertTrue(ev["qualified"])
+        self.assertEqual(cand["state"], "qualified")
+        self.assertEqual(ex.scout.live_wallets(), {})                             # SCOUT_LIVE still off
+        self.assertIn("SCOUT_LIVE=0", ex.scout.st["last_selection"]["reason"])
+        # The history gates still decide: a jackpot wallet or a thin one does not pass.
+        cand["history"]["coverage_days"] = 9.0
+        ex.scout.evaluate_all()
+        self.assertIn("history_days_fast", cand["evaluation"]["failed"])
+        self.assertEqual(cand["state"], "shadow")
+        cand["history"]["coverage_days"] = 16.0
+        cand["stats"]["7d"]["realized_profit"] = -1.0
+        ex.scout.evaluate_all()
+        self.assertIn("pnl_7d", cand["evaluation"]["failed"])
+
+    def test_fast_track_promotes_with_switch_and_budget_and_tripwire_pauses(self):
+        executor, ex = self.make(SCOUT_FAST_TRACK="1", SCOUT_LIVE="1")            # budget defaults to 25
+        cand = self.seed(ex, OTHER, state="shadow")
+        cand["rank_snapshots"], cand["holdings"] = [], None
+        ex.scout.st["trades"] = []
+        ex.scout.evaluate_all()                                                   # qualified
+        ex.scout.evaluate_all()                                                   # promoted
+        self.assertEqual(cand["state"], "live")
+        self.assertEqual(ex.scout.live_wallets(), {OTHER: {"size": 0.25, "min_usd": 300.0}})
+        self.assertIn("budget 25 USD", cand["lifecycle"][-1]["reason"])
+        # Shadow keeps scoring the live wallet: ten losing paper trades trip it.
+        for t in good_shadow_trades(OTHER, time.time(), n=10):
+            t["pnl_base"] = -0.5
+            ex.scout.st["trades"].append(t)
+        ex.scout.evaluate_all()
+        self.assertEqual(cand["state"], "paused")
+        self.assertIn("tripwire", cand["lifecycle"][-1]["reason"])
+        self.assertEqual(ex.scout.live_wallets(), {})
+
+    def test_full_policy_still_needs_every_gate(self):
+        cand = good_candidate(OTHER)
+        cand["rank_snapshots"] = []
+        ev = scout.evaluate_candidate(cand, cfg_with(SCOUT_FAST_TRACK="0"), NOW, 300.0)
+        self.assertEqual(ev["track"], "full")
+        self.assertEqual(ev["missing"], ["leaderboard"])
+        self.assertFalse(ev["qualified"])
 
     def test_discovery_reruns_at_retry_interval_until_something_is_enriched(self):
         executor, ex = self.make()
