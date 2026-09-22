@@ -267,6 +267,9 @@ class Config:
         # that a small pop followed by an ordinary pullback is left to the stop loss, instead of
         # selling a coin at -18% because it was briefly +12% (every lane, every trailing stop).
         self.trailing_arm_gain = float(os.getenv("TRAILING_ARM_GAIN", "0.30"))
+        # Breakeven floor, off for every lane except copy (see COPY_BREAKEVEN_ARM).
+        self.breakeven_arm = 0.0
+        self.breakeven_floor = 0.0
         # Never sell the whole position: a slice stays in the wallet in case the token runs
         # after the exit. MOON_BAG=0 restores full exits.
         # 10% of a winning exit is the lottery ticket: 28 bags kept from losing exits in one
@@ -280,6 +283,12 @@ class Config:
         self.moon_bag_winners_only = os.getenv("MOON_BAG_WINNERS_ONLY", "1") == "1"  # 0: losers keep a bag too
         self.moon_bag_target_x = max(0.0, float(os.getenv("MOON_BAG_TARGET_X", "100")))
         self.moon_bag_check_seconds = float(os.getenv("MOON_BAG_CHECK_SECONDS", "180"))
+        # Moon bags ride runners, and a meme that runs usually crashes just as hard. Once a bag
+        # has been worth MOON_BAG_TRAIL_ARM_X times what was kept, it is sold if it falls
+        # MOON_BAG_TRAIL from that peak (HhcfXbZ2's bag went 12x and back to 2.3x unsold).
+        # 0 for either disables it.
+        self.moon_bag_trail_arm_x = max(0.0, float(os.getenv("MOON_BAG_TRAIL_ARM_X", "3")))
+        self.moon_bag_trail = min(0.95, max(0.0, float(os.getenv("MOON_BAG_TRAIL", "0.40"))))
         # A bag worth less than MIN_MOON_BAG_USD is not worth its own rent (0.002 SOL) and is
         # sold with the rest. A bag that has fallen to MOON_BAG_DEAD_PCT of the value it was kept
         # at is burned and its account closed: the rent is worth more than the tokens.
@@ -426,12 +435,24 @@ class Config:
         self.copy_stop_loss = float(os.getenv("COPY_STOP_LOSS", "0.30"))
         self.copy_trailing_stop = float(os.getenv("COPY_TRAILING_STOP", "0.25"))
         self.copy_time_stop_minutes = float(os.getenv("COPY_TIME_STOP_MINUTES", "1440"))
-        # The followed wallets' winners mostly top out between +30% and +100% from their entry,
-        # so profit is phased out across that range: "1.4:40,1.8:30,3:30" sells 40% of the entry
-        # tokens at +40%, 30% at +80% and the last 30% at 3x (the final rung closes the
-        # position, so the moon bag still applies).
+        # Memes rip or die: every copied coin that passed +56% was a winner, none that stalled
+        # under +30% came back. So profit is banked early and hard, and what the ladder leaves
+        # hunts the runner: "1.4:30,1.8:30" sells 30% of the entry tokens at +40% and 30% at
+        # +80% (0.96x of the cost back), and the remaining 40% rides.
         # Empty disables the ladder and COPY_TAKE_PROFIT decides instead.
-        self.copy_ladder = parse_sell_ladder(os.getenv("COPY_LADDER", "1.4:40,1.8:30,3:30"))
+        self.copy_ladder = parse_sell_ladder(os.getenv("COPY_LADDER", "1.4:30,1.8:30"))
+        # The runner: once every rung is sold, the remainder trails COPY_RUNNER_TRAIL from its
+        # peak with no take-profit cap (the old 3x rung sold CdhZy8 before a 4x more and
+        # HhcfXbZ2 before 12x more). It is house money by then, so a wide trail only risks
+        # profit. 0 restores the old behaviour: the last rung closes the position.
+        self.copy_runner_trail = min(0.95, max(0.0, float(os.getenv("COPY_RUNNER_TRAIL", "0.40"))))
+        # Breakeven floor: once a copied position has been up COPY_BREAKEVEN_ARM, its stop moves
+        # from -COPY_STOP_LOSS up to entry plus COPY_BREAKEVEN_FLOOR. A meme that popped and fell
+        # back to entry is almost always dying: 8 of 38 positions popped +12-30% and then rode all
+        # the way to -30%. Armed at +20%, not +15%: at +15% the floor wicked out 7M3gDRgo, a
+        # slow winner, in the replay. 0 disables it.
+        self.copy_breakeven_arm = max(0.0, float(os.getenv("COPY_BREAKEVEN_ARM", "0.20")))
+        self.copy_breakeven_floor = float(os.getenv("COPY_BREAKEVEN_FLOOR", "0.0"))
         # Bundle guards. A curve that fills in seconds was bought by one party (SOLL graduated 29s
         # after creation with six buyers), and a wallet holding a big slice of supply at entry is
         # the one that dumps on us (SOLL's creator held 59% at graduation). 0 disables either.
@@ -1182,9 +1203,34 @@ def decide_exit(
     armed = bool(peak_usd) and peak_usd >= entry_usd * (1.0 + float(getattr(cfg, "trailing_arm_gain", 0.0) or 0.0))
     if cfg.trailing_stop > 0 and armed and current_usd <= peak_usd * (1.0 - cfg.trailing_stop):
         return "trailing_stop"
+    # Checked after the trail so the label names the higher stop when a crash crosses both:
+    # this one fires for the pop that never armed the trail (peak between +20% and +30%).
+    breakeven_arm = float(getattr(cfg, "breakeven_arm", 0.0) or 0.0)
+    if (breakeven_arm > 0 and peak_usd and peak_usd >= entry_usd * (1.0 + breakeven_arm)
+            and current_usd <= entry_usd * (1.0 + float(getattr(cfg, "breakeven_floor", 0.0) or 0.0))):
+        return "breakeven_stop"
     if now - opened_ts >= cfg.time_stop_minutes * 60:
         return "time_stop"
     return None
+
+
+def tp_text(basis: float, cfg: Config) -> str:
+    """The take-profit for the POSITION log line; a runner has none, only its trail."""
+    if cfg.take_profit == float("inf"):
+        return f"tp_value=none(runner, trail {cfg.trailing_stop:.0%})"
+    return f"tp_value=${basis * (1 + cfg.take_profit):.2f}"
+
+
+def stop_text(basis: float, peak: float, cfg: Config) -> str:
+    """The stop a position is actually on, for the POSITION log line: the stop loss, or the
+    breakeven floor once the position has been up far enough to arm it."""
+    stop = basis * (1.0 - cfg.stop_loss)
+    arm = float(getattr(cfg, "breakeven_arm", 0.0) or 0.0)
+    if arm > 0 and peak >= basis * (1.0 + arm):
+        floor = basis * (1.0 + float(getattr(cfg, "breakeven_floor", 0.0) or 0.0))
+        if floor > stop:
+            return f"sl_value=${floor:.2f}(breakeven)"
+    return f"sl_value=${stop:.2f}"
 
 
 class Rpc:
@@ -2759,9 +2805,18 @@ class Executor:
         cfg.stop_loss = getattr(self.cfg, f"{prefix}_stop_loss")
         cfg.trailing_stop = getattr(self.cfg, f"{prefix}_trailing_stop")
         cfg.time_stop_minutes = getattr(self.cfg, f"{prefix}_time_stop_minutes")
+        if prefix == "copy":
+            cfg.breakeven_arm = self.cfg.copy_breakeven_arm
+            cfg.breakeven_floor = self.cfg.copy_breakeven_floor
         if pos.get("ladder"):
-            # The ladder phases profit out; the flat take profit only backstops its top rung.
-            cfg.take_profit = max(cfg.take_profit, max(r["x"] for r in pos["ladder"]) - 1.0)
+            pending = [r for r in pos["ladder"] if not r.get("done")]
+            if pending or self.cfg.copy_runner_trail <= 0:
+                # The ladder phases profit out; the flat take profit only backstops its top rung.
+                cfg.take_profit = max(cfg.take_profit, max(r["x"] for r in pos["ladder"]) - 1.0)
+            else:
+                # Every rung is sold and what is left is the runner: no cap, a wide trail.
+                cfg.take_profit = float("inf")
+                cfg.trailing_stop = self.cfg.copy_runner_trail
         return cfg
 
     # ---- copy trading ----------------------------------------------------
@@ -3610,6 +3665,7 @@ class Executor:
                     "cost_usd": round(pos["position_usd"] * mb, 2),
                     "kept_usd": round(kept_usd, 2),
                     "peak_usd": round(kept_usd, 2),
+                    "trail_peak_usd": round(kept_usd, 2),
                     "created_at": utc_iso(),
                     "from_exit": reason,
                     "copy": pos.get("copy"),
@@ -3849,7 +3905,7 @@ class Executor:
                     basis = float(pos['position_usd'])
                     xcfg = self.exit_cfg(pos)
                     log(f"POSITION {pos['mint']} price_value=${estimate:.2f} basis=${basis:.2f} "
-                        f"tp_value=${basis * (1 + xcfg.take_profit):.2f} sl_value=${basis * (1 - xcfg.stop_loss):.2f} "
+                        f"{tp_text(basis, xcfg)} {stop_text(basis, float(pos['peak_usd']), xcfg)} "
                         f"peak=${pos['peak_usd']:.2f} age={(now_ts() - pos['opened_ts']) / 60:.1f}m")
                 continue
             try:
@@ -3863,8 +3919,8 @@ class Executor:
                     basis = float(pos['position_usd'])
                     log(
                         f"POSITION {pos['mint']}{' (runner)' if pos.get('runner') else ''} sell_quote=${current_usd:.2f} basis=${basis:.2f} "
-                        f"tp_value=${basis * (1 + xcfg.take_profit):.2f} "
-                        f"sl_value=${basis * (1 - xcfg.stop_loss):.2f} "
+                        f"{tp_text(basis, xcfg)} "
+                        f"{stop_text(basis, float(pos['peak_usd']), xcfg)} "
                         f"peak_quote=${pos['peak_usd']:.2f} scaled_out={bool(pos.get('scaled_out'))} "
                         f"age={(now_ts() - pos['opened_ts']) / 60:.1f}m"
                     )
@@ -3964,8 +4020,9 @@ class Executor:
 
     def ladder_step(self, pos: dict[str, Any], current_usd: float, sol_price: float) -> bool:
         """Copied positions phase out profit: at each rung's multiple of the entry price sell that
-        rung's share of the entry tokens; the last rung closes the position (moon bag applies).
-        Returns True when it acted, so the caller re-quotes next cycle."""
+        rung's share of the entry tokens. With COPY_RUNNER_TRAIL on, what the rungs leave rides as
+        the runner; with it off, the last rung closes the position (moon bag applies). Returns
+        True when it acted, so the caller re-quotes next cycle."""
         rungs = pos.get("ladder") or []
         entry_tokens, entry_basis = int(pos.get("entry_tokens") or 0), float(pos.get("entry_basis_usd") or 0)
         tokens_now = int(pos["tokens"])
@@ -3981,8 +4038,9 @@ class Executor:
         last = crossed[-1] is rungs[-1]
         for r in crossed:
             r["done"] = True
-        log(f"LADDER {pos['mint']}: {multiple:.2f}x entry, rung {crossed[-1]['x']:g}x reached")
-        if last or share_tokens >= tokens_now * 0.98:
+        log(f"LADDER {pos['mint']}: {multiple:.2f}x entry, rung {crossed[-1]['x']:g}x reached"
+            f"{'; the rest rides as the runner' if last and self.cfg.copy_runner_trail > 0 and share_tokens < tokens_now * 0.98 else ''}")
+        if (last and self.cfg.copy_runner_trail <= 0) or share_tokens >= tokens_now * 0.98:
             self.close_position(pos, f"ladder_{crossed[-1]['x']:g}x", sol_price)
         else:
             self.scale_out(pos, sol_price, frac=share_tokens / tokens_now, reason=f"ladder_{crossed[-1]['x']:g}x")
@@ -4040,12 +4098,26 @@ class Executor:
             bag["last_value_usd"] = round(value, 2)
             bag["peak_usd"] = round(max(float(bag.get("peak_usd") or 0.0), value), 2)
             bag["last_x"] = round(value / kept, 1) if kept > 0 else None
+            # The trail's own peak. A bag from before the trail existed starts it at today's
+            # value, so a deploy never sells a bag for a peak it reached under the old rules.
+            trail_peak = max(float(bag.get("trail_peak_usd") or value), value)
+            bag["trail_peak_usd"] = round(trail_peak, 2)
+            trailing = (kept > 0 and self.cfg.moon_bag_trail > 0 and self.cfg.moon_bag_trail_arm_x > 0
+                        and trail_peak >= kept * self.cfg.moon_bag_trail_arm_x
+                        and value <= trail_peak * (1.0 - self.cfg.moon_bag_trail))
             if kept > 0 and value >= kept * self.cfg.moon_bag_target_x:
                 try:
                     proceeds = self.sell_bag(bag, "moon_bags", "moon_bag_target", sol_price, quote)
                     log(f"MOONBAG TARGET {bag['mint']}: worth ${value:,.2f} = {value / kept:.0f}x the ${kept:.2f} kept; sold for ${proceeds:,.2f}")
                 except Exception as exc:
                     log(f"WARN moon bag {bag['mint']} hit {value / kept:.0f}x but sell failed: {describe_error(exc)}")
+            elif trailing:
+                try:
+                    proceeds = self.sell_bag(bag, "moon_bags", "moon_bag_trail", sol_price, quote)
+                    log(f"MOONBAG TRAIL {bag['mint']}: peaked at ${trail_peak:,.2f} ({trail_peak / kept:.1f}x the ${kept:.2f} kept), "
+                        f"fell {1 - value / trail_peak:.0%}; sold for ${proceeds:,.2f}")
+                except Exception as exc:
+                    log(f"WARN moon bag {bag['mint']} trail hit but sell failed: {describe_error(exc)}")
             elif kept > 0 and self.cfg.moon_bag_dead_pct > 0 and value < kept * self.cfg.moon_bag_dead_pct / 100:
                 self.burn_dead_bag(bag, value)
         save_state(self.state)
@@ -4259,7 +4331,8 @@ class Executor:
             f"scale_out={self.cfg.scale_out_at:.0%}x{self.cfg.scale_out_fraction:.0%} moon_bag={self.cfg.moon_bag:.0%}"
             f"{'(winners only)' if self.cfg.moon_bag_winners_only else ''}"
             f"{f'@{self.cfg.moon_bag_target_x:.0f}x' if self.cfg.moon_bag_target_x > 0 else '@hold'}"
-            f"(min${self.cfg.min_moon_bag_usd:.2f},dead<{self.cfg.moon_bag_dead_pct:.0f}%) "
+            f"(min${self.cfg.min_moon_bag_usd:.2f},dead<{self.cfg.moon_bag_dead_pct:.0f}%"
+            f"{f',trail {self.cfg.moon_bag_trail:.0%} after {self.cfg.moon_bag_trail_arm_x:g}x' if self.cfg.moon_bag_trail > 0 and self.cfg.moon_bag_trail_arm_x > 0 else ''}) "
             f"slippage={self.cfg.slippage_bps}/{self.cfg.sell_slippage_bps}bps(buy/sell) "
             f"round_trip>={self.cfg.min_entry_round_trip_pct:.0f}% "
             f"mcap=${self.cfg.min_entry_market_cap_usd:,.0f}-${self.cfg.max_entry_market_cap_usd:,.0f} "
@@ -4272,6 +4345,8 @@ class Executor:
             f"{'fast' if self.cfg.copy_fast else 'full-checks'} {'follow-sells' if self.cfg.copy_follow_sells else 'own-exits'} "
             f"{'rotate' if self.cfg.copy_rotate else 'no-rotate'} {'first-buys-only' if self.cfg.copy_first_buy_only else 'first-buys+adds'} "
             f"ladder={ladder_text(self.cfg.copy_ladder)} "
+            f"runner={'trail ' + format(self.cfg.copy_runner_trail, '.0%') + ' no cap' if self.cfg.copy_runner_trail > 0 else 'off'} "
+            f"breakeven={'at +' + format(self.cfg.copy_breakeven_arm, '.0%') + ' -> ' + format(self.cfg.copy_breakeven_floor, '+.0%') if self.cfg.copy_breakeven_arm > 0 else 'off'} "
             f"tp=+{self.cfg.copy_take_profit:.0%} sl=-{self.cfg.copy_stop_loss:.0%} trail={self.cfg.copy_trailing_stop:.0%}"
             f"(armed at +{self.cfg.trailing_arm_gain:.0%}) "
             f"time_stop={self.cfg.copy_time_stop_minutes:.0f}m) "

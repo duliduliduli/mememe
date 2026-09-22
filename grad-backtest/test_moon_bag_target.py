@@ -128,6 +128,35 @@ class TargetTests(unittest.TestCase):
             self.ex.manage_moon_bags(SOL)
         self.assertEqual(len(calls), 2)
 
+    def check(self, value):
+        self.ex.state["moon_bags_checked_ts"] = 0
+        self.ex.jup.quote = sol_quote(value)
+        self.ex.manage_moon_bags(SOL)
+
+    def test_trail_sells_a_bag_that_ran_and_turned(self):
+        self.ex.state["moon_bags"][0]["trail_peak_usd"] = 1.75     # created under the trail
+        self.check(3.0)                                             # 1.7x of the $1.75 kept: not armed
+        self.check(6.0)                                             # 3.4x: armed, peak $6
+        self.check(4.0)                                             # -33% off the peak: held
+        self.assertEqual(len(self.ex.state["moon_bags"]), 1)
+        self.check(3.5)                                             # -42%: sold
+        self.assertEqual(self.ex.state["moon_bags"], [])
+        self.assertIn("moon_bag_trail", open(os.path.join(os.environ["DATA_DIR"], "live_trades.csv")).read())
+
+    def test_trail_never_acts_on_a_peak_from_before_it_existed(self):
+        b = self.ex.state["moon_bags"][0]
+        b["peak_usd"] = 20.0                                        # ran 11x under the old rules
+        self.check(3.9)                                             # 2.2x now: not sold for the old peak
+        self.assertEqual(len(self.ex.state["moon_bags"]), 1)
+        self.assertEqual(self.ex.state["moon_bags"][0]["trail_peak_usd"], 3.9)
+
+    def test_trail_off(self):
+        self.ex.cfg.moon_bag_trail = 0
+        self.ex.state["moon_bags"][0]["trail_peak_usd"] = 1.75
+        self.check(6.0)
+        self.check(2.0)
+        self.assertEqual(len(self.ex.state["moon_bags"]), 1)
+
     def test_target_zero_holds_forever(self):
         self.ex.cfg.moon_bag_target_x = 0
         self.ex.jup.quote = sol_quote(1_000_000.0)

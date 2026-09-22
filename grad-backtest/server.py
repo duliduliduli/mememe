@@ -140,7 +140,8 @@ def healthz() -> dict[str, Any]:
     settings = ["EXECUTOR_MODE", "EXECUTOR_AUTOSTART", "DATA_DIR", "MAX_CONCURRENT_POSITIONS", "ACCOUNT_FRACTION",
                 "MAX_DEPLOYED_FRACTION", "MIN_POSITION_USD", "COPY_MIN_BUY_USD", "COPY_FIRST_BUY_ONLY", "COPY_ADD_DUST_RATIO",
                 "COPY_SELL_SCOPE", "COPY_GMGN_GATE", "COPY_ROTATE", "COPY_TIME_STOP_MINUTES", "COPY_LADDER", "HOLD_MINTS",
-                "DAILY_LOSS_LIMIT_USD", "PANIC", "SCOUT_MODE", "SCOUT_LIVE", "SCOUT_ELITE_ONLY", "SCOUT_MAX_LIVE",
+                "DAILY_LOSS_LIMIT_USD", "PANIC", "COPY_RUNNER_TRAIL", "COPY_BREAKEVEN_ARM", "COPY_BREAKEVEN_FLOOR",
+                "MOON_BAG_TRAIL", "MOON_BAG_TRAIL_ARM_X", "SCOUT_MODE", "SCOUT_LIVE", "SCOUT_ELITE_ONLY", "SCOUT_MAX_LIVE",
                 "SCOUT_LIVE_SIZE", "SCOUT_LIVE_LOSS_BUDGET_USD"]
     return {"status": "ok", "commit": os.getenv("RAILWAY_GIT_COMMIT_SHA", "unknown"),
             "settings": {k: os.getenv(k) for k in settings if os.getenv(k) is not None},
