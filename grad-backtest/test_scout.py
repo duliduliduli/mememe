@@ -686,6 +686,32 @@ class DiscoveryTests(unittest.TestCase):
         self.assertGreater(result["units"], 0)
         self.assertEqual(result["errors"], [])
 
+    def test_holdings_needing_signed_auth_do_not_stop_enrichment(self):
+        class Client:
+            pause_seconds = 0.0
+            holdings_calls = 0
+            def wallet_stats(self, chain, wallets, period):
+                return [{"realized_profit": 100.0, "buy": 10, "sell": 8, "bought_cost": 1000.0, "pnl_stat": {}, "common": {"tags": []}}]
+            def wallet_holdings(self, chain, wallet, limit=100):
+                Client.holdings_calls += 1
+                raise RuntimeError("GET /v1/user/wallet_holdings: missing signature")
+            def wallet_activity(self, chain, wallet, limit=20, cursor=None):
+                return [{"event_type": "buy", "timestamp": int(NOW) - 100 * 86400, "token": {"address": "t"}, "token_amount": 1, "cost_usd": 400}], None
+        cfg = cfg_with(GMGN_API_KEY="k")
+        client = Client()
+        out, units = scout.enrich_wallet(client, cfg, OTHER, NOW, 300.0, 600)
+        self.assertIsNone(out["holdings"])
+        self.assertIn("missing signature", out["holdings_error"])
+        self.assertEqual(out["history"]["events"], 1)                            # enrichment carried on
+        self.assertTrue(any("holdings unavailable" in f["flag"] for f in out["risk_flags"]))
+        out2, _ = scout.enrich_wallet(client, cfg, THIRD, NOW, 300.0, 600)
+        self.assertEqual(Client.holdings_calls, 1)                                # not retried for every wallet this cycle
+        self.assertIn("signed auth", out2["holdings_error"])
+        cand = good_candidate(OTHER, holdings=None)
+        ev = scout.evaluate_candidate(cand, cfg, NOW, 300.0)
+        self.assertEqual(ev["gates"]["open_inventory"]["status"], "missing")
+        self.assertFalse(ev["qualified"])
+
 
 class GmgnClientTests(unittest.TestCase):
     def test_new_endpoints(self):

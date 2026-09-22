@@ -16,7 +16,10 @@ What the GMGN OpenAPI can and cannot evidence (verified against the live API, Se
     cursor. Episodes, hold times, profit factor and the outlier test are built from it.
   * wallet_holdings: per token realized and unrealized profit and the inventory that arrived
     by transfer, which is how allocation-derived profit is told apart from copyable buys
-    (one page of up to 100 tokens is read; the response is {"list": [...], "next": cursor}).
+    (one page of up to 100 tokens; the response is {"list": [...], "next": cursor}). This
+    endpoint needs GMGN's signed auth (a GMGN_PRIVATE_KEY); with a read-only key it answers
+    "missing signature", holdings are recorded as unavailable and the open-inventory gate
+    stays `missing`.
   * smart-money and KOL trade feeds and a token's top traders: discovery sources. A token's
     top-trader position is a token-specific rank, never a global one.
   * There is no wallet leaderboard endpoint. The leaderboard gate therefore stays
@@ -747,7 +750,7 @@ class ScoutLane:
             for snap in update.get("rank_snapshots", []):
                 cand["rank_snapshots"].append(snap)
             del cand["rank_snapshots"][:-200]
-            for key in ("tags", "profile", "exposure", "stats", "holdings", "history", "risk_flags", "last_refresh", "refresh_error"):
+            for key in ("tags", "profile", "exposure", "stats", "holdings", "holdings_error", "history", "risk_flags", "last_refresh", "refresh_error"):
                 if key in update:
                     cand[key] = update[key]
         clusters = relationship_clusters(cands)
@@ -1358,14 +1361,26 @@ def enrich_wallet(client: Any, cfg: ScoutConfig, address: str, now: float, min_f
         if int(rank or 0) > 0:
             snapshots.append({"ts": now, "scope": "global", "list": f"gmgn:{name}", "rank": int(rank), "population": 0})
     out["rank_snapshots"] = snapshots
-    # Holdings: transferred-in inventory and open losses.
-    time.sleep(client.pause_seconds)
-    holdings = client.wallet_holdings("sol", address, limit=100)
-    units += 2
+    # Holdings: transferred-in inventory and open losses. GMGN serves this endpoint only with
+    # its signed ("critical") auth, which a read-only key cannot do; then holdings are recorded
+    # as unavailable, the open-inventory gate stays `missing`, and enrichment carries on.
+    holdings: list[dict[str, Any]] | None = None
+    holdings_error = ""
+    if not getattr(client, "holdings_unavailable", False):
+        time.sleep(client.pause_seconds)
+        try:
+            holdings = client.wallet_holdings("sol", address, limit=100)
+        except Exception as exc:
+            holdings_error = str(exc)
+            if "signature" in holdings_error.lower():
+                client.holdings_unavailable = True          # every wallet would fail the same way this cycle
+        units += 2
+    else:
+        holdings_error = "GMGN wallet_holdings needs signed auth (GMGN_PRIVATE_KEY); skipped this cycle"
     transfer_tokens: set[str] = set()
     open_loss = 0.0
     transfer_cost = 0.0
-    for h in holdings:
+    for h in holdings or []:
         token = (h.get("token") or {}).get("token_address") if isinstance(h.get("token"), dict) else h.get("token_address")
         tin = gmgn._num(h, "history_transfer_in_amount")
         bought = gmgn._num(h, "history_bought_amount")
@@ -1375,8 +1390,12 @@ def enrich_wallet(client: Any, cfg: ScoutConfig, address: str, now: float, min_f
         unreal = gmgn._num(h, "unrealized_profit")
         if unreal < 0:
             open_loss += -unreal
-    out["holdings"] = {"tokens": len(holdings), "transfer_in_tokens": len(transfer_tokens), "transfer_in_cost_usd": round(transfer_cost, 2),
-                       "open_loss_usd": round(open_loss, 2)}
+    if holdings is None:
+        out["holdings"] = None
+        out["holdings_error"] = holdings_error
+    else:
+        out["holdings"] = {"tokens": len(holdings), "transfer_in_tokens": len(transfer_tokens), "transfer_in_cost_usd": round(transfer_cost, 2),
+                           "open_loss_usd": round(open_loss, 2)}
     # Activity: page back until the history window is covered or the page cap is hit.
     events: list[dict[str, Any]] = []
     cursor = None
@@ -1421,6 +1440,9 @@ def enrich_wallet(client: Any, cfg: ScoutConfig, address: str, now: float, min_f
     if transfer_tokens:
         flags.append({"flag": f"{len(transfer_tokens)} token(s) with transferred-in inventory (excluded from profitability)",
                       "severity": "soft", "confidence": "high"})
+    if holdings is None:
+        flags.append({"flag": "holdings unavailable (GMGN signed auth required): transferred-in inventory and open losses not verified",
+                      "severity": "soft", "confidence": "provider"})
     if built["unmatched_sells"] > 0:
         flags.append({"flag": f"{built['unmatched_sells']} sell(s) of inventory with no observed buy", "severity": "soft", "confidence": "medium"})
     if profile.get("created_token_count", 0) > 0:
