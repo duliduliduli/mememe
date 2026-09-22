@@ -4412,7 +4412,9 @@ class Executor:
             log(f"graduation discovery: WebSocket stream + {self.cfg.discovery_catchup_seconds:.0f}s RPC catch-up")
         else:
             log(f"graduation discovery: RPC polling every {self.cfg.discovery_catchup_seconds:.0f}s")
-        self.screen_copy_wallets()
+        # Only when due: a restart must not re-screen (every deploy did, and bursts of those
+        # got the IP banned while the scout was using the same budget).
+        self.maybe_refresh_gmgn()
         while True:
             try:
                 self.run_cycle()
