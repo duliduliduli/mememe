@@ -102,6 +102,43 @@ class Gmgn:
         """Recent trades by GMGN's smart-money wallets (newest first)."""
         return _rows(self.request("GET", "/v1/user/smartmoney", {"chain": chain, "limit": limit}))
 
+    def kol(self, chain: str = "sol", limit: int = 100) -> list[dict[str, Any]]:
+        """Recent trades by wallets GMGN tags as KOLs (same row shape as the smart-money feed:
+        `maker`, `maker_info.tags`, `base_address`, `side`, `amount_usd`, `timestamp`)."""
+        return _rows(self.request("GET", "/v1/user/kol", {"chain": chain, "limit": limit}))
+
+    def wallet_activity(self, chain: str, wallet: str, limit: int = 20, cursor: str | None = None) -> tuple[list[dict[str, Any]], str | None]:
+        """One page of a wallet's buys and sells, newest first (the endpoint serves 20 rows a
+        page): `event_type`, `timestamp`, `token.address`, `token_amount`, `cost_usd` (the
+        USD paid on a buy, received on a sell), `gas_usd`. Returns (rows, next cursor)."""
+        query: dict[str, Any] = {"chain": chain, "wallet_address": wallet, "limit": limit}
+        if cursor:
+            query["cursor"] = cursor
+        data = self.request("GET", "/v1/user/wallet_activity", query)
+        if isinstance(data, dict):
+            rows = [r for r in (data.get("activities") or []) if isinstance(r, dict)]
+            nxt = data.get("next") or None
+            return rows, (str(nxt) if nxt else None)
+        return _rows(data), None
+
+    def wallet_holdings(self, chain: str, wallet: str, limit: int = 100, order_by: str = "usd_value",
+                        direction: str = "desc") -> list[dict[str, Any]]:
+        """Per-token position summary for a wallet: realized and unrealized profit, buy and
+        sell counts, and the inventory that arrived by transfer rather than by a public buy
+        (`history_transfer_in_amount`, `history_transfer_in_cost`)."""
+        return _rows(self.request("GET", "/v1/user/wallet_holdings",
+                                  {"chain": chain, "wallet_address": wallet, "limit": limit, "order_by": order_by, "direction": direction}))
+
+    def market_rank(self, chain: str = "sol", limit: int = 50) -> list[dict[str, Any]]:
+        """GMGN's trending token list: a sample of tokens across ages and liquidity to pull top
+        traders from. The endpoint nests its payload one level deeper than the others."""
+        data = self.request("GET", "/v1/market/rank", {"chain": chain, "limit": limit})
+        if isinstance(data, dict) and isinstance(data.get("data"), dict):
+            data = data["data"]
+        if isinstance(data, dict) and isinstance(data.get("rank"), list):
+            return [r for r in data["rank"] if isinstance(r, dict)]
+        return _rows(data)
+
 
 def _rows(data: Any) -> list[dict[str, Any]]:
     if isinstance(data, list):
