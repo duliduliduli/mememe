@@ -845,6 +845,36 @@ class DiscoveryTests(unittest.TestCase):
         self.assertGreater(result["units"], 0)
         self.assertEqual(result["errors"], [])
 
+    def test_the_backlog_is_enriched_even_when_the_feeds_do_not_resurface_it(self):
+        """A wallet discovered once and never enriched must not wait for a feed to mention it
+        again: the queue is drawn from everything tracked, not only from this cycle's finds."""
+        enriched = []
+        class Client:
+            pause_seconds = 0.0
+            def smart_money(self, chain, limit): return [{"maker": "FeedWalletAAAA"}]
+            def kol(self, chain, limit): return []
+            def market_rank(self, chain, limit): return []
+            def top_traders(self, chain, token, tag=None, limit=20): return []
+            def wallet_stats(self, chain, wallets, period):
+                enriched.append(wallets[0])
+                return [{"realized_profit": 1.0, "pnl_stat": {}, "common": {"tags": []}}]
+            def wallet_holdings(self, chain, wallet, limit=100): return []
+            def wallet_activity(self, chain, wallet, limit=20, cursor=None): return [], None
+        cfg = cfg_with(GMGN_API_KEY="k", SCOUT_ENRICH_PER_CYCLE="4")
+        known = {
+            "BacklogOld": {"address": "BacklogOld", "state": "discovered", "discovered_at": NOW - 900},
+            "BacklogNew": {"address": "BacklogNew", "state": "discovered", "discovered_at": NOW - 100},
+            "RejectedOne": {"address": "RejectedOne", "state": "rejected", "discovered_at": NOW - 900},
+            "FreshlyDone": {"address": "FreshlyDone", "state": "shadow", "last_refresh": NOW - 60},
+        }
+        scout.discover_and_enrich(Client(), cfg, known, [], [], NOW, 300.0)
+        self.assertIn("FeedWalletAAAA", enriched)                                 # found this cycle
+        self.assertIn("BacklogOld", enriched)                                     # never enriched, oldest first
+        self.assertIn("BacklogNew", enriched)
+        self.assertLess(enriched.index("BacklogOld"), enriched.index("BacklogNew"))
+        self.assertNotIn("RejectedOne", enriched)                                 # rejected wallets cost no units
+        self.assertNotIn("FreshlyDone", enriched)                                 # refreshed a minute ago
+
     def test_holdings_needing_signed_auth_do_not_stop_enrichment(self):
         class Client:
             pause_seconds = 0.0

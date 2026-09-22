@@ -1372,12 +1372,27 @@ def discover_and_enrich(client: Any, cfg: ScoutConfig, known: dict[str, dict[str
                 continue                                  # inventory that arrived by transfer is not a copyable buy
             note(address, f"top_traders:{token[:8]}", gmgn._tags(r))
             found[address]["rank_snapshots"].append({"ts": now, "scope": "token", "list": f"top_traders:{token[:8]}", "rank": rank, "population": len(rows)})
-    # Enrichment: new wallets first, then the stalest; configured wallets are evaluated by the same policy.
-    due = [a for a in configured if now - float((known.get(a) or {}).get("last_refresh") or 0) >= cfg.refresh_hours * 3600]
+    # Enrichment order: configured wallets due a refresh, then wallets this cycle just found,
+    # then the backlog, then the stalest. Backlog and stale are drawn from everything tracked,
+    # not only from what the feeds surfaced this cycle: a wallet discovered once and never
+    # enriched would otherwise wait for a feed to mention it again, which may never happen.
+    def refreshed(address: str) -> float:
+        return float((known.get(address) or {}).get("last_refresh") or 0)
+
+    def worth_enriching(address: str) -> bool:
+        return address not in configured and (known.get(address) or {}).get("state") != "rejected"
+
+    due = [a for a in configured if now - refreshed(a) >= cfg.refresh_hours * 3600]
     fresh_new = [a for a in found if a not in known]
-    stale = sorted((a for a in found if a in known and now - float(known[a].get("last_refresh") or 0) >= cfg.refresh_hours * 3600),
-                   key=lambda a: float(known[a].get("last_refresh") or 0))
-    queue = due + fresh_new + stale
+    backlog = sorted((a for a in known if worth_enriching(a) and not refreshed(a)),
+                     key=lambda a: float((known[a].get("discovered_at") or 0)))
+    stale = sorted((a for a in known if worth_enriching(a) and refreshed(a)
+                    and now - refreshed(a) >= cfg.refresh_hours * 3600), key=refreshed)
+    queue, seen_queue = [], set()
+    for address in due + fresh_new + backlog + stale:
+        if address and address not in seen_queue:
+            seen_queue.add(address)
+            queue.append(address)
     enriched = 0
     for address in queue:
         if enriched >= cfg.enrich_per_cycle or units >= cfg.gmgn_units_per_cycle:
