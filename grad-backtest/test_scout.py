@@ -176,7 +176,7 @@ class GateTests(unittest.TestCase):
         self.assertEqual(ev["failed"], [], ev["gates"])
         self.assertEqual(ev["missing"], [], ev["gates"])
         self.assertTrue(ev["qualified"])
-        self.assertEqual(ev["policy_version"], scout.POLICY_VERSION)
+        self.assertEqual(ev["policy_version"], scout.policy_key(scout.ScoutConfig()))
         self.assertGreater(ev["score"]["total"], 50)
         self.assertEqual(sum(ev["score"]["weights"].values()), 100)
 
@@ -607,7 +607,7 @@ class LaneTests(unittest.TestCase):
         self.assertEqual(again.scout.st["candidates"][OTHER]["state"], "shadow")
         self.assertEqual(len(again.scout.st["positions"]), 1)
         self.assertEqual(len(again.scout.st["trades"]), 37)                         # 36 seeded + 1
-        self.assertEqual(again.scout.st["policy_version"], scout.POLICY_VERSION)
+        self.assertEqual(again.scout.st["policy_version"], scout.policy_key(again.scout.cfg))
 
     def test_scout_failure_never_stops_position_management(self):
         executor, ex = self.make()
@@ -735,12 +735,30 @@ class LaneTests(unittest.TestCase):
         lane.st["policy_version"] = "2000-01-01.0"                                # state written by an older deploy
         lane.maybe_discover = lambda force=False: None                            # no network
         lane.tick(SOL)
-        self.assertEqual(lane.st["policy_version"], scout.POLICY_VERSION)
-        self.assertEqual(cand["evaluation"]["policy_version"], scout.POLICY_VERSION)
+        self.assertEqual(lane.st["policy_version"], scout.policy_key(lane.cfg))
+        self.assertEqual(cand["evaluation"]["policy_version"], scout.policy_key(lane.cfg))
         self.assertEqual(cand["state"], "qualified")                              # scored under the fast track right away
         lane.st["candidates"][OTHER]["state"] = "shadow"
         lane.tick(SOL)                                                            # same policy: not re-scored every tick
         self.assertEqual(cand["state"], "shadow")
+
+    def test_changing_a_threshold_re_scores_without_touching_POLICY_VERSION(self):
+        """A deploy that only moves a gate threshold must not leave stale verdicts behind:
+        the stored policy key fingerprints the thresholds, not just the version string."""
+        base = cfg_with(GMGN_API_KEY="k")
+        looser = cfg_with(GMGN_API_KEY="k", SCOUT_FAST_TRACK_DENSE_EPISODES="99")
+        self.assertNotEqual(scout.policy_key(base), scout.policy_key(looser))
+        self.assertTrue(scout.policy_key(base).startswith(scout.POLICY_VERSION))
+        executor, ex = self.make(SCOUT_FAST_TRACK="1")
+        lane = ex.scout
+        cand = self.seed(ex, OTHER, state="shadow")
+        cand["rank_snapshots"], cand["holdings"] = [], None
+        lane.st["policy_version"] = scout.POLICY_VERSION + "+deadbeef"            # same version, other thresholds
+        lane.maybe_discover = lambda force=False: None
+        lane.tick(SOL)
+        self.assertEqual(lane.st["policy_version"], scout.policy_key(lane.cfg))
+        self.assertEqual(cand["evaluation"]["policy_version"], scout.policy_key(lane.cfg))
+        self.assertEqual(cand["state"], "qualified")
 
     def test_discovery_reruns_at_retry_interval_until_something_is_enriched(self):
         executor, ex = self.make()
