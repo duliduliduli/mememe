@@ -56,6 +56,13 @@ POLICY_FIELDS = (
 )
 
 
+def rate_limited(exc: BaseException) -> bool:
+    """GMGN's rate-limit and IP-ban responses. Hitting one means the whole cycle must stop:
+    more requests only extend the ban, and every later call in it would fail anyway."""
+    text = str(exc).lower()
+    return "rate limit" in text or "temporarily banned" in text or "too many requests" in text or "429" in text
+
+
 def policy_key(cfg: "ScoutConfig") -> str:
     raw = "|".join(f"{f}={getattr(cfg, f, '')}" for f in POLICY_FIELDS)
     return f"{POLICY_VERSION}+{hashlib.sha1(raw.encode()).hexdigest()[:8]}"
@@ -114,10 +121,12 @@ class ScoutConfig:
         self.quote_budget = _env_int("SCOUT_QUOTE_BUDGET", 6)                  # Jupiter quotes per poll
         self.stress_seconds = _env_float("SCOUT_STRESS_SECONDS", 20)
         self.fee_usd = _env_float("SCOUT_FEE_USD", 0.05)                       # network + priority fee per swap; quotes carry route fees and impact
-        self.enrich_per_cycle = _env_int("SCOUT_ENRICH_PER_CYCLE", 25)
+        self.enrich_per_cycle = _env_int("SCOUT_ENRICH_PER_CYCLE", 12)
         self.activity_pages = _env_int("SCOUT_ACTIVITY_PAGES", 40)             # 20 events a page
         self.token_sample = _env_int("SCOUT_TOKEN_SAMPLE", 12)
-        self.gmgn_units_per_cycle = _env_int("SCOUT_GMGN_UNITS_PER_CYCLE", 4000)
+        self.gmgn_units_per_cycle = _env_int("SCOUT_GMGN_UNITS_PER_CYCLE", 1800)
+        self.pause_seconds = _env_float("SCOUT_PAUSE_SECONDS", 2.0)          # between GMGN calls; the free tier bans an IP that sustains too much
+        self.rate_limit_cooldown_hours = _env_float("SCOUT_RATE_LIMIT_COOLDOWN_HOURS", 3)
         self.requalify_hours = _env_float("SCOUT_REQUALIFY_HOURS", 24)
         # Historical qualification (30d window unless named otherwise)
         self.min_history_days = _env_float("SCOUT_MIN_HISTORY_DAYS", 60)
@@ -740,6 +749,11 @@ class ScoutLane:
         if self.st["candidates"] and not any(c.get("last_refresh") for c in self.st["candidates"].values()):
             due = True
         retry_ok = self.now() - float(self.st.get("attempt_ts") or 0) >= 1800
+        # GMGN bans an IP that keeps pushing after a rate-limit warning, so a cycle that hit
+        # one buys silence rather than retrying into the ban.
+        cooling = self.now() < float(self.st.get("rate_limited_until") or 0)
+        if cooling and not force:
+            return
         if not force and not (due and retry_ok):
             return
         self.st["attempt_ts"] = self.now()
@@ -761,7 +775,7 @@ class ScoutLane:
     def gmgn_client(self) -> Any:
         import gmgn
         client = gmgn.Gmgn()
-        client.pause_seconds = 1.0            # scouting is the low-priority user of the shared GMGN budget
+        client.pause_seconds = self.cfg.pause_seconds   # scouting is the low-priority user of the shared GMGN budget
         return client
 
     def token_sample(self) -> list[str]:
@@ -799,6 +813,13 @@ class ScoutLane:
             self.log(f"WARN discovery failed: {payload}; retrying in 30m")
             return
         self.st["discovered_ts"] = self.now()
+        if payload.get("rate_limited"):
+            until = self.now() + self.cfg.rate_limit_cooldown_hours * 3600
+            self.st["rate_limited_until"] = until
+            self.log(f"WARN GMGN rate-limited this cycle; pausing discovery for "
+                     f"{self.cfg.rate_limit_cooldown_hours:.0f}h and resuming at a slower pace")
+        else:
+            self.st.pop("rate_limited_until", None)
         self.st["token_sample"] = payload.get("token_sample", [])
         self.st["last_units"] = payload.get("units", 0)
         for err in payload.get("errors", []):
@@ -1340,6 +1361,8 @@ def discover_and_enrich(client: Any, cfg: ScoutConfig, known: dict[str, dict[str
                 note(gmgn.wallet_of(r), name, gmgn._tags(r) or list((r.get("maker_info") or {}).get("tags") or []))
         except Exception as exc:
             errors.append(f"{name}: {exc}")
+            if rate_limited(exc):
+                return {"candidates": dict(found), "token_sample": [], "units": units, "errors": errors, "rate_limited": True}
         time.sleep(client.pause_seconds)
     tokens = list(token_sample)
     try:
@@ -1348,6 +1371,8 @@ def discover_and_enrich(client: Any, cfg: ScoutConfig, known: dict[str, dict[str
         tokens.extend(str(r.get("address")) for r in trending if r.get("address"))
     except Exception as exc:
         errors.append(f"market_rank: {exc}")
+        if rate_limited(exc):
+            return {"candidates": dict(found), "token_sample": [], "units": units, "errors": errors, "rate_limited": True}
     seen_tokens: list[str] = []
     for t in tokens:
         if t and t not in seen_tokens:
@@ -1365,6 +1390,8 @@ def discover_and_enrich(client: Any, cfg: ScoutConfig, known: dict[str, dict[str
             units += 5
         except Exception as exc:
             errors.append(f"top_traders {token[:8]}: {exc}")
+            if rate_limited(exc):
+                return {"candidates": dict(found), "token_sample": seen_tokens, "units": units, "errors": errors, "rate_limited": True}
             continue
         for rank, r in enumerate(rows, 1):
             address = gmgn.wallet_of(r)
@@ -1411,10 +1438,13 @@ def discover_and_enrich(client: Any, cfg: ScoutConfig, known: dict[str, dict[str
         except Exception as exc:
             entry["refresh_error"] = str(exc)
             errors.append(f"enrich {address[:8]}: {exc}")
+            if rate_limited(exc):
+                break
     for address, entry in found.items():
         entry.setdefault("tags", sorted(set(entry.get("feed_tags") or []) | set(entry.get("tags") or [])))
         entry.pop("feed_tags", None)
-    return {"candidates": dict(found), "token_sample": seen_tokens, "units": units, "errors": errors}
+    return {"candidates": dict(found), "token_sample": seen_tokens, "units": units, "errors": errors,
+            "rate_limited": any(rate_limited(Exception(e)) for e in errors)}
 
 
 def enrich_wallet(client: Any, cfg: ScoutConfig, address: str, now: float, min_first_buy_usd: float, unit_budget: int) -> tuple[dict[str, Any], int]:
