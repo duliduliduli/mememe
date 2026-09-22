@@ -217,6 +217,30 @@ class WalletSizeTests(unittest.TestCase):
         self.assertEqual([(e["mint"], e["copy_size"]) for e in entered], [(MINT, 0.5)])
 
 
+class BuiltinDefaultsTests(unittest.TestCase):
+    """Settings that live in code so nothing has to be edited in Railway."""
+    BIG = "498g1rVnFcnjBjpfw1xyqA1WvgQXUU8RWuELjxkjAayQ"
+
+    def test_known_wallet_gets_its_terms_without_any_in_the_variable(self):
+        executor, p = fresh(COPY_WALLETS=f"{self.BIG}, {WALLET}")
+        self.addCleanup(p.stop)
+        cfg = executor.Config()
+        self.assertEqual((cfg.copy_wallet_min_usd[self.BIG], cfg.copy_wallet_size[self.BIG]), (300.0, 0.5))
+        self.assertNotIn(WALLET, cfg.copy_wallet_size)
+        self.assertEqual(cfg.copy_gmgn_gate, "enforce")         # GMGN "skip" wallets are not bought
+
+    def test_terms_written_in_the_variable_still_win(self):
+        executor, p = fresh(COPY_WALLETS=f"{self.BIG}:500:0.25")
+        self.addCleanup(p.stop)
+        cfg = executor.Config()
+        self.assertEqual((cfg.copy_wallet_min_usd[self.BIG], cfg.copy_wallet_size[self.BIG]), (500.0, 0.25))
+
+    def test_terms_only_apply_to_a_followed_wallet(self):
+        executor, p = fresh(COPY_WALLETS=WALLET)
+        self.addCleanup(p.stop)
+        self.assertNotIn(self.BIG, executor.Config().copy_wallet_min_usd)
+
+
 class WalletValidationTests(unittest.TestCase):
     def test_mistyped_address_is_dropped_at_startup(self):
         executor, p = fresh(COPY_WALLETS=f"9BMzTpSoShort, {WALLET}:300")
@@ -515,7 +539,7 @@ class PollTests(unittest.TestCase):
         self.assertEqual(closed, [])                          # WALLET is not the source of either position
 
     def test_gmgn_gate_shadow_then_enforce(self):
-        executor, ex = self.make(COPY_MIN_BUY_USD="50")
+        executor, ex = self.make(COPY_MIN_BUY_USD="50", COPY_GMGN_GATE="shadow")
         now = int(executor.now_ts())
         self.sigs = [{"signature": "base", "blockTime": now - 600}]
         ex.poll_copy_wallets(SOL)
