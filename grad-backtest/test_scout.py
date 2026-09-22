@@ -12,6 +12,7 @@ os.environ.setdefault("DATA_DIR", tempfile.mkdtemp(prefix="grad-scout-test-"))
 # The tests below exercise the full policy (every gate decides). The fast track, on by default
 # in production, has its own tests that switch it on explicitly.
 os.environ["SCOUT_FAST_TRACK"] = "0"
+os.environ["SCOUT_LIVE"] = "0"                      # promotion is on in production; tests that need it set it explicitly
 
 import scout
 from test_copy import MINT, OTHER, SOL, WALLET, WSOL, fresh, tx
@@ -275,10 +276,11 @@ class ConfigTests(unittest.TestCase):
                     del os.environ[key]
             cfg = scout.ScoutConfig()
             self.assertEqual(cfg.mode, "shadow")
-            self.assertFalse(cfg.live)
+            self.assertTrue(cfg.live)                                             # promotion on: fast track + tripwire + budget guard it
             self.assertFalse(cfg.elite_only)
             self.assertEqual(cfg.max_live, 3)
-            self.assertEqual(cfg.live_size, 0.25)
+            self.assertEqual(cfg.live_size, 0.5)
+            self.assertEqual(cfg.max_open_positions, 3)
             self.assertEqual(cfg.live_loss_budget_usd, 25.0)
             self.assertTrue(cfg.fast_track)
             self.assertEqual(cfg.fast_track_min_history_days, 15.0)
@@ -335,7 +337,7 @@ class LaneTests(unittest.TestCase):
         ex.scout.cfg.live_loss_budget_usd = 50.0
         ex.scout.evaluate_all()
         self.assertEqual(ex.scout.st["candidates"][OTHER]["state"], "live")
-        self.assertEqual(ex.scout.live_wallets(), {OTHER: {"size": 0.25, "min_usd": 300.0}})
+        self.assertEqual(ex.scout.live_wallets(), {OTHER: {"size": 0.5, "min_usd": 300.0}})
         self.assertEqual(ex.followed_wallets(), [WALLET, OTHER])
 
     def test_related_wallets_one_live_per_cluster(self):
@@ -396,7 +398,7 @@ class LaneTests(unittest.TestCase):
         ex.enter_with_retry = lambda item, sol_price: entered.append(item)
         ex.copy_handle_event(OTHER, "sig1", int(time.time()), tx(10.0, 5.0, 0, 1000, owner=OTHER), SOL, True)
         self.assertEqual(len(entered), 1)
-        self.assertEqual(entered[0]["copy_size"], 0.25)
+        self.assertEqual(entered[0]["copy_size"], 0.5)
         self.assertTrue(entered[0]["copy_scouted"])
         self.assertEqual(ex.copy_wallet_terms(WALLET), (300.0, 1.0, False))
 
@@ -409,6 +411,23 @@ class LaneTests(unittest.TestCase):
                       "copy_scouted": True}, SOL)
         self.assertEqual(ex.state["positions"], [])
         self.assertTrue(skips and "below the $5.00 minimum" in skips[-1], skips)
+
+    def test_scouted_wallets_share_a_small_pool_of_slots(self):
+        executor, ex = self.make(SCOUT_LIVE="1", SCOUT_MAX_OPEN_POSITIONS="2")
+        self.seed(ex, OTHER, state="live")
+        entered = []
+        ex.enter_with_retry = lambda item, sol_price: entered.append(item)
+        ex.state["positions"] = [{"mint": f"M{i}", "tokens": 1, "position_usd": 5.0, "opened_ts": 0, "opened_at": "t", "peak_usd": 5.0,
+                                  "buy_signature": "", "copy": OTHER, "copy_scouted": True} for i in range(2)]
+        ex.copy_handle_event(OTHER, "buy1", int(time.time()), tx(10.0, 5.0, 0, 1000, owner=OTHER), SOL, True)
+        self.assertEqual(entered, [])                                             # two scouted positions open: full
+        ex.copy_handle_event(WALLET, "buy2", int(time.time()), tx(10.0, 5.0, 0, 1000, mint="Other111"), SOL, True)
+        self.assertEqual(len(entered), 1)                                         # configured wallets are not capped by it
+        ex.state["positions"].pop()
+        ex.copy_handle_event(OTHER, "buy3", int(time.time()), tx(10.0, 5.0, 0, 1000, owner=OTHER, mint="Other222"), SOL, True)
+        self.assertEqual(len(entered), 2)                                         # a slot freed: mirrored
+        rows = list(__import__("csv").DictReader(open(os.path.join(os.environ["DATA_DIR"], "copy_signals.csv"))))
+        self.assertEqual([r["reason"] for r in rows if r["status"] == "blocked"], ["scout_slots"])
 
     def test_stale_elite_only_blocks_buys_but_never_sells(self):
         executor, ex = self.make(SCOUT_ELITE_ONLY="1")
@@ -663,7 +682,7 @@ class LaneTests(unittest.TestCase):
         ex.scout.evaluate_all()                                                   # qualified
         ex.scout.evaluate_all()                                                   # promoted
         self.assertEqual(cand["state"], "live")
-        self.assertEqual(ex.scout.live_wallets(), {OTHER: {"size": 0.25, "min_usd": 300.0}})
+        self.assertEqual(ex.scout.live_wallets(), {OTHER: {"size": 0.5, "min_usd": 300.0}})
         self.assertIn("budget 25 USD", cand["lifecycle"][-1]["reason"])
         # Shadow keeps scoring the live wallet: ten losing paper trades trip it.
         for t in good_shadow_trades(OTHER, time.time(), n=10):

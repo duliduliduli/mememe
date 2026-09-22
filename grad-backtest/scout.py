@@ -70,13 +70,14 @@ class ScoutConfig:
 
     def __init__(self) -> None:
         self.mode = os.getenv("SCOUT_MODE", "shadow").strip().lower()          # off | shadow
-        self.live = os.getenv("SCOUT_LIVE", "0") == "1"                        # promotion switch
+        self.live = os.getenv("SCOUT_LIVE", "1") == "1"                        # promotion switch
         self.elite_only = os.getenv("SCOUT_ELITE_ONLY", "0") == "1"            # configured wallets must qualify too
         self.discovery_hours = _env_float("SCOUT_DISCOVERY_HOURS", 6)
         self.refresh_hours = _env_float("SCOUT_REFRESH_HOURS", 24)
         self.max_qualification_age_hours = _env_float("SCOUT_MAX_QUALIFICATION_AGE_HOURS", 48)
         self.max_live = _env_int("SCOUT_MAX_LIVE", 3)
-        self.live_size = _env_float("SCOUT_LIVE_SIZE", 0.25)
+        self.live_size = _env_float("SCOUT_LIVE_SIZE", 0.5)                    # of the usual size; 0.25 falls under the $5 minimum on a small account
+        self.max_open_positions = _env_int("SCOUT_MAX_OPEN_POSITIONS", 3)      # open positions from scouted wallets at once (0: no cap)
         self.live_loss_budget_usd = _env_float("SCOUT_LIVE_LOSS_BUDGET_USD", 25)  # 0: promotion refused
         # Fast track: qualify on fetched history alone, waiving the gates GMGN cannot evidence
         # (leaderboard, holdings) and the 14-day shadow sample. Shadow still runs as the tripwire.
@@ -1217,6 +1218,7 @@ class ScoutLane:
             return f"wallet scouting off ({why})"
         return (f"wallet scouting mode={c.mode} track={'fast' if c.fast_track else 'full'} live_promotion={'ON' if c.live else 'off'} elite_only={'on' if c.elite_only else 'off'} "
                 f"discovery={c.discovery_hours:.0f}h refresh={c.refresh_hours:.0f}h max_live={c.max_live} live_size={c.live_size:.0%} "
+                f"max_open_scouted={c.max_open_positions} "
                 f"live_loss_budget=${c.live_loss_budget_usd:,.0f}{' (promotion refused until set)' if c.live_loss_budget_usd <= 0 else ''} "
                 f"shadow>={c.shadow_min_days}d/{c.shadow_min_trades}trades/{c.shadow_min_tokens}tokens PF>={c.shadow_min_profit_factor} "
                 f"DD<={c.shadow_max_drawdown:.0%} history>={c.min_history_days}d PF>={c.min_profit_factor} "
