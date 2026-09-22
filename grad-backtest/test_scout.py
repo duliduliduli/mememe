@@ -286,7 +286,9 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(cfg.fast_track_min_history_days, 15.0)
             self.assertEqual(cfg.fast_track_dense_episodes, 40)
             self.assertEqual(cfg.discovery_hours, 2.0)
-            self.assertEqual(cfg.enrich_per_cycle, 25)
+            self.assertEqual(cfg.enrich_per_cycle, 12)
+            self.assertEqual(cfg.pause_seconds, 2.0)
+            self.assertEqual(cfg.rate_limit_cooldown_hours, 3.0)
             self.assertEqual(cfg.tripwire_trades, 10)
             self.assertFalse(cfg.enabled)                                        # no key: nothing runs
         self.assertTrue(cfg_with(GMGN_API_KEY="k").enabled)
@@ -760,6 +762,26 @@ class LaneTests(unittest.TestCase):
         self.assertEqual(cand["evaluation"]["policy_version"], scout.policy_key(lane.cfg))
         self.assertEqual(cand["state"], "qualified")
 
+    def test_rate_limited_cycle_pauses_discovery_for_the_cooldown(self):
+        executor, ex = self.make()
+        lane = ex.scout
+        lane.st["candidates"][OTHER] = {"address": OTHER, "state": "discovered", "sources": [], "rank_snapshots": [],
+                                        "lifecycle": [], "last_refresh": time.time()}
+        lane._result = ("ok", {"candidates": {}, "token_sample": [], "units": 9, "errors": ["x: rate limit"], "rate_limited": True})
+        lane.apply_discovery()
+        self.assertGreater(lane.st["rate_limited_until"], time.time())
+        with mock.patch("threading.Thread") as thread:
+            lane.st["attempt_ts"] = 0
+            lane.maybe_discover()
+            self.assertEqual(thread.call_count, 0)                                # still cooling: no new cycle
+            lane.st["rate_limited_until"] = time.time() - 1                        # cooldown elapsed
+            lane.st["discovered_ts"] = time.time() - 3 * 3600                      # and a cycle is due again
+            lane.maybe_discover()
+            self.assertEqual(thread.call_count, 1)
+        lane._result = ("ok", {"candidates": {}, "token_sample": [], "units": 9, "errors": [], "rate_limited": False})
+        lane.apply_discovery()
+        self.assertNotIn("rate_limited_until", lane.st)                            # a clean cycle clears it
+
     def test_discovery_reruns_at_retry_interval_until_something_is_enriched(self):
         executor, ex = self.make()
         lane = ex.scout
@@ -844,6 +866,23 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(result["token_sample"], [MINT, "Trend1"])
         self.assertGreater(result["units"], 0)
         self.assertEqual(result["errors"], [])
+
+    def test_a_rate_limit_stops_the_cycle_instead_of_extending_the_ban(self):
+        calls = []
+        class Client:
+            pause_seconds = 0.0
+            def smart_money(self, chain, limit):
+                calls.append("smart_money")
+                raise RuntimeError("GET /v1/user/smartmoney: IP is temporarily banned due to repeated rate limit violations")
+            def kol(self, chain, limit): calls.append("kol"); return []
+            def market_rank(self, chain, limit): calls.append("market_rank"); return []
+            def top_traders(self, chain, token, tag=None, limit=20): calls.append("top_traders"); return []
+            def wallet_stats(self, chain, wallets, period): calls.append("wallet_stats"); return []
+        out = scout.discover_and_enrich(Client(), cfg_with(GMGN_API_KEY="k"), {}, [], [], NOW, 300.0)
+        self.assertTrue(out["rate_limited"])
+        self.assertEqual(calls, ["smart_money"])                                  # nothing after the ban
+        self.assertTrue(scout.rate_limited(RuntimeError("429 Too Many Requests")))
+        self.assertFalse(scout.rate_limited(RuntimeError("missing signature")))
 
     def test_the_backlog_is_enriched_even_when_the_feeds_do_not_resurface_it(self):
         """A wallet discovered once and never enriched must not wait for a feed to mention it
