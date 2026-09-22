@@ -425,6 +425,12 @@ A second copy lane (`evm/` package, `python -m evm`, autostarted by the server) 
 | `COPY_TAKE_PROFIT` / `COPY_STOP_LOSS` / `COPY_TRAILING_STOP` / `COPY_TIME_STOP_MINUTES` | `0.75` / `0.30` / `0.25` / `1440` | Exit thresholds for copied positions between the wallet's own sell and ours. With a ladder the take profit only backstops its top rung. |
 | `TRAILING_ARM_GAIN` | `0.30` | Every trailing stop (graduation, runner, copy, EVM) arms only once the position has been up at least this much from its cost basis. Before that the stop loss is the only downside exit, so a coin that popped 12% and pulled back is not sold at −18%. `0` arms from entry. |
 | `COPY_LADDER` | `1.4:40,1.8:30,3:30` | Phase profit out on copied positions: sell that percent of the entry tokens once the price reaches that multiple of the entry price (40% at +40%, 30% at +80%, the rest at 3x). The last rung closes the position (moon bag applies). Empty disables it. |
+| `SCOUT_MODE` | `shadow` | GMGN wallet scouting (`scout.py`; needs `GMGN_API_KEY`, otherwise inert). Every `SCOUT_DISCOVERY_HOURS` (6) a worker thread pulls candidate wallets from GMGN's smart-money and KOL feeds and from the top traders of a rotating token sample (what the followed wallets bought, what we traded, GMGN's trending list), then enriches up to `SCOUT_ENRICH_PER_CYCLE` (8) wallets per cycle with 7d/30d/all stats, holdings (transferred-in inventory, open losses) and up to `SCOUT_ACTIVITY_PAGES` (40) pages of buy/sell history, under `SCOUT_GMGN_UNITS_PER_CYCLE` (600) request units. Candidates then move `discovered → research → shadow`: their first buys are followed on-chain with real Jupiter buy quotes (baseline, then the same quote again `SCOUT_STRESS_SECONDS` = 20 s later), the same first-buy rule, sizing, deployment cap, ladder and exits as production, and a virtual sell quote only when an exit is due. Nothing is ever swapped: shadow trades are recorded in the state and `scout_shadow_trades.csv`. `off` disables the lane. |
+| `SCOUT_LIVE` / `SCOUT_MAX_LIVE` / `SCOUT_LIVE_SIZE` / `SCOUT_LIVE_LOSS_BUDGET_USD` | `0` / `3` / `0.25` / `0` | Promotion switch, off by default: with `SCOUT_LIVE=1` **and** a loss budget above 0, wallets that pass every mandatory gate (below) are promoted to `live`, at most `SCOUT_MAX_LIVE`, one per evidenced wallet cluster, and the copy lane mirrors their first buys at `SCOUT_LIVE_SIZE` of the usual size (a size under `MIN_POSITION_USD` is skipped, never rounded up). Realized P&L of their positions and moon bags counts against the budget; at −budget the wallet is `paused` (open positions stay managed, its sells stay followed). `SCOUT_MAX_QUALIFICATION_AGE_HOURS` (48) stales a qualification; `SCOUT_REQUALIFY_HOURS` (24) is the cooldown after a demotion. |
+| `SCOUT_ELITE_ONLY` | `0` | `1` also gates the configured `COPY_WALLETS` entries: a buy is mirrored only while the wallet is `qualified` or `live` with a fresh evaluation (sells of held coins and open positions are never affected; the signal is recorded as `blocked: elite_only`). With the default thresholds this blocks every buy until a wallet passes all gates, so leave it off unless that is the intent. |
+| `SCOUT_MIN_HISTORY_DAYS` / `SCOUT_MIN_EPISODES_30D` / `SCOUT_MIN_TOKENS_30D` / `SCOUT_MIN_ACTIVE_DAYS_30D` / `SCOUT_MIN_PROFIT_FACTOR` / `SCOUT_MAX_BEST_TOKEN_SHARE` / `SCOUT_MAX_DRAWDOWN` / `SCOUT_MIN_MEDIAN_HOLD_MINUTES` / `SCOUT_MAX_FAST_EXIT_FRACTION` | `60` / `30` / `20` / `10` / `1.5` / `0.4` / `0.25` / `30` / `0.1` | Historical qualification gates on GMGN evidence, all mandatory: positive realized P&L over 7d, 30d and all time; enough history, closed episodes (a buy from an empty stack to a stack back at dust, P&L net of fees), tokens and active days in 30 days; profit factor; net still positive without the best token and the best token at most that share of gross profit; drawdown of realized episode equity (open positions are not marked, which the report says); median time to the first material sell and the share of first buys exited within 60 s, over first buys of at least `COPY_MIN_BUY_USD`; open unrealized losses not larger than 30-day realized profit; tokens whose inventory arrived by transfer are excluded from profitability; wash-trading, bundler and MEV tags reject the wallet. A gate whose evidence GMGN does not provide is `missing`, and `missing` never qualifies. |
+| `SCOUT_LEADERBOARD_TOP_FRACTION` / `SCOUT_LEADERBOARD_TOP_N` / `SCOUT_LEADERBOARD_MIN_SNAPSHOTS` / `SCOUT_LEADERBOARD_SPAN_DAYS` | `0.05` / `100` / `3` / `7` | The persistent-leaderboard gate: a global rank within the top 5% (or top 100) on at least 3 daily snapshots spanning 7 days. Only global rank evidence counts; a token's top-trader list never does. GMGN's OpenAPI exposes no wallet leaderboard and its `tag_rank` came back 0 on every wallet probed, so this gate is `missing` for every candidate today and no wallet can qualify until GMGN provides rank data. The report states this instead of pretending. |
+| `SCOUT_SHADOW_MIN_DAYS` / `SCOUT_SHADOW_MIN_TRADES` / `SCOUT_SHADOW_MIN_TOKENS` / `SCOUT_SHADOW_MIN_ACTIVE_DAYS` / `SCOUT_SHADOW_MIN_PROFIT_FACTOR` / `SCOUT_SHADOW_MAX_DRAWDOWN` | `14` / `30` / `15` / `7` / `1.3` / `0.15` | Forward (shadow) gates: enough closed shadow trades over enough days and tokens, positive net after fees at the baseline latency **and** at 20 s extra latency, profit factor, drawdown against the peak capital the shadow trades tied up, net still positive without the best token, and a positive 95% bootstrap lower bound on the mean trade return resampled by token and by day clusters. `SCOUT_MAX_SHADOW` (25) wallets are polled on-chain at a time under `SCOUT_DECODE_BUDGET` (20) transactions and `SCOUT_QUOTE_BUDGET` (6) Jupiter quotes per poll every `SCOUT_POLL_SECONDS` (10), all separate from the production copy lane's budgets. |
 
 ### 4.7 Restart safety and housekeeping (live mode)
 
@@ -513,7 +519,9 @@ continues after `POLL_SECONDS`:
 4. Manage moon bags, stuck positions, and panic liquidation before doing any entry work.
 5. If not draining, drain WebSocket graduation hints and run standard-RPC catch-up when due (6.3), bounded by `DISCOVERY_TIMEOUT_SECONDS`.
 6. Collect due graduations and analyze at most `MAX_ENTRIES_PER_CYCLE`; later items remain queued.
-7. Save state.
+7. Poll the followed wallets (configured `COPY_WALLETS`, scouted wallets promoted to `live`, and any scouted wallet a still-open position was copied from), while draining too so sells keep being followed.
+8. Tick the wallet scout (`scout.py`) under its own request budgets; a failure there is logged and never reaches steps 3 and 4.
+9. Save state.
 
 Pending graduations are persisted in `executor_state.json`. On restart, entries
 later than `MAX_ENTRY_LATENESS_SECONDS` are discarded rather than replayed.
@@ -723,6 +731,7 @@ moon_bag = {
 | `executor_state.json` | `save_state` | schema above |
 | `live_trades.csv` | closes, scale-outs, bag sells, dead-bag burns | one row per exit leg |
 | `skips.csv` | `skip()` | `timestamp,mint,reason` plus everything known at the time: seconds after graduation, BOOST window, market cap, impact, curve age, curve transaction count, top holder, creator, creator launches and holding, early seller, bundle metrics, history sample size, round trip |
+| `scout_signals.csv`, `scout_shadow_trades.csv` | `scout.py` | every first buy a shadowed wallet made and what the shadow did with it; every closed shadow trade with baseline and 20 s-stress P&L |
 | `executor.stop`, `executor.panic` | server / executor | empty flag files |
 
 `live_trades.csv` columns:
@@ -781,6 +790,8 @@ endpoints are for `curl` and the like.
 | `GET /api/trades?limit=200` | none | rows of `trade_results.csv`, newest first |
 | `GET /api/errors?limit=200` | none | last rows of `errors.csv` |
 | `GET /api/activity?lines=100` | none | last lines of `run.log` plus job status |
+| `GET /api/scout` | none | wallet scouting report: every candidate's lifecycle state, discovery sources, leaderboard evidence, verified exposure, history coverage, net P&L, profit factor, win rates (token- and episode-level), drawdown with its basis, best-token concentration, transfer-in exclusions, copyability numbers, shadow results (baseline and stress), risk flags with confidence, relationship cluster, and the last promotion decision. Read-only; built from the executor state. |
+| `GET /api/scout/{address}` | none | one candidate in full with its shadow trades, shadow signals and live loss-budget book |
 | `GET /api/live?limit=100` | none | executor running/draining flags, mode, full state JSON, `live_trades.csv` rows, closed count, win rate, realized P&L, last 60 lines of `executor.log` |
 | `POST /api/run` | admin | body `{"stage": "collect"\|"run"\|"sizing"\|"optimize", "extra_args": "…"}`; launches one background job (409 if one is running); output appended to `run.log` |
 | `POST /api/executor/start` | admin | launches the executor (409 if running) |
@@ -1011,6 +1022,7 @@ cd grad-backtest && python -m unittest -v
 | `test_reconcile.py` | account close/burn transactions, adoption, stuck handling, panic |
 | `test_rate_limits.py` | 429 backoff, price cache, adopted slots, blockhash retry |
 | `test_moon_bag_target.py` | winners-only, target multiple, dead-bag burn, minimum size, redaction |
+| `test_scout.py` | wallet scouting: episodes, gates, leaderboard evidence, clustered bootstrap, relationship clusters, promotion switch and budget, one live wallet per cluster, elite-only gate, demotion keeps sells followed, shadow trades never swap, separate budgets, restart safety, scout failures never reach position management |
 
 ---
 

@@ -22,6 +22,7 @@ import shlex
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -139,7 +140,8 @@ def healthz() -> dict[str, Any]:
     settings = ["EXECUTOR_MODE", "EXECUTOR_AUTOSTART", "DATA_DIR", "MAX_CONCURRENT_POSITIONS", "ACCOUNT_FRACTION",
                 "MAX_DEPLOYED_FRACTION", "MIN_POSITION_USD", "COPY_MIN_BUY_USD", "COPY_FIRST_BUY_ONLY", "COPY_ADD_DUST_RATIO",
                 "COPY_SELL_SCOPE", "COPY_GMGN_GATE", "COPY_ROTATE", "COPY_TIME_STOP_MINUTES", "COPY_LADDER", "HOLD_MINTS",
-                "DAILY_LOSS_LIMIT_USD", "PANIC"]
+                "DAILY_LOSS_LIMIT_USD", "PANIC", "SCOUT_MODE", "SCOUT_LIVE", "SCOUT_ELITE_ONLY", "SCOUT_MAX_LIVE",
+                "SCOUT_LIVE_SIZE", "SCOUT_LIVE_LOSS_BUDGET_USD"]
     return {"status": "ok", "commit": os.getenv("RAILWAY_GIT_COMMIT_SHA", "unknown"),
             "settings": {k: os.getenv(k) for k in settings if os.getenv(k) is not None},
             "copy_wallets": [w.strip()[:8] + "…" for w in os.getenv("COPY_WALLETS", "").replace("\n", ",").split(",") if w.strip()],
@@ -498,6 +500,38 @@ def copy_signals(limit: int = 200) -> JSONResponse:
     if not frame.empty and "timestamp" in frame.columns:
         frame = frame.sort_values("timestamp", ascending=False)
     return JSONResponse({"signals": frame_records(frame.head(limit))})
+
+
+def _scout_state() -> dict[str, Any]:
+    if not EXECUTOR_STATE.exists():
+        return {}
+    try:
+        return json.loads(EXECUTOR_STATE.read_text()).get("scout") or {}
+    except Exception:
+        return {}
+
+
+@app.get("/api/scout")
+def scout_report() -> JSONResponse:
+    """Read-only view of GMGN wallet scouting: every candidate's lifecycle state, gate results,
+    history and shadow metrics, relationships and the last live selection. Built from the
+    executor's persisted state; nothing here can promote or trade."""
+    import scout
+    return JSONResponse(scout.candidate_report(_scout_state(), scout.ScoutConfig(), time.time()))
+
+
+@app.get("/api/scout/{address}")
+def scout_candidate(address: str, limit: int = 200) -> JSONResponse:
+    """One candidate in full: the stored evaluation, its shadow trades and shadow signals."""
+    st = _scout_state()
+    cand = (st.get("candidates") or {}).get(address)
+    if cand is None:
+        raise HTTPException(404, "not a scouted wallet")
+    trades = [t for t in st.get("trades") or [] if t.get("wallet") == address][-limit:]
+    signals = [s for s in st.get("signals") or [] if s.get("wallet") == address][-limit:]
+    positions = [p for p in st.get("positions") or [] if p.get("copy") == address]
+    return JSONResponse({"candidate": cand, "shadow_trades": trades, "shadow_signals": signals,
+                         "shadow_positions": positions, "live": (st.get("live") or {}).get(address)})
 
 
 @app.get("/api/gmgn/screen")

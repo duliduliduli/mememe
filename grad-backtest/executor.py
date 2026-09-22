@@ -2383,6 +2383,74 @@ class Executor:
         self.pending: list[dict[str, Any]] = self.state.setdefault("pending", [])
         self._prune_stale_pending()
         self.last_entry_meta: dict[str, Any] = {}
+        # GMGN wallet scouting (discovery, qualification, shadow evaluation, controlled
+        # promotion) lives in its own module and its own slice of the state. It never trades:
+        # the only way a scouted wallet reaches the live copy lane is `followed_wallets()`.
+        self.scout: Any = None
+        try:
+            import scout
+            self.scout = scout.ScoutLane(self)
+        except Exception as exc:
+            log(f"WARN scout lane unavailable: {describe_error(exc)}")
+
+    # ---- followed wallets -------------------------------------------------
+    def followed_wallets(self) -> list[str]:
+        """The wallets the copy lane polls: the configured COPY_WALLETS, then scouted wallets
+        promoted to live (only with SCOUT_LIVE=1), then any scouted wallet a still-open
+        position was copied from, so a demoted wallet's sells keep being followed until its
+        positions are closed. Configured wallets removed from the variable are dropped as
+        before."""
+        wallets = list(self.cfg.copy_wallets)
+        scout = getattr(self, "scout", None)
+        if scout is not None:
+            try:
+                for wallet in scout.live_wallets():
+                    if wallet not in wallets:
+                        wallets.append(wallet)
+            except Exception as exc:
+                log(f"WARN scout live wallets: {describe_error(exc)}")
+        for pos in self.state.get("positions") or []:
+            wallet = pos.get("copy")
+            if wallet and pos.get("copy_scouted") and wallet not in wallets:
+                wallets.append(wallet)
+        return wallets
+
+    def followed_wallets_for_buys(self) -> list[str]:
+        """Wallets whose new buys may be mirrored: configured, plus scouted wallets currently
+        live. A wallet followed only for the sells of its open positions is not here."""
+        wallets = list(self.cfg.copy_wallets)
+        scout = getattr(self, "scout", None)
+        if scout is not None:
+            try:
+                wallets.extend(w for w in scout.live_wallets() if w not in wallets)
+            except Exception as exc:
+                log(f"WARN scout live wallets: {describe_error(exc)}")
+        return wallets
+
+    def copy_wallet_terms(self, wallet: str) -> tuple[float, float, bool]:
+        """(minimum source buy in USD, size multiplier, scouted?) for a followed wallet. A
+        configured wallet keeps its address:min:size terms; a scouted live wallet gets the
+        scout's reduced size (SCOUT_LIVE_SIZE) and the default minimum."""
+        cfg = self.cfg
+        if wallet in cfg.copy_wallets:
+            return cfg.copy_wallet_min_usd.get(wallet, cfg.copy_min_buy_usd), cfg.copy_wallet_size.get(wallet, 1.0), False
+        scout = getattr(self, "scout", None)
+        terms = (scout.live_wallets() if scout is not None else {}).get(wallet)
+        if terms:
+            return float(terms.get("min_usd") or cfg.copy_min_buy_usd), float(terms.get("size") or 1.0), True
+        return cfg.copy_min_buy_usd, 1.0, True
+
+    def note_copy_pnl(self, source: dict[str, Any], pnl: float) -> None:
+        """Realized P&L of a position (or its moon bag) copied from a wallet, reported to the
+        scout for the per-wallet live loss budget."""
+        scout = getattr(self, "scout", None)
+        wallet = source.get("copy")
+        if scout is None or not wallet:
+            return
+        try:
+            scout.note_live_pnl(wallet, float(pnl))
+        except Exception as exc:
+            log(f"WARN scout pnl note: {describe_error(exc)}")
 
     # ---- pricing helpers -------------------------------------------------
     def sol_price_usd(self) -> float:
@@ -2463,6 +2531,7 @@ class Executor:
             f"moon_bags={len(self.state.get('moon_bags', []))} watchlist={len(self.state.get('watchlist', []))} "
             f"draining={self.state.get('draining', False)} cooldown={cooldown:.0f}s "
             f"reconcile_pending={getattr(self, '_reconcile_pending', False)} "
+            f"scout={self.scout.heartbeat() if getattr(self, 'scout', None) is not None else 'off'} "
             f"decode_totals={json.dumps(self._discovery_counts, sort_keys=True)}"
         )
 
@@ -2703,7 +2772,8 @@ class Executor:
         ends in exactly one of: handled, unresolved (durable, retried with backoff) or failed
         (durable, visible in state["copy_failed"])."""
         cfg = self.cfg
-        if not cfg.copy_wallets:
+        wallets = self.followed_wallets()
+        if not wallets:
             return
         if now_ts() - float(self.state.get("copy_polled_ts") or 0) < cfg.copy_poll_seconds:
             return
@@ -2711,7 +2781,7 @@ class Executor:
         self.copy_retry_pending_exits(sol_price)
         self.copy_retry_unresolved(sol_price, allow_buys)
         seen_all = self.state.setdefault("copy_seen", {})
-        for wallet in cfg.copy_wallets:
+        for wallet in wallets:
             seen = seen_all.setdefault(wallet, [])
             baselined = self.state.setdefault("copy_baselined", [])
             try:
@@ -2725,9 +2795,9 @@ class Executor:
                 baselined.append(wallet)
                 fresh = [r for r in rows if r.get("blockTime") and now_ts() - int(r["blockTime"]) <= cfg.copy_max_tx_age_seconds]
                 seen.extend(r.get("signature") for r in rows if r.get("signature") and r not in fresh)
-                log(f"COPY watching {wallet} (baseline {len(seen)} signatures, {len(fresh)} fresh; "
-                    f"mirroring buys >= ${cfg.copy_wallet_min_usd.get(wallet, cfg.copy_min_buy_usd):,.0f} "
-                    f"at {cfg.copy_wallet_size.get(wallet, 1.0):.0%} of the usual size)")
+                w_min, w_size, w_scouted = self.copy_wallet_terms(wallet)
+                log(f"COPY watching {wallet} ({'scouted, ' if w_scouted else ''}baseline {len(seen)} signatures, {len(fresh)} fresh; "
+                    f"mirroring buys >= ${w_min:,.0f} at {w_size:.0%} of the usual size)")
             # Discovery and decoding are separate steps. Every unseen row goes into a durable
             # per-wallet inbox first (so a moved cursor or a restart can never lose it), then the
             # inbox is worked oldest-first under the decode budget.
@@ -2841,7 +2911,7 @@ class Executor:
         if age > cfg.copy_max_tx_age_seconds:
             log(f"COPY {wallet[:8]}: buy of {mint} is {age:.0f}s old; too late to mirror")
             return
-        minimum = cfg.copy_wallet_min_usd.get(wallet, cfg.copy_min_buy_usd)
+        minimum, wallet_size, scouted = self.copy_wallet_terms(wallet)
         if usd < minimum:
             log(f"COPY {wallet[:8]} bought {mint} for ${usd:,.0f} < ${minimum:,.0f} minimum; ignored")
             return
@@ -2861,6 +2931,18 @@ class Executor:
             log(f"COPY {wallet[:8]} bought {mint} for ${usd:,.0f}; draining, no new entries")
             blocked("draining")
             return
+        if scouted and wallet not in self.followed_wallets_for_buys():
+            # A demoted scouted wallet: its open positions are still managed and its sells
+            # still followed, but it opens nothing new.
+            log(f"COPY {wallet[:8]} bought {mint} for ${usd:,.0f}; scouted wallet is no longer live; not mirrored")
+            blocked("scout_not_live")
+            return
+        if self.scout is not None:
+            allowed, why = self.scout.entry_allowed(wallet)
+            if not allowed:
+                log(f"COPY {wallet[:8]} bought {mint} for ${usd:,.0f}; {why}; not mirrored (sells still followed)")
+                blocked("elite_only")
+                return
         if verdict == "skip" and cfg.copy_gmgn_gate == "enforce":
             if self.gmgn_verdict_stale(verdict_row):
                 log(f"COPY {wallet[:8]}: GMGN verdict for this wallet is stale; treated as unknown, not enforced")
@@ -2889,7 +2971,7 @@ class Executor:
         self.last_skip = None
         self.enter_with_retry({"mint": mint, "graduated_ts": int(block_time or now_ts()), "enter_at": now_ts(),
                                "copy": wallet, "copy_buy_usd": round(usd), "copy_signature": sig,
-                               "copy_size": cfg.copy_wallet_size.get(wallet, 1.0)}, sol_price)
+                               "copy_size": wallet_size, "copy_scouted": scouted}, sol_price)
         # The attempt is only a fill once the position exists with this source signature.
         pos = next((p for p in self.state["positions"] if p.get("copy_signature") == sig), None)
         if pos:
@@ -3249,8 +3331,13 @@ class Executor:
             return
         scale = float(item.get("copy_size") or 1.0)
         if scale != 1.0:
+            scaled = round(size_usd * scale, 2)
+            if scaled < self.cfg.min_position_usd and item.get("copy_scouted"):
+                # A scouted wallet's reduced size is a risk cap, never rounded up to the minimum.
+                self.skip(mint, f"scouted size {scale:.0%} of ${size_usd:,.2f} is below the ${self.cfg.min_position_usd:,.2f} minimum")
+                return
             # A wallet copied at a reduced size; never below the minimum position, where fees win.
-            size_usd = max(self.cfg.min_position_usd, round(size_usd * scale, 2))
+            size_usd = max(self.cfg.min_position_usd, scaled)
         deployed = self.deployed_usd()
         if deployed + size_usd > equity * self.cfg.max_deployed_fraction:
             self.skip(mint, f"deployment cap: ${deployed:,.2f} in positions + ${size_usd:,.2f} > "
@@ -3430,6 +3517,7 @@ class Executor:
                 "copy": copied or None,
                 "copy_buy_usd": item.get("copy_buy_usd"),
                 "copy_signature": item.get("copy_signature"),
+                "copy_scouted": bool(item.get("copy_scouted")) or None,
                 "position_id": uuid.uuid4().hex[:16],
                 "entry_tokens": tokens,
                 "entry_basis_usd": size_usd,
@@ -3487,6 +3575,7 @@ class Executor:
                     f"(${est:.2f}). Confirm the actual proceeds on an explorer."
                 )
                 self.state["daily"]["realized_pnl_usd"] = float(self.state["daily"]["realized_pnl_usd"]) + (est - pos["position_usd"])
+                self.note_copy_pnl(pos, est - pos["position_usd"])
                 self.state["positions"].remove(pos)
                 save_state(self.state)
                 self._record_close(pos, f"{reason}_unconfirmed", est, "", pos["position_usd"])
@@ -3514,11 +3603,13 @@ class Executor:
                     "peak_usd": round(kept_usd, 2),
                     "created_at": utc_iso(),
                     "from_exit": reason,
+                    "copy": pos.get("copy"),
                 }
             )
             target = f", sells at {self.cfg.moon_bag_target_x:.0f}x (${kept_usd * self.cfg.moon_bag_target_x:,.0f})" if self.cfg.moon_bag_target_x > 0 else ", held until panic"
             log(f"MOONBAG {mint}: keeping {mb:.0%} ({keep} tokens, worth ${kept_usd:.2f} now{target})")
         self.state["daily"]["realized_pnl_usd"] = float(self.state["daily"]["realized_pnl_usd"]) + (exit_usd - sold_cost)
+        self.note_copy_pnl(pos, exit_usd - sold_cost)
         self.state["positions"].remove(pos)
         save_state(self.state)
         self._record_close(pos, reason, exit_usd, sell_sig, sold_cost)
@@ -3820,6 +3911,7 @@ class Executor:
         net = proceeds / sold_cost - 1.0 if sold_cost > 0 else 0.0
         peak_gain = float(pos["peak_usd"]) / pos["position_usd"] - 1.0 if pos["position_usd"] else None
         self.state["daily"]["realized_pnl_usd"] = float(self.state["daily"]["realized_pnl_usd"]) + (proceeds - sold_cost)
+        self.note_copy_pnl(pos, proceeds - sold_cost)
         pos["tokens"] = amount - sell_amount
         pos["position_usd"] = pos["position_usd"] - sold_cost
         pos["peak_usd"] = float(pos["peak_usd"]) * (1.0 - frac)
@@ -3900,6 +3992,7 @@ class Executor:
         self.state[key].remove(bag)
         basis = float(bag.get("cost_usd", bag.get("position_usd", 0.0)) or 0.0)
         self.state["daily"]["realized_pnl_usd"] = float(self.state["daily"]["realized_pnl_usd"]) + (proceeds - basis)
+        self.note_copy_pnl(bag, proceeds - basis)
         record_trade(
             {
                 "opened_at": bag.get("created_at") or bag.get("opened_at"),
@@ -3958,6 +4051,7 @@ class Executor:
             self.state["moon_bags"].remove(bag)
             basis = float(bag.get("cost_usd") or 0.0)
             self.state["daily"]["realized_pnl_usd"] = float(self.state["daily"]["realized_pnl_usd"]) - basis
+            self.note_copy_pnl(bag, -basis)
             record_trade(
                 {
                     "opened_at": bag.get("created_at"),
@@ -4061,13 +4155,21 @@ class Executor:
                     self.manage_watchlist(sol_price or self.sol_price_usd())
                 except Exception as exc:
                     log(f"WARN runner watchlist: {describe_error(exc)}")
-        if self.cfg.copy_wallets:
+        if self.followed_wallets():
             # Runs while draining too: sells are still followed and pending exits retried,
             # only new entries are refused.
             try:
                 self.poll_copy_wallets(sol_price or self.sol_price_usd(), allow_buys=not draining)
             except Exception as exc:
                 log(f"WARN copy trading: {describe_error(exc)}")
+        if self.scout is not None and self.scout.enabled:
+            # Scouting runs last, after every exit check and the copy poll, under its own
+            # request budgets; a failure here is logged and never reaches position management.
+            try:
+                self.scout.reset_quote_budget()
+                self.scout.tick(sol_price or self.sol_price_usd())
+            except Exception as exc:
+                log(f"WARN scout: {describe_error(exc)}")
         self.maybe_refresh_gmgn()
         save_state(self.state)
 
@@ -4184,6 +4286,8 @@ class Executor:
             f"stuck_after={self.cfg.stuck_after_minutes:.0f}m "
             f"retries={self.cfg.entry_retries} daily_loss_limit=${self.cfg.daily_loss_limit_usd}")
         log("RPC endpoints: " + ", ".join(redact_endpoint(url) for url in self.cfg.rpc_urls))
+        if self.scout is not None:
+            log("SCOUT " + self.scout.startup_line())
         if self.cfg.mode == "live":
             log(f"live wallet: {self.wallet.pubkey} (burner only!)")
             startup_provider_limited = False
