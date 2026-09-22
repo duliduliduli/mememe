@@ -619,6 +619,24 @@ class LaneTests(unittest.TestCase):
         self.assertIn("promotion refused until set", line)
         self.assertIn(scout.POLICY_VERSION, line)
 
+    def test_discovery_reruns_at_retry_interval_until_something_is_enriched(self):
+        executor, ex = self.make()
+        lane = ex.scout
+        started = []
+        lane.discover_and_enrich_async = None
+        def fake_start(force=False):
+            started.append(1)
+        lane.st["discovered_ts"] = time.time()                                    # a cycle just ran ...
+        lane.st["attempt_ts"] = time.time() - 3600
+        lane.st["candidates"][OTHER] = {"address": OTHER, "state": "discovered", "sources": [], "rank_snapshots": [], "lifecycle": []}
+        with mock.patch("threading.Thread") as thread:
+            lane.maybe_discover()                                                 # ... but enriched nothing: due again
+            self.assertEqual(thread.call_count, 1)
+            lane.st["attempt_ts"] = time.time() - 3600
+            lane.st["candidates"][OTHER]["last_refresh"] = time.time()
+            lane.maybe_discover()                                                 # something enriched: wait the full period
+            self.assertEqual(thread.call_count, 1)
+
     def test_discovery_result_is_applied_on_the_main_thread(self):
         executor, ex = self.make()
         lane = ex.scout

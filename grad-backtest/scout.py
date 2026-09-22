@@ -669,6 +669,10 @@ class ScoutLane:
         if self._thread is not None and self._thread.is_alive():
             return
         due = self.now() - float(self.st.get("discovered_ts") or 0) >= self.cfg.discovery_hours * 3600
+        # A cycle that enriched nothing (every lookup failed) is not a cycle: try again at the
+        # retry interval instead of waiting out the whole discovery period.
+        if self.st["candidates"] and not any(c.get("last_refresh") for c in self.st["candidates"].values()):
+            due = True
         retry_ok = self.now() - float(self.st.get("attempt_ts") or 0) >= 1800
         if not force and not (due and retry_ok):
             return
