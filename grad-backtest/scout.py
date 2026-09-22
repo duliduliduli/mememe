@@ -72,7 +72,7 @@ class ScoutConfig:
         self.mode = os.getenv("SCOUT_MODE", "shadow").strip().lower()          # off | shadow
         self.live = os.getenv("SCOUT_LIVE", "1") == "1"                        # promotion switch
         self.elite_only = os.getenv("SCOUT_ELITE_ONLY", "0") == "1"            # configured wallets must qualify too
-        self.discovery_hours = _env_float("SCOUT_DISCOVERY_HOURS", 6)
+        self.discovery_hours = _env_float("SCOUT_DISCOVERY_HOURS", 2)
         self.refresh_hours = _env_float("SCOUT_REFRESH_HOURS", 24)
         self.max_qualification_age_hours = _env_float("SCOUT_MAX_QUALIFICATION_AGE_HOURS", 48)
         self.max_live = _env_int("SCOUT_MAX_LIVE", 3)
@@ -83,6 +83,10 @@ class ScoutConfig:
         # (leaderboard, holdings) and the 14-day shadow sample. Shadow still runs as the tripwire.
         self.fast_track = os.getenv("SCOUT_FAST_TRACK", "1") == "1"
         self.fast_track_min_history_days = _env_float("SCOUT_FAST_TRACK_MIN_HISTORY_DAYS", 15)
+        # A wallet trading hundreds of times a day fills the activity page cap in days, not
+        # weeks, so a short window is not thin evidence: this many closed episodes inside it
+        # count instead of the calendar requirement.
+        self.fast_track_dense_episodes = _env_int("SCOUT_FAST_TRACK_DENSE_EPISODES", 40)
         self.fast_track_min_episodes_30d = _env_int("SCOUT_FAST_TRACK_MIN_EPISODES_30D", 20)
         self.fast_track_min_tokens_30d = _env_int("SCOUT_FAST_TRACK_MIN_TOKENS_30D", 10)
         self.fast_track_min_active_days_30d = _env_int("SCOUT_FAST_TRACK_MIN_ACTIVE_DAYS_30D", 7)
@@ -406,11 +410,24 @@ def evaluate_candidate(cand: dict[str, Any], cfg: ScoutConfig, now: float, min_f
         gate("history_days", "missing", f"only {coverage_days:.0f} days of activity fetched before the page cap; need {cfg.min_history_days:.0f}")
     else:
         gate("history_days", "pass" if coverage_days >= cfg.min_history_days else "fail", f"{coverage_days:.0f} days observed")
+    dense = int((m30 or {}).get("closed_episodes") or 0)
     if coverage_days is None:
         gate("history_days_fast", "missing", "activity history not fetched")
+    elif coverage_days >= cfg.fast_track_min_history_days:
+        gate("history_days_fast", "pass", f"{coverage_days:.1f} days of activity fetched")
+    elif hist.get("truncated") and dense >= cfg.fast_track_dense_episodes:
+        # The page cap cut the window short, not the wallet's record: this many closed
+        # episodes inside those days is denser evidence than a quiet wallet's fortnight.
+        gate("history_days_fast", "pass",
+             f"{coverage_days:.1f} days fetched before the page cap, holding {dense} closed episodes "
+             f"(dense evidence counts from {cfg.fast_track_dense_episodes})")
+    elif hist.get("truncated"):
+        gate("history_days_fast", "missing",
+             f"only {coverage_days:.1f} days fetched before the page cap, holding {dense} closed episodes; "
+             f"need {cfg.fast_track_min_history_days:.0f} days or {cfg.fast_track_dense_episodes} episodes")
     else:
-        gate("history_days_fast", "pass" if coverage_days >= cfg.fast_track_min_history_days else ("missing" if hist.get("truncated") else "fail"),
-             f"{coverage_days:.1f} days of activity fetched (fast track needs {cfg.fast_track_min_history_days:.0f})")
+        gate("history_days_fast", "fail",
+             f"{coverage_days:.1f} days of activity (fast track needs {cfg.fast_track_min_history_days:.0f})")
     min_eps = cfg.fast_track_min_episodes_30d if cfg.fast_track else cfg.min_episodes_30d
     min_tok = cfg.fast_track_min_tokens_30d if cfg.fast_track else cfg.min_tokens_30d
     min_days = cfg.fast_track_min_active_days_30d if cfg.fast_track else cfg.min_active_days_30d
