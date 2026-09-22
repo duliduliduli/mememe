@@ -2937,6 +2937,15 @@ class Executor:
             log(f"COPY {wallet[:8]} bought {mint} for ${usd:,.0f}; scouted wallet is no longer live; not mirrored")
             blocked("scout_not_live")
             return
+        if scouted and self.scout is not None and self.scout.cfg.max_open_positions > 0:
+            # Scouted wallets share a small pool of slots so they can never crowd out the
+            # configured wallets or spread the account across too many coins at once.
+            open_scouted = sum(1 for p in self.state["positions"] if p.get("copy_scouted"))
+            if open_scouted >= self.scout.cfg.max_open_positions:
+                log(f"COPY {wallet[:8]} bought {mint} for ${usd:,.0f}; {open_scouted} scouted position(s) already open "
+                    f"(SCOUT_MAX_OPEN_POSITIONS={self.scout.cfg.max_open_positions}); not mirrored")
+                blocked("scout_slots")
+                return
         if self.scout is not None:
             allowed, why = self.scout.entry_allowed(wallet)
             if not allowed:

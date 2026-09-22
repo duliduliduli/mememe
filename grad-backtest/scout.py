@@ -42,7 +42,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-POLICY_VERSION = "2026-09-22.1"
+POLICY_VERSION = "2026-09-22.2"
 STATES = ("discovered", "research", "shadow", "qualified", "live", "paused", "rejected")
 BAD_TAGS = ("wash_trader", "sandwich_bot", "mev_bot", "bundler", "rat_trader")
 WSOL = "So11111111111111111111111111111111111111112"
@@ -70,14 +70,23 @@ class ScoutConfig:
 
     def __init__(self) -> None:
         self.mode = os.getenv("SCOUT_MODE", "shadow").strip().lower()          # off | shadow
-        self.live = os.getenv("SCOUT_LIVE", "0") == "1"                        # promotion switch
+        self.live = os.getenv("SCOUT_LIVE", "1") == "1"                        # promotion switch
         self.elite_only = os.getenv("SCOUT_ELITE_ONLY", "0") == "1"            # configured wallets must qualify too
         self.discovery_hours = _env_float("SCOUT_DISCOVERY_HOURS", 6)
         self.refresh_hours = _env_float("SCOUT_REFRESH_HOURS", 24)
         self.max_qualification_age_hours = _env_float("SCOUT_MAX_QUALIFICATION_AGE_HOURS", 48)
         self.max_live = _env_int("SCOUT_MAX_LIVE", 3)
-        self.live_size = _env_float("SCOUT_LIVE_SIZE", 0.25)
-        self.live_loss_budget_usd = _env_float("SCOUT_LIVE_LOSS_BUDGET_USD", 0)  # 0: promotion refused
+        self.live_size = _env_float("SCOUT_LIVE_SIZE", 0.5)                    # of the usual size; 0.25 falls under the $5 minimum on a small account
+        self.max_open_positions = _env_int("SCOUT_MAX_OPEN_POSITIONS", 3)      # open positions from scouted wallets at once (0: no cap)
+        self.live_loss_budget_usd = _env_float("SCOUT_LIVE_LOSS_BUDGET_USD", 25)  # 0: promotion refused
+        # Fast track: qualify on fetched history alone, waiving the gates GMGN cannot evidence
+        # (leaderboard, holdings) and the 14-day shadow sample. Shadow still runs as the tripwire.
+        self.fast_track = os.getenv("SCOUT_FAST_TRACK", "1") == "1"
+        self.fast_track_min_history_days = _env_float("SCOUT_FAST_TRACK_MIN_HISTORY_DAYS", 15)
+        self.fast_track_min_episodes_30d = _env_int("SCOUT_FAST_TRACK_MIN_EPISODES_30D", 20)
+        self.fast_track_min_tokens_30d = _env_int("SCOUT_FAST_TRACK_MIN_TOKENS_30D", 10)
+        self.fast_track_min_active_days_30d = _env_int("SCOUT_FAST_TRACK_MIN_ACTIVE_DAYS_30D", 7)
+        self.tripwire_trades = _env_int("SCOUT_TRIPWIRE_TRADES", 10)              # live wallet paused when shadow net < 0 after this many
         self.max_shadow = _env_int("SCOUT_MAX_SHADOW", 25)                     # wallets polled on-chain
         self.max_candidates = _env_int("SCOUT_MAX_CANDIDATES", 200)
         self.poll_seconds = _env_float("SCOUT_POLL_SECONDS", 10)
@@ -85,10 +94,10 @@ class ScoutConfig:
         self.quote_budget = _env_int("SCOUT_QUOTE_BUDGET", 6)                  # Jupiter quotes per poll
         self.stress_seconds = _env_float("SCOUT_STRESS_SECONDS", 20)
         self.fee_usd = _env_float("SCOUT_FEE_USD", 0.05)                       # network + priority fee per swap; quotes carry route fees and impact
-        self.enrich_per_cycle = _env_int("SCOUT_ENRICH_PER_CYCLE", 8)
+        self.enrich_per_cycle = _env_int("SCOUT_ENRICH_PER_CYCLE", 25)
         self.activity_pages = _env_int("SCOUT_ACTIVITY_PAGES", 40)             # 20 events a page
         self.token_sample = _env_int("SCOUT_TOKEN_SAMPLE", 12)
-        self.gmgn_units_per_cycle = _env_int("SCOUT_GMGN_UNITS_PER_CYCLE", 600)
+        self.gmgn_units_per_cycle = _env_int("SCOUT_GMGN_UNITS_PER_CYCLE", 4000)
         self.requalify_hours = _env_float("SCOUT_REQUALIFY_HOURS", 24)
         # Historical qualification (30d window unless named otherwise)
         self.min_history_days = _env_float("SCOUT_MIN_HISTORY_DAYS", 60)
@@ -397,13 +406,21 @@ def evaluate_candidate(cand: dict[str, Any], cfg: ScoutConfig, now: float, min_f
         gate("history_days", "missing", f"only {coverage_days:.0f} days of activity fetched before the page cap; need {cfg.min_history_days:.0f}")
     else:
         gate("history_days", "pass" if coverage_days >= cfg.min_history_days else "fail", f"{coverage_days:.0f} days observed")
+    if coverage_days is None:
+        gate("history_days_fast", "missing", "activity history not fetched")
+    else:
+        gate("history_days_fast", "pass" if coverage_days >= cfg.fast_track_min_history_days else ("missing" if hist.get("truncated") else "fail"),
+             f"{coverage_days:.1f} days of activity fetched (fast track needs {cfg.fast_track_min_history_days:.0f})")
+    min_eps = cfg.fast_track_min_episodes_30d if cfg.fast_track else cfg.min_episodes_30d
+    min_tok = cfg.fast_track_min_tokens_30d if cfg.fast_track else cfg.min_tokens_30d
+    min_days = cfg.fast_track_min_active_days_30d if cfg.fast_track else cfg.min_active_days_30d
     if not m30:
         for name in ("episodes_30d", "tokens_30d", "active_days_30d", "profit_factor_30d", "outlier_30d", "best_token_share", "drawdown", "hold_time", "fast_exits"):
             gate(name, "missing", "no episode metrics")
     else:
-        gate("episodes_30d", "pass" if m30["closed_episodes"] >= cfg.min_episodes_30d else "fail", f"{m30['closed_episodes']} closed episodes (need {cfg.min_episodes_30d})")
-        gate("tokens_30d", "pass" if m30["distinct_tokens"] >= cfg.min_tokens_30d else "fail", f"{m30['distinct_tokens']} tokens (need {cfg.min_tokens_30d})")
-        gate("active_days_30d", "pass" if m30["active_days"] >= cfg.min_active_days_30d else "fail", f"{m30['active_days']} active days (need {cfg.min_active_days_30d})")
+        gate("episodes_30d", "pass" if m30["closed_episodes"] >= min_eps else "fail", f"{m30['closed_episodes']} closed episodes (need {min_eps})")
+        gate("tokens_30d", "pass" if m30["distinct_tokens"] >= min_tok else "fail", f"{m30['distinct_tokens']} tokens (need {min_tok})")
+        gate("active_days_30d", "pass" if m30["active_days"] >= min_days else "fail", f"{m30['active_days']} active days (need {min_days})")
         pf = m30.get("profit_factor")
         if pf is None:
             gate("profit_factor_30d", "missing", "no scored losses or profits")
@@ -463,11 +480,20 @@ def evaluate_candidate(cand: dict[str, Any], cfg: ScoutConfig, now: float, min_f
         lbb = sh.get("bootstrap_lower_bound")
         gate("shadow_bootstrap", "missing" if lbb is None else ("pass" if lbb > 0 else "fail"),
              f"95% lower bound of mean return {lbb:+.4f} (token and day clusters)" if lbb is not None else "too few clusters")
-    failed = [k for k, g in gates.items() if g["status"] == "fail"]
-    qualified = not failed and not missing
+    # Which gates decide. The full policy needs every gate; the fast track waives what GMGN
+    # cannot evidence (leaderboard, holdings), the 60-day history and the shadow sample, and
+    # judges on the fetched history alone. `history_days_fast` only counts on the fast track.
+    if cfg.fast_track:
+        waived = ["leaderboard", "open_inventory", "history_days"] + [k for k in gates if k.startswith("shadow_")]
+    else:
+        waived = ["history_days_fast"]
+    deciding = {k: g for k, g in gates.items() if k not in waived}
+    failed = [k for k, g in deciding.items() if g["status"] == "fail"]
+    missing_deciding = [k for k, g in deciding.items() if g["status"] == "missing"]
+    qualified = not failed and not missing_deciding
     score = score_candidate(cand, m30, sh, lb)
-    return {"policy_version": POLICY_VERSION, "evaluated_at": now, "gates": gates, "failed": failed, "missing": missing,
-            "qualified": qualified, "score": score}
+    return {"policy_version": POLICY_VERSION, "evaluated_at": now, "gates": gates, "failed": failed, "missing": missing_deciding,
+            "waived": waived, "track": "fast" if cfg.fast_track else "full", "qualified": qualified, "score": score}
 
 
 def score_candidate(cand: dict[str, Any], m30: dict[str, Any], sh: dict[str, Any], lb: dict[str, Any]) -> dict[str, Any]:
@@ -804,6 +830,11 @@ class ScoutLane:
             if cooldown and self.now() - float(cooldown) < self.cfg.requalify_hours * 3600:
                 return
             self.transition(cand, "qualified", "every gate passed with fresh evidence")
+            return
+        sh = cand.get("shadow") or {}
+        if state == "live" and sh.get("trades", 0) >= self.cfg.tripwire_trades and _f(sh.get("net_base_usd")) < 0:
+            cand["demoted_ts"] = self.now()
+            self.transition(cand, "paused", f"tripwire: shadow net {sh['net_base_usd']:+.2f} USD after {sh['trades']} trades")
             return
         if state in ("qualified", "live") and not ev["qualified"]:
             why = ", ".join(ev["failed"]) or ("missing " + ", ".join(ev["missing"]))
@@ -1185,8 +1216,9 @@ class ScoutLane:
         if not self.enabled:
             why = "SCOUT_MODE=off" if c.mode == "off" else "GMGN_API_KEY not set"
             return f"wallet scouting off ({why})"
-        return (f"wallet scouting mode={c.mode} live_promotion={'ON' if c.live else 'off'} elite_only={'on' if c.elite_only else 'off'} "
+        return (f"wallet scouting mode={c.mode} track={'fast' if c.fast_track else 'full'} live_promotion={'ON' if c.live else 'off'} elite_only={'on' if c.elite_only else 'off'} "
                 f"discovery={c.discovery_hours:.0f}h refresh={c.refresh_hours:.0f}h max_live={c.max_live} live_size={c.live_size:.0%} "
+                f"max_open_scouted={c.max_open_positions} "
                 f"live_loss_budget=${c.live_loss_budget_usd:,.0f}{' (promotion refused until set)' if c.live_loss_budget_usd <= 0 else ''} "
                 f"shadow>={c.shadow_min_days}d/{c.shadow_min_trades}trades/{c.shadow_min_tokens}tokens PF>={c.shadow_min_profit_factor} "
                 f"DD<={c.shadow_max_drawdown:.0%} history>={c.min_history_days}d PF>={c.min_profit_factor} "
@@ -1236,6 +1268,7 @@ def candidate_report(st: dict[str, Any], cfg: ScoutConfig, now: float) -> dict[s
     for r in rows:
         counts[r["state"]] += 1
     return {"policy_version": POLICY_VERSION, "mode": cfg.mode, "live_switch": cfg.live, "elite_only": cfg.elite_only,
+            "track": "fast" if cfg.fast_track else "full", "live_loss_budget_usd": cfg.live_loss_budget_usd,
             "counts": dict(counts), "candidates": rows, "shadow_positions": st.get("positions", []),
             "last_selection": st.get("last_selection"), "discovered_at": st.get("discovered_ts"), "errors": (st.get("errors") or [])[-10:],
             "token_sample": st.get("token_sample", []), "gmgn_units_last_cycle": st.get("last_units")}
