@@ -948,7 +948,8 @@ class LadderTests(unittest.TestCase):
         self.assertEqual(executor.parse_sell_ladder("5:30, 2x:40%,3:30,bad,0.5:10"),
                          [{"x": 2.0, "pct": 40.0}, {"x": 3.0, "pct": 30.0}, {"x": 5.0, "pct": 30.0}])
         self.assertEqual(executor.parse_sell_ladder(""), [])
-        self.assertEqual([(r["x"], r["pct"]) for r in executor.Config().copy_ladder], [(1.4, 40.0), (1.8, 30.0), (3.0, 30.0)])
+        # 30% at +40%, 30% at +80%; the remaining 40% rides as the runner (COPY_RUNNER_TRAIL).
+        self.assertEqual([(r["x"], r["pct"]) for r in executor.Config().copy_ladder], [(1.4, 30.0), (1.8, 30.0)])
 
     def position(self, ex, tokens=1000, basis=10.0):
         import time as _time
@@ -979,6 +980,72 @@ class LadderTests(unittest.TestCase):
         price["v"] = 0.06                           # 6x: top rung closes the rest (moon bag inside close)
         ex.manage_positions(SOL, panic=False)
         self.assertEqual(closed, ["ladder_5x"])
+
+    def drive(self, ex, pos):
+        """A price the test can move; quotes (not the feed) value the position every call."""
+        price = {"v": 0.01}
+        ex.token_prices = lambda mints: {}
+        ex.jup.quote = lambda mint, out, amount, **kw: {"outAmount": str(int(amount * price["v"] / SOL * 1e9))}
+        closed = []
+        real_close = ex.close_position
+        ex.close_position = lambda p, reason, sol_price: (closed.append(reason), real_close(p, reason, sol_price))
+        def at(v):
+            price["v"] = v
+            ex.manage_positions(SOL, panic=False)
+        return at, closed
+
+    def test_runner_rides_past_the_last_rung_with_no_cap(self):
+        executor, ex = self.make(COPY_LADDER="1.4:30,1.8:30")
+        pos = self.position(ex)                        # 1000 tokens for $10: entry price $0.01
+        at, closed = self.drive(ex, pos)
+        at(0.015)                                      # 1.5x: 30% of the entry tokens
+        self.assertEqual(pos["tokens"], 700)
+        at(0.019)                                      # 1.9x: 30% more; the last rung no longer closes
+        self.assertEqual(pos["tokens"], 400)
+        self.assertEqual(closed, [])
+        xcfg = ex.exit_cfg(pos)
+        self.assertEqual(xcfg.take_profit, float("inf"))
+        self.assertEqual(xcfg.trailing_stop, 0.40)
+        self.assertEqual(executor.tp_text(4.0, xcfg), "tp_value=none(runner, trail 40%)")
+        self.assertEqual(executor.stop_text(4.0, 7.6, xcfg), "sl_value=$4.00(breakeven)")
+        at(0.10)                                       # 10x: nothing caps the runner
+        self.assertIn(pos, ex.state["positions"])
+        at(0.065)                                      # 35% off its peak: still riding
+        self.assertIn(pos, ex.state["positions"])
+        at(0.058)                                      # 42% off: the runner trail sells it
+        self.assertEqual(closed, ["trailing_stop"])
+
+    def test_runner_off_restores_the_closing_last_rung(self):
+        executor, ex = self.make(COPY_LADDER="1.4:30,1.8:30", COPY_RUNNER_TRAIL="0")
+        pos = self.position(ex)
+        at, closed = self.drive(ex, pos)
+        at(0.015)
+        self.assertEqual(pos["tokens"], 700)
+        at(0.019)
+        self.assertEqual(closed, ["ladder_1.8x"])
+
+    def test_breakeven_floor_after_a_pop_that_never_armed_the_trail(self):
+        """The 8 losers of the first 38 positions that popped +12-30% and rode to -30%."""
+        executor, ex = self.make(COPY_LADDER="")         # no rungs: the floor alone
+        pos = self.position(ex)
+        at, closed = self.drive(ex, pos)
+        at(0.0125)                                     # +25%: above the +20% arm, below the +30% trail arm
+        at(0.0101)                                     # back to +1%: still above entry
+        self.assertEqual(closed, [])
+        at(0.0099)                                     # below entry: out near cost, not at -30%
+        self.assertEqual(closed, ["breakeven_stop"])
+
+    def test_no_floor_below_the_arm_and_other_lanes_untouched(self):
+        executor, ex = self.make(COPY_LADDER="")
+        pos = self.position(ex)
+        at, closed = self.drive(ex, pos)
+        at(0.0115)                                     # +15%: below the +20% arm
+        at(0.0090)                                     # -10%: ordinary meme noise, held
+        self.assertEqual(closed, [])
+        at(0.0069)
+        self.assertEqual(closed, ["stop_loss"])
+        base = executor.Config()                       # graduation lane: no floor
+        self.assertIsNone(executor.decide_exit(10.0, 9.9, 0, 1, base, 12.5))
 
     def test_jump_past_two_rungs_takes_both(self):
         executor, ex = self.make()

@@ -1187,7 +1187,8 @@ class ScoutLane:
         for r in crossed:
             r["done"] = True
         last = crossed[-1] is rungs[-1]
-        if last or share_tokens >= tokens_now * 0.98:
+        runner = float(getattr(self.ex.cfg, "copy_runner_trail", 0.0) or 0.0) > 0   # same rule as the live ladder
+        if (last and not runner) or share_tokens >= tokens_now * 0.98:
             self.shadow_exit(pos, 1.0, f"ladder_{crossed[-1]['x']:g}x", None, current_usd)
         else:
             self.shadow_exit(pos, share_tokens / tokens_now, f"ladder_{crossed[-1]['x']:g}x", None, current_usd)
