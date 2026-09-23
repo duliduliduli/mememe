@@ -1082,7 +1082,7 @@ class ConvergenceTests(unittest.TestCase):
         lane.shadow_handle_buy(wallet, sig, int(ts or time.time()), swap, usd, 1.0, SOL)
 
     def test_two_independent_wallets_in_the_window_open_one_convergence_position(self):
-        executor, ex = self.make(SCOUT_QUOTE_BUDGET="20")
+        executor, ex = self.make(SCOUT_QUOTE_BUDGET="20", SCOUT_CONVERGENCE_LIVE="0")
         self.seed(ex, OTHER, state="shadow")
         self.seed(ex, THIRD, state="shadow")
         self.fake_market(ex)
@@ -1201,3 +1201,66 @@ class ExpectancyTests(unittest.TestCase):
         self.assertEqual(report["convergence"]["trades"], 1)
         self.assertEqual(report["convergence"]["net_pnl_stress_usd"], 3.5)
         self.assertEqual(report["shadow"]["overall"], {"trades": 0})
+
+
+class ConvergenceLiveTests(unittest.TestCase):
+    make, seed, fake_market = LaneTests.make, LaneTests.seed, LaneTests.fake_market
+    buy = ConvergenceTests.buy
+
+    def setup(self, **env):
+        env.setdefault("SCOUT_QUOTE_BUDGET", "50")
+        env.setdefault("PAPER_BALANCE_USD", "200")
+        executor, ex = self.make(**env)
+        ex.state["paper_balance_usd"] = 200.0
+        self.seed(ex, OTHER, state="shadow")
+        self.seed(ex, THIRD, state="shadow")
+        self.fake_market(ex)
+        ex.scout.reset_quote_budget()
+        return executor, ex
+
+    def converge(self, ex, mint=MINT):
+        self.buy(ex.scout, OTHER, f"a-{mint}", mint=mint)
+        self.buy(ex.scout, THIRD, f"b-{mint}", mint=mint)
+
+    def test_convergence_buys_live_at_reduced_size_and_member_sell_closes_it(self):
+        executor, ex = self.setup()
+        self.converge(ex)
+        live = [p for p in ex.state["positions"] if p.get("convergence")]
+        self.assertEqual(len(live), 1)
+        self.assertEqual(live[0]["copy"], scout.CONVERGENCE)
+        self.assertEqual(sorted(live[0]["convergence_wallets"]), sorted([OTHER, THIRD]))
+        self.assertEqual(ex.scout.st["convergence_events"][-1]["live"], "bought")
+        self.assertNotIn(scout.CONVERGENCE, ex.followed_wallets())            # not a wallet to poll
+        full = next(p for p in ex.scout.st["positions"] if p["wallet"] == OTHER)["size_usd"]   # the usual copy size
+        self.assertAlmostEqual(live[0]["position_usd"], max(ex.cfg.min_position_usd, round(full * 0.5, 2)), delta=0.01)
+        ex.scout.shadow_follow_sell(OTHER, MINT, 0.3, SOL, "trim")             # a trim keeps it
+        self.assertEqual(len([p for p in ex.state["positions"] if p.get("convergence")]), 1)
+        ex.scout.shadow_follow_sell(OTHER, MINT, 1.0, SOL, "out")
+        self.assertEqual([p for p in ex.state["positions"] if p.get("convergence")], [])
+        self.assertIn(scout.CONVERGENCE, ex.scout.st["live"])                  # P&L booked against its budget
+
+    def test_open_cap_loss_budget_tripwire_and_switch(self):
+        executor, ex = self.setup(SCOUT_CONVERGENCE_MAX_OPEN="1")
+        self.converge(ex, "M1")
+        self.converge(ex, "M2")
+        self.assertEqual(sum(1 for p in ex.state["positions"] if p.get("convergence")), 1)
+        self.assertIn("SCOUT_CONVERGENCE_MAX_OPEN", ex.scout.st["convergence_events"][-1]["live"])
+        ex.scout.cfg.convergence_max_open = 0
+        ex.scout.st["live"][scout.CONVERGENCE] = {"realized_pnl_usd": -15.0}
+        self.assertIn("loss budget", ex.scout.convergence_live_block())
+        ex.scout.st["live"][scout.CONVERGENCE] = {"realized_pnl_usd": 0.0}
+        ex.scout.st["trades"].extend({"kind": "convergence", "closed_ts": 1, "pnl_base": -1.0} for _ in range(10))
+        self.assertIn("tripwire", ex.scout.convergence_live_block())
+        ex.scout.st["trades"] = []
+        self.assertEqual(ex.scout.convergence_live_block(), "")
+        ex.scout.cfg.convergence_live = False
+        self.assertEqual(ex.scout.convergence_live_block(), "SCOUT_CONVERGENCE_LIVE=0")
+
+    def test_a_stale_convergence_is_shadow_only(self):
+        executor, ex = self.setup()
+        old = time.time() - 300
+        self.buy(ex.scout, OTHER, "a", ts=old)
+        self.buy(ex.scout, THIRD, "b", ts=old + 5)
+        self.assertEqual(ex.state["positions"], [])
+        self.assertIn("old", ex.scout.st["convergence_events"][-1]["live"])
+        self.assertTrue(any(p.get("kind") == "convergence" for p in ex.scout.st["positions"]))

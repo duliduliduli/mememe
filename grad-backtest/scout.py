@@ -170,6 +170,16 @@ class ScoutConfig:
         self.convergence_min_wallets = max(2, _env_int("SCOUT_CONVERGENCE_MIN_WALLETS", 2))
         self.convergence_window_seconds = _env_float("SCOUT_CONVERGENCE_WINDOW_MINUTES", 10) * 60
         self.convergence_cooldown_hours = _env_float("SCOUT_CONVERGENCE_COOLDOWN_HOURS", 6)   # one event per coin per this long
+        # Live convergence: a convergence event also buys for real, at its own reduced size,
+        # with its own cap on open positions and its own loss budget. Once realized P&L of
+        # these positions reaches -budget, live convergence stops (shadow keeps recording).
+        # The shadow tripwire stops it too: after this many closed shadow convergence trades
+        # with a negative baseline net. SCOUT_CONVERGENCE_LIVE=0 turns the real buys off.
+        self.convergence_live = os.getenv("SCOUT_CONVERGENCE_LIVE", "1") == "1"
+        self.convergence_live_size = _env_float("SCOUT_CONVERGENCE_LIVE_SIZE", 0.5)
+        self.convergence_max_open = _env_int("SCOUT_CONVERGENCE_MAX_OPEN", 2)
+        self.convergence_loss_budget_usd = _env_float("SCOUT_CONVERGENCE_LOSS_BUDGET_USD", 15)
+        self.convergence_tripwire_trades = _env_int("SCOUT_CONVERGENCE_TRIPWIRE_TRADES", 10)
 
         self.gmgn_key_set = bool(os.getenv("GMGN_API_KEY", "").strip())
 
@@ -1115,7 +1125,7 @@ class ScoutLane:
             return
         # Every qualifying first buy feeds the convergence detector, whether or not this
         # wallet's own shadow position can be opened (budget, already held).
-        self.note_first_buy(wallet, mint, sig, block_time, usd)
+        self.note_first_buy(wallet, mint, sig, block_time, usd, bought)
         if any(p["wallet"] == wallet and p["mint"] == mint for p in self.st["positions"]):
             self.record_signal({**base, "status": "blocked", "reason": "already_held"})
             self.check_convergence(mint, sol_price)
@@ -1184,13 +1194,13 @@ class ScoutLane:
         return pos
 
     # ---- convergence: several independent tracked wallets entering the same coin ------------
-    def note_first_buy(self, wallet: str, mint: str, sig: str, block_time: Any, usd: float) -> None:
+    def note_first_buy(self, wallet: str, mint: str, sig: str, block_time: Any, usd: float, tokens: int = 0) -> None:
         ts = float(block_time) if block_time else self.now()
         recent = self.st.setdefault("recent_buys", {})
         rows = recent.setdefault(mint, [])
         if any(r.get("signature") == sig for r in rows):
             return
-        rows.append({"wallet": wallet, "ts": ts, "signature": sig, "usd": round(usd)})
+        rows.append({"wallet": wallet, "ts": ts, "signature": sig, "usd": round(usd), "tokens": int(tokens or 0)})
         self.prune_recent_buys()
 
     def prune_recent_buys(self) -> None:
@@ -1253,6 +1263,57 @@ class ScoutLane:
                                         extra={"kind": "convergence", "wallets": wallets, "independent": len(groups),
                                                "spread_s": event["spread_s"], "pair_overlap": overlap})
         event["shadow_opened"] = pos is not None
+        group_tokens = sum(int(r.get("tokens") or 0) for r in window)
+        event["live"] = self.enter_convergence_live(mint, sig, last_ts, source_usd, wallets, sol_price, group_tokens)
+
+    def convergence_live_block(self) -> str:
+        """Why live convergence may not buy right now, or "" when it may."""
+        if not self.cfg.convergence_live:
+            return "SCOUT_CONVERGENCE_LIVE=0"
+        realized = float((self.st.get("live") or {}).get(CONVERGENCE, {}).get("realized_pnl_usd") or 0.0)
+        if self.cfg.convergence_loss_budget_usd > 0 and realized <= -self.cfg.convergence_loss_budget_usd:
+            return f"loss budget spent ({realized:+.2f} USD <= -{self.cfg.convergence_loss_budget_usd:.0f})"
+        closed = [t for t in self.st["trades"] if t.get("kind") == "convergence" and t.get("closed_ts")]
+        if self.cfg.convergence_tripwire_trades > 0 and len(closed) >= self.cfg.convergence_tripwire_trades:
+            net = sum(float(t.get("pnl_base") or 0.0) for t in closed)
+            if net < 0:
+                return f"shadow tripwire: {len(closed)} closed shadow trades net {net:+.2f} USD"
+        open_live = sum(1 for p in self.ex.state["positions"] if p.get("convergence"))
+        if self.cfg.convergence_max_open > 0 and open_live >= self.cfg.convergence_max_open:
+            return f"{open_live} live convergence position(s) open (SCOUT_CONVERGENCE_MAX_OPEN={self.cfg.convergence_max_open})"
+        return ""
+
+    def enter_convergence_live(self, mint: str, sig: str, last_ts: float, source_usd: float, wallets: list[str],
+                               sol_price: float, group_tokens: int = 0) -> str:
+        """Buy the converging coin for real through production's entry path (every sizing,
+        impact and round-trip guard applies). Returns what happened, for the event record."""
+        ex = self.ex
+        why = self.convergence_live_block()
+        if not why and ex.state.get("draining"):
+            why = "draining"
+        if not why and self.now() - last_ts > ex.cfg.copy_max_tx_age_seconds:
+            why = f"last buy {self.now() - last_ts:.0f}s old > {ex.cfg.copy_max_tx_age_seconds:.0f}s"
+        if not why and (any(p.get("mint") == mint for p in ex.state["positions"]) or any(p.get("mint") == mint for p in ex.pending)):
+            why = "already held"
+        if why:
+            self.log(f"CONVERGENCE {mint}: not bought live ({why})")
+            return f"skipped: {why}"
+        self.log(f"CONVERGENCE {mint}: buying live at {self.cfg.convergence_live_size:.0%} size")
+        ex.last_skip = None
+        ex.enter_with_retry({"mint": mint, "graduated_ts": int(last_ts), "enter_at": self.now(), "copy": CONVERGENCE,
+                             "copy_buy_usd": round(source_usd), "copy_signature": sig, "copy_size": self.cfg.convergence_live_size,
+                             # The whole group leaving at once is the exit to survive: the
+                             # source-exit guard quotes the sell of everything they just bought.
+                             "copy_tokens": group_tokens},
+                            sol_price)
+        pos = next((p for p in ex.state["positions"] if p.get("copy_signature") == sig), None)
+        if pos is None:
+            skip = ex.last_skip[1] if ex.last_skip and ex.last_skip[0] == mint else "entry failed"
+            return f"failed: {skip}"
+        pos["convergence"] = True
+        pos["convergence_wallets"] = wallets
+        self.mod.save_state(ex.state)
+        return "bought"
 
     def pair_overlap(self, wallets: list[str]) -> float:
         """How often these wallets already buy the same coins: shared coins over the smaller
@@ -1276,6 +1337,14 @@ class ScoutLane:
 
     def shadow_follow_sell(self, wallet: str, mint: str, fraction: float, sol_price: float, sig: str) -> None:
         cfg = self.ex.cfg
+        # A live convergence position exits on the first member's full sell, like its shadow.
+        # Its members are scout wallets the production copy poll does not watch, so this is
+        # the only place their sells are seen.
+        if fraction >= cfg.copy_full_sell_fraction:
+            for pos in list(self.ex.state["positions"]):
+                if pos.get("convergence") and pos.get("mint") == mint and wallet in (pos.get("convergence_wallets") or []):
+                    self.log(f"CONVERGENCE {mint}: member {wallet[:8]} sold {fraction:.0%}; closing the live position")
+                    self.ex.copy_execute_exit(pos, wallet, sig, fraction, 0, sol_price)
         for pos in list(self.st["positions"]):
             if pos["mint"] != mint:
                 continue
@@ -1547,6 +1616,10 @@ def convergence_report(st: dict[str, Any], cfg: ScoutConfig) -> dict[str, Any]:
                 "profit_factor": profit_factor(sum(wins), sum(losses)) if pnl else None}
 
     return {"enabled": cfg.convergence, "min_wallets": cfg.convergence_min_wallets,
+            "live": {"enabled": cfg.convergence_live, "size": cfg.convergence_live_size, "max_open": cfg.convergence_max_open,
+                     "loss_budget_usd": cfg.convergence_loss_budget_usd,
+                     "realized_pnl_usd": (st.get("live") or {}).get(CONVERGENCE, {}).get("realized_pnl_usd", 0.0),
+                     "bought": sum(1 for e in events if e.get("live") == "bought")},
             "window_minutes": cfg.convergence_window_seconds / 60, "events": len(events),
             "open_positions": sum(1 for p in st.get("positions") or [] if p.get("kind") == "convergence"),
             "shadow": summary(closed), "single_wallet_shadow": summary(single),
