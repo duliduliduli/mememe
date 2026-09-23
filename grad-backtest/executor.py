@@ -76,6 +76,10 @@ LAMPORTS = 1_000_000_000
 TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 TOKEN_ACCOUNT_RENT_SOL = 0.00203928
+# A failed rent reclaim after a sell is retried this many times, RENT_RECLAIM_RETRY_SECONDS
+# apart (growing), before it is left to the startup reconcile pass.
+RENT_RECLAIM_ATTEMPTS = 4
+RENT_RECLAIM_RETRY_SECONDS = 20.0
 SYSTEM_PROGRAM = "11111111111111111111111111111111"
 DEX_PROGRAMS = {
     "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",  # Pump.fun
@@ -461,6 +465,15 @@ class Config:
         # slow winner, in the replay. 0 disables it.
         self.copy_breakeven_arm = max(0.0, float(os.getenv("COPY_BREAKEVEN_ARM", "0.20")))
         self.copy_breakeven_floor = float(os.getenv("COPY_BREAKEVEN_FLOOR", "0.0"))
+        # A followed wallet whose stack is large next to the pool takes the price down with it
+        # when it leaves: EC2f5DnH's $5,300 and $18,800 buys were both stopped out at -33%
+        # within seconds of its sell, with nothing we could have done at our latency. Before
+        # mirroring, the sell of the tokens the wallet just bought is quoted; when that alone
+        # would move the price by at least this much (default: our copy stop loss), the buy is
+        # skipped, since the source's exit would be our stop. 0 disables it.
+        self.copy_max_source_exit_impact_pct = float(
+            os.getenv("COPY_MAX_SOURCE_EXIT_IMPACT_PCT", "") or self.copy_stop_loss * 100
+        )
         # Bundle guards. A curve that fills in seconds was bought by one party (SOLL graduated 29s
         # after creation with six buyers), and a wallet holding a big slice of supply at entry is
         # the one that dumps on us (SOLL's creator held 59% at graduation). 0 disables either.
@@ -2212,9 +2225,16 @@ class Rpc:
         }
 
     def send_raw(self, raw: bytes) -> str:
+        # Preflight at confirmed, not the node's finalized default: a sell is only waited on to
+        # confirmed, so the rent-reclaim close that follows it (and any swap built on the same
+        # fresh state) would otherwise be simulated against the pre-sell balances and rejected
+        # with NonNativeHasBalance ("Custom: 11") although it is valid.
         return self.call(
             "sendTransaction",
-            [base64.b64encode(raw).decode(), {"encoding": "base64", "skipPreflight": False, "maxRetries": 3}],
+            [
+                base64.b64encode(raw).decode(),
+                {"encoding": "base64", "skipPreflight": False, "preflightCommitment": "confirmed", "maxRetries": 3},
+            ],
         )
 
     def confirmed(self, signature: str, timeout_s: float = 60) -> bool:
@@ -3051,7 +3071,7 @@ class Executor:
         self.last_skip = None
         self.enter_with_retry({"mint": mint, "graduated_ts": int(block_time or now_ts()), "enter_at": now_ts(),
                                "copy": wallet, "copy_buy_usd": round(usd), "copy_signature": sig,
-                               "copy_size": wallet_size, "copy_scouted": scouted}, sol_price)
+                               "copy_tokens": bought, "copy_size": wallet_size, "copy_scouted": scouted}, sol_price)
         # The attempt is only a fill once the position exists with this source signature.
         pos = next((p for p in self.state["positions"] if p.get("copy_signature") == sig), None)
         if pos:
@@ -3384,6 +3404,24 @@ class Executor:
                 log(f"WARN {mint}: bundle snapshot unavailable ({describe_error(exc)})")
         return result(bundle)
 
+    def source_exit_impact_pct(self, mint: str, item: dict[str, Any]) -> float | None:
+        """How far the price would move if the followed wallet sold the tokens it just bought
+        (`copy_tokens`), from a Jupiter sell quote of that amount. None when the check is off,
+        the item is not a copy, or the quote fails (the guard fails open: the entry's own
+        impact and round-trip checks still apply)."""
+        source_tokens = int(item.get("copy_tokens") or 0)
+        if not item.get("copy") or source_tokens <= 0 or self.cfg.copy_max_source_exit_impact_pct <= 0:
+            return None
+        try:
+            impact = quote_price_impact_pct(self.jup.quote(mint, WSOL, source_tokens))
+        except Exception as exc:
+            log(f"WARN {mint}: could not quote the source wallet's exit ({describe_error(exc)}); not enforced")
+            return None
+        self.last_entry_meta["source_exit_impact_pct"] = impact
+        if impact is not None:
+            log(f"COPY {item['copy'][:8]}: selling its {mint} stack would move the price {impact:.1f}%")
+        return impact
+
     def try_enter(self, item: dict[str, Any], sol_price: float) -> None:
         if item["mint"] in self.cfg.hold_mints:
             self.skip(item["mint"], "in HOLD_MINTS (held by hand, never traded)")
@@ -3528,6 +3566,14 @@ class Executor:
                 f"{self.cfg.min_entry_round_trip_pct:.1f}% of proposed buy",
             )
             return
+        source_exit_impact = self.source_exit_impact_pct(mint, item)
+        if source_exit_impact is not None and source_exit_impact >= self.cfg.copy_max_source_exit_impact_pct > 0:
+            self.skip(
+                mint,
+                f"source wallet's exit alone would move the price {source_exit_impact:.1f}% "
+                f">= {self.cfg.copy_max_source_exit_impact_pct:.0f}% (its sell would be our stop)",
+            )
+            return
         buy_sig = ""
         if self.cfg.mode == "live":
             # The wallet may already hold this mint (a moon bag from an earlier exit), so the
@@ -3598,6 +3644,7 @@ class Executor:
                 "copy_buy_usd": item.get("copy_buy_usd"),
                 "copy_signature": item.get("copy_signature"),
                 "copy_scouted": bool(item.get("copy_scouted")) or None,
+                "entry_source_exit_impact_pct": round(source_exit_impact, 1) if source_exit_impact is not None else None,
                 "position_id": uuid.uuid4().hex[:16],
                 "entry_tokens": tokens,
                 "entry_basis_usd": size_usd,
@@ -3724,7 +3771,11 @@ class Executor:
         blockhash = self.rpc.call("getLatestBlockhash", [{"commitment": "finalized"}])["value"]["blockhash"]
         return self.rpc.send_raw(self.wallet.sign_instructions(instructions, blockhash))
 
-    def reclaim_rent(self, mint: str) -> None:
+    def reclaim_rent(self, mint: str, attempt: int = 1) -> bool:
+        """Close the emptied token account(s) of `mint` for their rent. A failure is retried
+        from state["rent_pending"] on later cycles (the sell may not have propagated to the
+        node yet); after RENT_RECLAIM_ATTEMPTS the startup reconcile pass is left to do it.
+        Returns True when nothing is left to close."""
         try:
             for acct in self.rpc.token_accounts(self.wallet.pubkey, mint=mint):
                 # token_accounts() may be served at finalized commitment and briefly report the
@@ -3735,8 +3786,46 @@ class Executor:
                     acct["pubkey"], acct["program"], mint, burn_amount=burn_amount
                 )
                 log(f"RENT reclaimed ~{TOKEN_ACCOUNT_RENT_SOL:.4f} SOL from {mint}'s token account ({sig[:16]}…)")
+            if any(e.get("mint") == mint for e in self.state.get("rent_pending") or []):
+                self.state["rent_pending"] = [e for e in self.state["rent_pending"] if e.get("mint") != mint]
+                save_state(self.state)
+            return True
         except Exception as exc:
-            log(f"WARN {mint}: could not close token account: {describe_error(exc)}")
+            why = describe_error(exc)
+            if attempt >= RENT_RECLAIM_ATTEMPTS:
+                self.state["rent_pending"] = [e for e in self.state.get("rent_pending") or [] if e.get("mint") != mint]
+                save_state(self.state)
+                log(f"WARN {mint}: could not close token account after {attempt} attempts ({why}); "
+                    f"the startup reconcile will close it")
+                return False
+            pending = self.state.setdefault("rent_pending", [])
+            entry = next((e for e in pending if e.get("mint") == mint), None)
+            if entry is None:
+                entry = {"mint": mint, "created_at": utc_iso()}
+                pending.append(entry)
+            entry["attempts"] = attempt
+            entry["next_ts"] = now_ts() + RENT_RECLAIM_RETRY_SECONDS * attempt
+            entry["why"] = why
+            save_state(self.state)
+            log(f"WARN {mint}: could not close token account ({why}); retrying in "
+                f"{RENT_RECLAIM_RETRY_SECONDS * attempt:.0f}s")
+            return False
+
+    def retry_pending_rent(self) -> None:
+        for entry in list(self.state.get("rent_pending") or []):
+            if now_ts() < float(entry.get("next_ts") or 0):
+                continue
+            mint = entry["mint"]
+            held = any(p.get("mint") == mint for p in self.state["positions"]) or any(
+                b.get("mint") == mint for b in self.state.get("moon_bags") or [])
+            if held:
+                # The coin was bought again before the close landed: the account is in use and
+                # a burn-and-close would destroy the new position. Drop the intent.
+                self.state["rent_pending"] = [e for e in self.state["rent_pending"] if e.get("mint") != mint]
+                save_state(self.state)
+                log(f"RENT {mint}: account back in use by a new position; reclaim dropped")
+                continue
+            self.reclaim_rent(mint, attempt=int(entry.get("attempts") or 0) + 1)
 
     def reconcile_wallet(self, sol_price: float) -> None:
         """Startup pass over every token account the wallet holds. Untracked holdings worth at
@@ -4227,6 +4316,8 @@ class Executor:
             self.manage_positions(sol_price, panic)
         if self.state.get("moon_bags") and not panic:
             self.manage_moon_bags(sol_price or self.sol_price_usd())
+        if self.cfg.mode == "live" and self.state.get("rent_pending"):
+            self.retry_pending_rent()
         if panic and (self.state.get("moon_bags") or self.state.get("stuck")):
             price = sol_price or self.sol_price_usd()
             self.liquidate_bags(price, "moon_bags", "panic_moon_bag")

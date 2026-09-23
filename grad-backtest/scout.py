@@ -4,8 +4,10 @@ passes every gate, and only when the live switch is on.
 
 Nothing here places an order. The lane's only effects on production are (1) the wallets it
 reports as `live` being added to the followed set (SCOUT_LIVE=1 and a per-wallet loss budget
-are both required, and neither is on by default) and (2) the elite-only entry gate
-(SCOUT_ELITE_ONLY=1, off by default). Everything else is bookkeeping in state["scout"].
+are both required) and (2) the elite-only entry gate (SCOUT_ELITE_ONLY, on by default: a
+configured wallet's buys are mirrored only while it is qualified or live). Everything else
+is bookkeeping in state["scout"], including the convergence signal (several independent
+tracked wallets entering one coin inside a short window), which is only ever shadow traded.
 
 What the GMGN OpenAPI can and cannot evidence (verified against the live API, Sep 2026):
   * wallet_stats: realized profit, buy/sell counts, tokens traded, win rate and average hold
@@ -44,6 +46,9 @@ from pathlib import Path
 from typing import Any
 
 POLICY_VERSION = "2026-09-23.2"
+# The pseudo-wallet that owns convergence shadow positions (several tracked wallets entering
+# one coin together); never a real address, never polled, never promoted.
+CONVERGENCE = "convergence"
 # Every threshold that decides a gate. `policy_key` fingerprints them, so changing one (in
 # code or by variable) re-scores the stored candidates instead of leaving stale verdicts.
 POLICY_FIELDS = (
@@ -94,7 +99,11 @@ class ScoutConfig:
     def __init__(self) -> None:
         self.mode = os.getenv("SCOUT_MODE", "shadow").strip().lower()          # off | shadow
         self.live = os.getenv("SCOUT_LIVE", "1") == "1"                        # promotion switch
-        self.elite_only = os.getenv("SCOUT_ELITE_ONLY", "0") == "1"            # configured wallets must qualify too
+        # On by default since 2026-09-23: the configured wallets' unproven buys lost money
+        # (EC2f5DnH twice at -33%, 498g1rVn flipped its coin in 13s); a wallet must be
+        # qualified or live with a fresh evaluation before its buys are mirrored. Sells and
+        # open positions are never affected. SCOUT_ELITE_ONLY=0 restores unconditional copying.
+        self.elite_only = os.getenv("SCOUT_ELITE_ONLY", "1") == "1"
         self.discovery_hours = _env_float("SCOUT_DISCOVERY_HOURS", 2)
         self.refresh_hours = _env_float("SCOUT_REFRESH_HOURS", 24)
         self.max_qualification_age_hours = _env_float("SCOUT_MAX_QUALIFICATION_AGE_HOURS", 48)
@@ -153,6 +162,24 @@ class ScoutConfig:
         self.shadow_min_active_days = _env_int("SCOUT_SHADOW_MIN_ACTIVE_DAYS", 7)
         self.shadow_min_profit_factor = _env_float("SCOUT_SHADOW_MIN_PROFIT_FACTOR", 1.3)
         self.shadow_max_drawdown = _env_float("SCOUT_SHADOW_MAX_DRAWDOWN", 0.15)
+        # Convergence: several tracked wallets, from different relationship clusters, buying
+        # the same coin inside a short window is treated as one signal of its own and shadow
+        # traded like a wallet's first buy. Reported separately, so it can be judged against
+        # single-wallet copying before it is ever given real money.
+        self.convergence = os.getenv("SCOUT_CONVERGENCE", "1") == "1"
+        self.convergence_min_wallets = max(2, _env_int("SCOUT_CONVERGENCE_MIN_WALLETS", 2))
+        self.convergence_window_seconds = _env_float("SCOUT_CONVERGENCE_WINDOW_MINUTES", 10) * 60
+        self.convergence_cooldown_hours = _env_float("SCOUT_CONVERGENCE_COOLDOWN_HOURS", 6)   # one event per coin per this long
+        # Live convergence: a convergence event also buys for real, at its own reduced size,
+        # with its own cap on open positions and its own loss budget. Once realized P&L of
+        # these positions reaches -budget, live convergence stops (shadow keeps recording).
+        # The shadow tripwire stops it too: after this many closed shadow convergence trades
+        # with a negative baseline net. SCOUT_CONVERGENCE_LIVE=0 turns the real buys off.
+        self.convergence_live = os.getenv("SCOUT_CONVERGENCE_LIVE", "1") == "1"
+        self.convergence_live_size = _env_float("SCOUT_CONVERGENCE_LIVE_SIZE", 0.5)
+        self.convergence_max_open = _env_int("SCOUT_CONVERGENCE_MAX_OPEN", 2)
+        self.convergence_loss_budget_usd = _env_float("SCOUT_CONVERGENCE_LOSS_BUDGET_USD", 15)
+        self.convergence_tripwire_trades = _env_int("SCOUT_CONVERGENCE_TRIPWIRE_TRADES", 10)
 
         self.gmgn_key_set = bool(os.getenv("GMGN_API_KEY", "").strip())
 
@@ -649,7 +676,7 @@ class ScoutLane:
         self.st: dict[str, Any] = ex.state.setdefault("scout", {})
         for key, default in (("candidates", {}), ("positions", []), ("trades", []), ("signals", []), ("seen", {}),
                              ("baselined", []), ("inbox", {}), ("unresolved", {}), ("failed", []), ("token_sample", []),
-                             ("errors", []), ("live", {})):
+                             ("errors", []), ("live", {}), ("recent_buys", {}), ("convergence_events", [])):
             self.st.setdefault(key, default if not isinstance(default, (dict, list)) else type(default)())
         self.st.setdefault("policy_version", policy_key(self.cfg))
         self._thread: threading.Thread | None = None
@@ -713,8 +740,8 @@ class ScoutLane:
         """The elite-only gate for new buys (sells and open positions are never touched). Off
         by default; when on, a configured wallet must be currently qualified or live with a
         fresh evaluation, and a scouted wallet must be live."""
-        if not self.cfg.elite_only:
-            return True, ""
+        if not self.cfg.elite_only or not self.enabled:
+            return True, ""          # without GMGN scouting there is no evidence to gate on
         cand = self.candidate(wallet)
         if cand is None:
             return False, "elite_only: wallet not evaluated"
@@ -883,7 +910,8 @@ class ScoutLane:
         cands = self.st["candidates"]
         by_wallet: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for t in self.st["trades"]:
-            by_wallet[t["wallet"]].append(t)
+            if t.get("kind") != "convergence":                # the group signal is judged on its own
+                by_wallet[t["wallet"]].append(t)
         first_signal: dict[str, float] = {}
         for s in self.st["signals"]:
             first_signal[s["wallet"]] = min(first_signal.get(s["wallet"], s["ts"]), s["ts"])
@@ -997,7 +1025,7 @@ class ScoutLane:
         watch.sort(key=lambda a: -((cands[a].get("evaluation") or {}).get("score", {}).get("total", 0)))
         watch = watch[: self.cfg.max_shadow]
         for p in self.st["positions"]:
-            if p["wallet"] not in watch:
+            if p["wallet"] not in watch and p["wallet"] != CONVERGENCE:
                 watch.append(p["wallet"])
         return watch
 
@@ -1095,12 +1123,26 @@ class ScoutLane:
         if cfg.copy_first_buy_only and bought > 0 and pre > bought * cfg.copy_add_dust_ratio:
             self.record_signal({**base, "status": "blocked", "reason": "add"})
             return
+        # Every qualifying first buy feeds the convergence detector, whether or not this
+        # wallet's own shadow position can be opened (budget, already held).
+        self.note_first_buy(wallet, mint, sig, block_time, usd, bought)
         if any(p["wallet"] == wallet and p["mint"] == mint for p in self.st["positions"]):
             self.record_signal({**base, "status": "blocked", "reason": "already_held"})
+            self.check_convergence(mint, sol_price)
             return
+        self.open_shadow_position(base, wallet, mint, sig, block_time, usd, age, sol_price)
+        self.check_convergence(mint, sol_price)
+
+    def open_shadow_position(self, base: dict[str, Any], wallet: str, mint: str, sig: str, block_time: Any, usd: float,
+                             age: float, sol_price: float, size_multiplier: float | None = None,
+                             extra: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        """Quote and open one shadow position under production's sizing and entry guards.
+        `wallet` is the source wallet, or the CONVERGENCE label for a multi-wallet signal.
+        Returns the position, or None with the reason recorded as a signal."""
+        ex, cfg = self.ex, self.ex.cfg
         if self._quotes_used >= self.cfg.quote_budget:
             self.record_signal({**base, "status": "failed", "reason": "missed:quote_budget"})
-            return
+            return None
         # Hypothetical size: what production would trade for this wallet, under the same guards.
         daily_pnl = float(ex.state["daily"]["realized_pnl_usd"])
         open_prod = sum(1 for p in ex.state["positions"] if not p.get("adopted") or cfg.copy_only)
@@ -1113,7 +1155,8 @@ class ScoutLane:
         size = self.mod.position_size_usd(cfg, equity, 0, daily_pnl)
         if size <= 0:
             size = max(cfg.min_position_usd, min(equity * cfg.account_fraction, cfg.max_position_usd))
-        size = round(size * float(cfg.copy_wallet_size.get(wallet, 1.0)), 2)
+        multiplier = float(cfg.copy_wallet_size.get(wallet, 1.0)) if size_multiplier is None else float(size_multiplier)
+        size = round(size * multiplier, 2)
         admitted = (open_prod + open_shadow < cfg.max_concurrent
                     and ex.deployed_usd() + sum(p["size_usd"] for p in self.st["positions"] if p.get("portfolio_admitted")) + size
                     <= equity * cfg.max_deployed_fraction)
@@ -1128,30 +1171,191 @@ class ScoutLane:
         except Exception as exc:
             self.record_signal({**base, "status": "failed", "reason": "missed:unpriceable", "size_usd": size, "portfolio_admitted": admitted})
             self.st["trades"].append({**base, "opened_ts": self.now(), "closed_ts": None, "cost_usd": size, "reason": "missed:unpriceable",
-                                      "why": self.mod.describe_error(exc), "portfolio_admitted": admitted})
-            return
+                                      "why": self.mod.describe_error(exc), "portfolio_admitted": admitted, **(extra or {})})
+            return None
         if tokens <= 0 or (impact is not None and impact > cfg.max_price_impact_pct) or round_trip < cfg.min_entry_round_trip_pct:
             why = f"impact {impact}% round_trip {round_trip:.0f}%"
             self.record_signal({**base, "status": "failed", "reason": "missed:guards", "size_usd": size, "portfolio_admitted": admitted})
             self.st["trades"].append({**base, "opened_ts": self.now(), "closed_ts": None, "cost_usd": size, "reason": "missed:guards",
-                                      "why": why, "portfolio_admitted": admitted})
-            return
+                                      "why": why, "portfolio_admitted": admitted, **(extra or {})})
+            return None
         pos = {"id": f"{wallet[:8]}:{sig[:16]}", "wallet": wallet, "mint": mint, "signature": sig, "source_usd": round(usd),
                "opened_ts": self.now(), "source_ts": int(block_time) if block_time else None, "latency_s": round(age, 1),
                "size_usd": size, "cost_usd": round(size + self.cfg.fee_usd, 4), "tokens": tokens, "entry_tokens": tokens,
                "entry_basis_usd": size, "position_usd": size, "tokens_stress": None, "stress_due_ts": self.now() + self.cfg.stress_seconds,
                "stress_attempts": 0, "entry_price_impact_pct": impact, "entry_round_trip_pct": round(round_trip, 1),
                "ladder": [dict(r) for r in cfg.copy_ladder], "peak_usd": size, "last_value_usd": size, "realized_usd": 0.0,
-               "realized_stress_usd": 0.0, "copy": wallet, "portfolio_admitted": admitted, "next_check_ts": 0}
+               "realized_stress_usd": 0.0, "copy": wallet, "portfolio_admitted": admitted, "next_check_ts": 0, **(extra or {})}
         self.st["positions"].append(pos)
         self.record_signal({**base, "status": "shadow_opened", "reason": "shadow", "size_usd": size, "portfolio_admitted": admitted})
-        self.log(f"{wallet[:8]} bought {mint} for ${usd:,.0f}; shadow buy ${size:.2f} -> {tokens} tokens "
+        who = "convergence" if wallet == CONVERGENCE else f"{wallet[:8]} bought"
+        self.log(f"{who} {mint} for ${usd:,.0f}; shadow buy ${size:.2f} -> {tokens} tokens "
                  f"(impact {impact}%, round trip {round_trip:.0f}%, {age:.0f}s after source, {'in' if admitted else 'outside'} portfolio)")
+        return pos
+
+    # ---- convergence: several independent tracked wallets entering the same coin ------------
+    def note_first_buy(self, wallet: str, mint: str, sig: str, block_time: Any, usd: float, tokens: int = 0) -> None:
+        ts = float(block_time) if block_time else self.now()
+        recent = self.st.setdefault("recent_buys", {})
+        rows = recent.setdefault(mint, [])
+        if any(r.get("signature") == sig for r in rows):
+            return
+        rows.append({"wallet": wallet, "ts": ts, "signature": sig, "usd": round(usd), "tokens": int(tokens or 0)})
+        self.prune_recent_buys()
+
+    def prune_recent_buys(self) -> None:
+        horizon = self.now() - max(self.cfg.convergence_window_seconds, self.cfg.convergence_cooldown_hours * 3600)
+        recent = self.st.setdefault("recent_buys", {})
+        for mint in list(recent):
+            recent[mint] = [r for r in recent[mint] if float(r.get("ts") or 0) >= horizon]
+            if not recent[mint]:
+                del recent[mint]
+
+    def independent_groups(self, wallets: list[str]) -> list[list[str]]:
+        """Wallets grouped by relationship cluster: a medium/high-confidence cluster counts as
+        one participant however many of its members bought, so two addresses that look
+        commonly controlled never make a convergence on their own."""
+        groups: dict[str, list[str]] = {}
+        for w in wallets:
+            rel = (self.candidate(w) or {}).get("relationship") or {}
+            key = rel.get("cluster") if rel.get("cluster") and rel.get("confidence") in ("medium", "high") else w
+            groups.setdefault(key, []).append(w)
+        return list(groups.values())
+
+    def check_convergence(self, mint: str, sol_price: float) -> None:
+        """Open one convergence shadow position for `mint` when at least
+        SCOUT_CONVERGENCE_MIN_WALLETS independent tracked wallets bought it within the window,
+        at most once per coin per cooldown. The event is recorded whether or not the shadow
+        position could be opened, so the frequency of the signal is known either way."""
+        if not self.cfg.convergence:
+            return
+        rows = (self.st.get("recent_buys") or {}).get(mint) or []
+        if len(rows) < self.cfg.convergence_min_wallets:
+            return
+        newest = max(float(r["ts"]) for r in rows)
+        window = [r for r in rows if newest - float(r["ts"]) <= self.cfg.convergence_window_seconds]
+        wallets = list(dict.fromkeys(r["wallet"] for r in window))
+        groups = self.independent_groups(wallets)
+        if len(groups) < self.cfg.convergence_min_wallets:
+            return
+        events = self.st.setdefault("convergence_events", [])
+        cooldown = self.cfg.convergence_cooldown_hours * 3600
+        if any(e.get("mint") == mint and self.now() - float(e.get("ts") or 0) < cooldown for e in events):
+            return
+        if any(p["wallet"] == CONVERGENCE and p["mint"] == mint for p in self.st["positions"]):
+            return
+        first_ts, last_ts = min(float(r["ts"]) for r in window), newest
+        source_usd = sum(float(r.get("usd") or 0) for r in window)
+        overlap = self.pair_overlap(wallets)
+        sig = f"conv:{mint[:12]}:{int(last_ts)}"
+        event = {"ts": self.now(), "mint": mint, "wallets": wallets, "independent": len(groups), "first_ts": first_ts,
+                 "last_ts": last_ts, "spread_s": round(last_ts - first_ts, 1), "source_usd": round(source_usd),
+                 "pair_overlap": overlap, "signature": sig}
+        events.append(event)
+        del events[:-2000]
+        self.log(f"CONVERGENCE {mint}: {len(groups)} independent tracked wallet(s) bought within {event['spread_s']:.0f}s "
+                 f"({', '.join(w[:8] for w in wallets)}; ${source_usd:,.0f} combined; usual overlap {overlap:.0%})")
+        self._csv("scout_convergence.csv", ["ts", "mint", "wallets", "independent", "spread_s", "source_usd", "pair_overlap", "signature"],
+                  {**event, "ts": self.mod.utc_iso(event["ts"]), "wallets": " ".join(wallets)})
+        base = {"wallet": CONVERGENCE, "mint": mint, "signature": sig, "source_usd": round(source_usd)}
+        age = self.now() - last_ts
+        pos = self.open_shadow_position(base, CONVERGENCE, mint, sig, int(last_ts), source_usd, age, sol_price, size_multiplier=1.0,
+                                        extra={"kind": "convergence", "wallets": wallets, "independent": len(groups),
+                                               "spread_s": event["spread_s"], "pair_overlap": overlap})
+        event["shadow_opened"] = pos is not None
+        group_tokens = sum(int(r.get("tokens") or 0) for r in window)
+        event["live"] = self.enter_convergence_live(mint, sig, last_ts, source_usd, wallets, sol_price, group_tokens)
+
+    def convergence_live_block(self) -> str:
+        """Why live convergence may not buy right now, or "" when it may."""
+        if not self.cfg.convergence_live:
+            return "SCOUT_CONVERGENCE_LIVE=0"
+        realized = float((self.st.get("live") or {}).get(CONVERGENCE, {}).get("realized_pnl_usd") or 0.0)
+        if self.cfg.convergence_loss_budget_usd > 0 and realized <= -self.cfg.convergence_loss_budget_usd:
+            return f"loss budget spent ({realized:+.2f} USD <= -{self.cfg.convergence_loss_budget_usd:.0f})"
+        closed = [t for t in self.st["trades"] if t.get("kind") == "convergence" and t.get("closed_ts")]
+        if self.cfg.convergence_tripwire_trades > 0 and len(closed) >= self.cfg.convergence_tripwire_trades:
+            net = sum(float(t.get("pnl_base") or 0.0) for t in closed)
+            if net < 0:
+                return f"shadow tripwire: {len(closed)} closed shadow trades net {net:+.2f} USD"
+        open_live = sum(1 for p in self.ex.state["positions"] if p.get("convergence"))
+        if self.cfg.convergence_max_open > 0 and open_live >= self.cfg.convergence_max_open:
+            return f"{open_live} live convergence position(s) open (SCOUT_CONVERGENCE_MAX_OPEN={self.cfg.convergence_max_open})"
+        return ""
+
+    def enter_convergence_live(self, mint: str, sig: str, last_ts: float, source_usd: float, wallets: list[str],
+                               sol_price: float, group_tokens: int = 0) -> str:
+        """Buy the converging coin for real through production's entry path (every sizing,
+        impact and round-trip guard applies). Returns what happened, for the event record."""
+        ex = self.ex
+        why = self.convergence_live_block()
+        if not why and ex.state.get("draining"):
+            why = "draining"
+        if not why and self.now() - last_ts > ex.cfg.copy_max_tx_age_seconds:
+            why = f"last buy {self.now() - last_ts:.0f}s old > {ex.cfg.copy_max_tx_age_seconds:.0f}s"
+        if not why and (any(p.get("mint") == mint for p in ex.state["positions"]) or any(p.get("mint") == mint for p in ex.pending)):
+            why = "already held"
+        if why:
+            self.log(f"CONVERGENCE {mint}: not bought live ({why})")
+            return f"skipped: {why}"
+        self.log(f"CONVERGENCE {mint}: buying live at {self.cfg.convergence_live_size:.0%} size")
+        ex.last_skip = None
+        ex.enter_with_retry({"mint": mint, "graduated_ts": int(last_ts), "enter_at": self.now(), "copy": CONVERGENCE,
+                             "copy_buy_usd": round(source_usd), "copy_signature": sig, "copy_size": self.cfg.convergence_live_size,
+                             # The whole group leaving at once is the exit to survive: the
+                             # source-exit guard quotes the sell of everything they just bought.
+                             "copy_tokens": group_tokens},
+                            sol_price)
+        pos = next((p for p in ex.state["positions"] if p.get("copy_signature") == sig), None)
+        if pos is None:
+            skip = ex.last_skip[1] if ex.last_skip and ex.last_skip[0] == mint else "entry failed"
+            return f"failed: {skip}"
+        pos["convergence"] = True
+        pos["convergence_wallets"] = wallets
+        self.mod.save_state(ex.state)
+        return "bought"
+
+    def pair_overlap(self, wallets: list[str]) -> float:
+        """How often these wallets already buy the same coins: shared coins over the smaller
+        wallet's coin count, averaged over pairs, from the recent-buy record. 0 when unknown.
+        A high value means the group converging is their habit, not news."""
+        coins: dict[str, set[str]] = defaultdict(set)
+        for mint, rows in (self.st.get("recent_buys") or {}).items():
+            for r in rows:
+                coins[r["wallet"]].add(mint)
+        pairs, total = 0, 0.0
+        for i, a in enumerate(wallets):
+            for b in wallets[i + 1:]:
+                smaller = min(len(coins[a]), len(coins[b]))
+                if smaller:
+                    total += len(coins[a] & coins[b]) / smaller
+                    pairs += 1
+        return round(total / pairs, 3) if pairs else 0.0
+
+    def convergence_summary(self) -> dict[str, Any]:
+        return convergence_report(self.st, self.cfg)
 
     def shadow_follow_sell(self, wallet: str, mint: str, fraction: float, sol_price: float, sig: str) -> None:
         cfg = self.ex.cfg
+        # A live convergence position exits on the first member's full sell, like its shadow.
+        # Its members are scout wallets the production copy poll does not watch, so this is
+        # the only place their sells are seen.
+        if fraction >= cfg.copy_full_sell_fraction:
+            for pos in list(self.ex.state["positions"]):
+                if pos.get("convergence") and pos.get("mint") == mint and wallet in (pos.get("convergence_wallets") or []):
+                    self.log(f"CONVERGENCE {mint}: member {wallet[:8]} sold {fraction:.0%}; closing the live position")
+                    self.ex.copy_execute_exit(pos, wallet, sig, fraction, 0, sol_price)
         for pos in list(self.st["positions"]):
-            if pos["wallet"] != wallet or pos["mint"] != mint:
+            if pos["mint"] != mint:
+                continue
+            if pos["wallet"] == CONVERGENCE:
+                # The group's first full exit ends the convergence: the same rule production
+                # applies to any followed wallet selling a coin it holds.
+                if wallet in (pos.get("wallets") or []) and fraction >= cfg.copy_full_sell_fraction:
+                    pos["exit_wallet"] = wallet
+                    self.shadow_exit(pos, 1.0, "convergence_member_sell", sol_price)
+                continue
+            if pos["wallet"] != wallet:
                 continue
             if fraction >= cfg.copy_full_sell_fraction:
                 self.shadow_exit(pos, 1.0, "copy_sell", sol_price)
@@ -1286,12 +1490,22 @@ class ScoutLane:
                  "return_base": round((total - pos["cost_usd"]) / pos["cost_usd"], 4) if pos["cost_usd"] else 0.0,
                  "reason": reason, "moon_bag_written_off": round(current_usd * keep, 4), "portfolio_admitted": pos.get("portfolio_admitted", False),
                  "entry_price_impact_pct": pos.get("entry_price_impact_pct"), "entry_round_trip_pct": pos.get("entry_round_trip_pct")}
+        if pos.get("kind") == "convergence":
+            trade.update({"kind": "convergence", "wallets": pos.get("wallets"), "independent": pos.get("independent"),
+                          "spread_s": pos.get("spread_s"), "pair_overlap": pos.get("pair_overlap"), "exit_wallet": pos.get("exit_wallet")})
         self.st["trades"].append(trade)
         del self.st["trades"][:-5000]
         self.st["positions"].remove(pos)
-        self._csv("scout_shadow_trades.csv", ["opened_at", "closed_at", "wallet", "mint", "source_usd", "cost_usd", "proceeds_base_usd", "pnl_base",
-                                              "proceeds_stress_usd", "pnl_stress", "reason", "portfolio_admitted", "latency_s", "signature"],
-                  {**trade, "opened_at": self.mod.utc_iso(trade["opened_ts"]), "closed_at": self.mod.utc_iso(trade["closed_ts"])})
+        stamped = {**trade, "opened_at": self.mod.utc_iso(trade["opened_ts"]), "closed_at": self.mod.utc_iso(trade["closed_ts"])}
+        if pos.get("kind") == "convergence":
+            self._csv("scout_convergence_trades.csv",
+                      ["opened_at", "closed_at", "mint", "wallets", "independent", "spread_s", "pair_overlap", "source_usd", "cost_usd",
+                       "proceeds_base_usd", "pnl_base", "proceeds_stress_usd", "pnl_stress", "reason", "exit_wallet", "latency_s"],
+                      {**stamped, "wallets": " ".join(pos.get("wallets") or [])})
+        else:
+            self._csv("scout_shadow_trades.csv", ["opened_at", "closed_at", "wallet", "mint", "source_usd", "cost_usd", "proceeds_base_usd", "pnl_base",
+                                                  "proceeds_stress_usd", "pnl_stress", "reason", "portfolio_admitted", "latency_s", "signature"],
+                      stamped)
         self.log(f"{pos['wallet'][:8]} {pos['mint']}: shadow {reason} ${total:.2f} on ${pos['cost_usd']:.2f} "
                  f"({trade['return_base']:+.1%}{', stress ' + format(trade['pnl_stress'], '+.2f') if stress_known else ''})")
 
@@ -1312,9 +1526,12 @@ class ScoutLane:
             return "off" if self.cfg.mode == "off" else "no-key"
         n = self.counts()
         age = self.now() - float(self.st.get("discovered_ts") or 0) if self.st.get("discovered_ts") else None
+        conv_open = sum(1 for p in self.st["positions"] if p.get("kind") == "convergence")
+        conv_closed = sum(1 for t in self.st["trades"] if t.get("kind") == "convergence" and t.get("closed_ts"))
         return (f"{self.cfg.mode}{'+live' if self.cfg.live else ''}:cand={len(self.st['candidates'])},shadow={n['shadow']},"
                 f"qualified={n['qualified']},live={n['live']},paused={n['paused']},rejected={n['rejected']},"
                 f"shadow_pos={len(self.st['positions'])},shadow_trades={len(self.st['trades'])},"
+                f"conv={len(self.st.get('convergence_events') or [])}/{conv_open}/{conv_closed},"
                 f"discovery={'never' if age is None else f'{age / 3600:.1f}h'}")
 
     def startup_line(self) -> str:
@@ -1376,8 +1593,37 @@ def candidate_report(st: dict[str, Any], cfg: ScoutConfig, now: float) -> dict[s
     return {"policy_version": policy_key(cfg), "mode": cfg.mode, "live_switch": cfg.live, "elite_only": cfg.elite_only,
             "track": "fast" if cfg.fast_track else "full", "live_loss_budget_usd": cfg.live_loss_budget_usd,
             "counts": dict(counts), "candidates": rows, "shadow_positions": st.get("positions", []),
+            "convergence": convergence_report(st, cfg),
             "last_selection": st.get("last_selection"), "discovered_at": st.get("discovered_ts"), "errors": (st.get("errors") or [])[-10:],
             "token_sample": st.get("token_sample", []), "gmgn_units_last_cycle": st.get("last_units")}
+
+
+def convergence_report(st: dict[str, Any], cfg: ScoutConfig) -> dict[str, Any]:
+    """The convergence signal on its own, beside single-wallet shadow copying: how often it
+    fires, and what its closed shadow trades made at baseline and under stress."""
+    events = st.get("convergence_events") or []
+    closed = [t for t in (st.get("trades") or []) if t.get("kind") == "convergence" and t.get("closed_ts")]
+    single = [t for t in (st.get("trades") or []) if t.get("kind") != "convergence" and t.get("closed_ts")]
+
+    def summary(trades: list[dict[str, Any]]) -> dict[str, Any]:
+        pnl = [float(t.get("pnl_base") or 0.0) for t in trades]
+        stress = [float(t["pnl_stress"]) for t in trades if t.get("pnl_stress") is not None]
+        wins = [p for p in pnl if p > 0]
+        losses = [-p for p in pnl if p < 0]
+        return {"trades": len(trades), "net_base_usd": round(sum(pnl), 4), "net_stress_usd": round(sum(stress), 4) if stress else None,
+                "win_rate": round(len(wins) / len(pnl), 3) if pnl else None,
+                "avg_return": round(sum(float(t.get("return_base") or 0.0) for t in trades) / len(trades), 4) if trades else None,
+                "profit_factor": profit_factor(sum(wins), sum(losses)) if pnl else None}
+
+    return {"enabled": cfg.convergence, "min_wallets": cfg.convergence_min_wallets,
+            "live": {"enabled": cfg.convergence_live, "size": cfg.convergence_live_size, "max_open": cfg.convergence_max_open,
+                     "loss_budget_usd": cfg.convergence_loss_budget_usd,
+                     "realized_pnl_usd": (st.get("live") or {}).get(CONVERGENCE, {}).get("realized_pnl_usd", 0.0),
+                     "bought": sum(1 for e in events if e.get("live") == "bought")},
+            "window_minutes": cfg.convergence_window_seconds / 60, "events": len(events),
+            "open_positions": sum(1 for p in st.get("positions") or [] if p.get("kind") == "convergence"),
+            "shadow": summary(closed), "single_wallet_shadow": summary(single),
+            "recent_events": events[-20:], "recent_trades": closed[-20:]}
 
 
 # ---- discovery + enrichment (runs on the worker thread, touches no executor state) --------------

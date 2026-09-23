@@ -503,6 +503,14 @@ def copy_signals(limit: int = 200) -> JSONResponse:
     return JSONResponse({"signals": frame_records(frame.head(limit))})
 
 
+@app.get("/api/copy/expectancy")
+def copy_expectancy() -> JSONResponse:
+    """Per-wallet expectancy after costs: live fills joined to their source wallets, the
+    scout's single-wallet shadow trades, and the convergence signal, side by side."""
+    import copy_expectancy as ce
+    return JSONResponse(ce.expectancy(DATA_DIR))
+
+
 def _scout_state() -> dict[str, Any]:
     if not EXECUTOR_STATE.exists():
         return {}

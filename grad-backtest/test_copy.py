@@ -1082,3 +1082,65 @@ class LadderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SourceExitImpactTests(unittest.TestCase):
+    """A followed wallet whose stack is large next to the pool takes the price down with it
+    when it leaves; when that move alone would reach our stop, the buy is not mirrored."""
+
+    def setUp(self):
+        executor, p = fresh(PAPER_BALANCE_USD="200")
+        self.addCleanup(p.stop)
+        self.executor = executor
+        self.ex = executor.Executor(executor.Config())
+        self.ex.state["paper_balance_usd"] = 200.0
+        self.skips = []
+        self.ex.skip = lambda mint, reason: self.skips.append(reason)
+
+    def quote(self, source_impact_pct, fail_source=False):
+        source_tokens = 5_000_000_000
+        def q(inp, out, amount, **kw):
+            if inp == MINT and amount == source_tokens:
+                if fail_source:
+                    raise RuntimeError("quote unavailable")
+                return {"outAmount": str(amount), "priceImpactPct": str(source_impact_pct / 100)}
+            return {"outAmount": str(amount), "priceImpactPct": "0.001"}    # 1:1, our own size is tiny
+        self.ex.jup.quote = q
+        return source_tokens
+
+    def enter(self, source_tokens):
+        import time as _time
+        self.ex.try_enter({"mint": MINT, "graduated_ts": _time.time(), "enter_at": _time.time(), "copy": WALLET,
+                           "copy_buy_usd": 5300, "copy_tokens": source_tokens}, SOL)
+
+    def test_a_source_whose_exit_would_hit_our_stop_is_not_mirrored(self):
+        self.enter(self.quote(35.0))
+        self.assertEqual(self.ex.state["positions"], [])
+        self.assertTrue(self.skips and "source wallet's exit" in self.skips[0], self.skips)
+
+    def test_a_source_with_a_small_footprint_is_mirrored_and_recorded(self):
+        self.enter(self.quote(4.2))
+        self.assertEqual(self.skips, [])
+        self.assertEqual(len(self.ex.state["positions"]), 1)
+        self.assertEqual(self.ex.state["positions"][0]["entry_source_exit_impact_pct"], 4.2)
+
+    def test_threshold_defaults_to_the_copy_stop_loss_and_is_configurable(self):
+        self.assertAlmostEqual(self.ex.cfg.copy_max_source_exit_impact_pct, self.ex.cfg.copy_stop_loss * 100)
+        executor, p = fresh(COPY_MAX_SOURCE_EXIT_IMPACT_PCT="0")
+        self.addCleanup(p.stop)
+        self.assertEqual(executor.Config().copy_max_source_exit_impact_pct, 0.0)
+
+    def test_a_failed_source_quote_fails_open(self):
+        self.enter(self.quote(35.0, fail_source=True))
+        self.assertEqual(self.skips, [])
+        self.assertEqual(len(self.ex.state["positions"]), 1)
+        self.assertIsNone(self.ex.state["positions"][0]["entry_source_exit_impact_pct"])
+
+    def test_an_item_without_source_tokens_is_not_quoted(self):
+        import time as _time
+        calls = []
+        self.ex.jup.quote = lambda inp, out, amount, **kw: (calls.append(amount), {"outAmount": str(amount), "priceImpactPct": "0.001"})[1]
+        self.ex.try_enter({"mint": MINT, "graduated_ts": _time.time(), "enter_at": _time.time(), "copy": WALLET,
+                           "copy_buy_usd": 5300}, SOL)
+        self.assertEqual(len(self.ex.state["positions"]), 1)
+        self.assertEqual(len(calls), 2)      # our buy quote and the round-trip sell quote only
