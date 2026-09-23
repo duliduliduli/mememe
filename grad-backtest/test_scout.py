@@ -783,6 +783,24 @@ class LaneTests(unittest.TestCase):
         lane.apply_discovery()
         self.assertNotIn("rate_limited_until", lane.st)                            # a clean cycle clears it
 
+    def test_a_new_find_takes_the_slot_of_the_weakest_enriched_wallet_when_full(self):
+        executor, ex = self.make(SCOUT_MAX_CANDIDATES="3", SCOUT_MAX_SHADOW="1")
+        lane = ex.scout
+        now = time.time()
+        def cand(address, state, score, refreshed=True):
+            c = {"address": address, "state": state, "sources": [], "rank_snapshots": [], "lifecycle": [], "discovered_at": now,
+                 "evaluation": {"failed": ["pnl_30d"], "score": {"total": score}}}
+            if refreshed:
+                c["last_refresh"] = now
+            return c
+        lane.st["candidates"] = {"Strong": cand("Strong", "shadow", 80), "Weak": cand("Weak", "shadow", 10),
+                                 "Waiting": cand("Waiting", "discovered", 0, refreshed=False)}
+        self.assertEqual(lane.evictable(), ["Weak"])        # Strong is polled; Waiting never had its turn
+        lane._result = ("ok", {"candidates": {"Newcomer": {"sources": [{"source": "smartmoney", "ts": now}], "rank_snapshots": []}},
+                               "token_sample": [], "units": 1, "errors": []})
+        lane.apply_discovery()
+        self.assertEqual(sorted(lane.st["candidates"]), ["Newcomer", "Strong", "Waiting"])
+
     def test_a_pause_stored_under_the_old_longer_setting_is_cut_back(self):
         executor, ex = self.make()
         lane = ex.scout
@@ -923,6 +941,29 @@ class DiscoveryTests(unittest.TestCase):
         self.assertLess(enriched.index("BacklogOld"), enriched.index("BacklogNew"))
         self.assertNotIn("RejectedOne", enriched)                                 # rejected wallets cost no units
         self.assertNotIn("FreshlyDone", enriched)                                 # refreshed a minute ago
+
+    def test_a_full_tracker_spends_the_budget_on_the_backlog_not_on_finds_it_would_drop(self):
+        enriched = []
+        class Client:
+            pause_seconds = 0.0
+            def smart_money(self, chain, limit): return [{"maker": "NewFindAAAA"}, {"maker": "NewFindBBBB"}]
+            def kol(self, chain, limit): return []
+            def market_rank(self, chain, limit): return []
+            def top_traders(self, chain, token, tag=None, limit=20): return []
+            def wallet_stats(self, chain, wallets, period):
+                enriched.append(wallets[0])
+                return [{"realized_profit": 1.0, "pnl_stat": {}, "common": {"tags": []}}]
+            def wallet_holdings(self, chain, wallet, limit=100): return []
+            def wallet_activity(self, chain, wallet, limit=20, cursor=None): return [], None
+        cfg = cfg_with(GMGN_API_KEY="k", SCOUT_ENRICH_PER_CYCLE="2")
+        known = {"Backlog1": {"address": "Backlog1", "state": "discovered", "discovered_at": NOW - 900},
+                 "Backlog2": {"address": "Backlog2", "state": "discovered", "discovered_at": NOW - 800}}
+        scout.discover_and_enrich(Client(), cfg, known, [], [], NOW, 300.0, room=0)
+        self.assertEqual(sorted(set(enriched)), ["Backlog1", "Backlog2"])        # backlog first, finds wait
+        enriched.clear()
+        cfg = cfg_with(GMGN_API_KEY="k", SCOUT_ENRICH_PER_CYCLE="4")
+        scout.discover_and_enrich(Client(), cfg, known, [], [], NOW, 300.0, room=1)
+        self.assertEqual(sorted(set(enriched)), ["Backlog1", "Backlog2", "NewFindAAAA"])   # one slot: one find
 
     def test_holdings_needing_signed_auth_do_not_stop_enrichment(self):
         class Client:

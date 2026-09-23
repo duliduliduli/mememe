@@ -767,10 +767,14 @@ class ScoutLane:
         token_sample = self.token_sample()
         min_buy = float(self.ex.cfg.copy_min_buy_usd)
         cfg, now = self.cfg, self.now()
+        # New finds are only worth enriching if they can be tracked: free slots plus the
+        # enriched wallets that would give theirs up.
+        room = max(0, cfg.max_candidates - len(wallets_known)) + len(self.evictable())
 
         def work() -> None:
             try:
-                self._result = ("ok", discover_and_enrich(self.gmgn_client(), cfg, wallets_known, configured, token_sample, now, min_buy))
+                self._result = ("ok", discover_and_enrich(self.gmgn_client(), cfg, wallets_known, configured, token_sample, now, min_buy,
+                                                          room=room))
             except Exception as exc:
                 self._result = ("error", self.mod.describe_error(exc))
 
@@ -837,7 +841,10 @@ class ScoutLane:
             cand = cands.get(address)
             if cand is None:
                 if len(cands) >= self.cfg.max_candidates and address not in self.ex.cfg.copy_wallets:
-                    continue
+                    worst = self.evictable()
+                    if not worst:
+                        continue
+                    cands.pop(worst[0])
                 cand = {"address": address, "state": "discovered", "state_since": self.now(), "discovered_at": self.now(),
                         "sources": [], "rank_snapshots": [], "lifecycle": []}
                 cands[address] = cand
@@ -952,6 +959,24 @@ class ScoutLane:
         return decision
 
     # ---- shadow: watch first buys with executable quotes ----------------------------------
+    def evictable(self) -> list[str]:
+        """Tracked wallets that may give up their slot to a new find, weakest first: already
+        enriched and evaluated with a failed history gate, not configured, not qualified or
+        live, not among the wallets polled on-chain, and with no open shadow position. A wallet
+        never enriched keeps its slot until it has had its turn, and rejected wallets stay so
+        they are not enriched again."""
+        cands = self.st["candidates"]
+        polled = set(self.shadow_wallets())
+        configured = set(self.ex.cfg.copy_wallets)
+        out = []
+        for address, c in cands.items():
+            ev = c.get("evaluation") or {}
+            if (c.get("state") in ("discovered", "research", "shadow") and c.get("last_refresh") and address not in configured
+                    and address not in polled and any(not k.startswith("shadow") for k in ev.get("failed") or [])):
+                out.append(address)
+        out.sort(key=lambda a: ((cands[a].get("evaluation") or {}).get("score", {}).get("total", 0), float(cands[a].get("last_refresh") or 0)))
+        return out
+
     def shadow_wallets(self) -> list[str]:
         """Wallets polled on-chain: shadow and qualified candidates (best score first, capped),
         plus any wallet with an open shadow position so its sells keep being followed."""
@@ -1345,7 +1370,9 @@ def candidate_report(st: dict[str, Any], cfg: ScoutConfig, now: float) -> dict[s
 
 # ---- discovery + enrichment (runs on the worker thread, touches no executor state) --------------
 def discover_and_enrich(client: Any, cfg: ScoutConfig, known: dict[str, dict[str, Any]], configured: list[str],
-                        token_sample: list[str], now: float, min_first_buy_usd: float) -> dict[str, Any]:
+                        token_sample: list[str], now: float, min_first_buy_usd: float, room: int | None = None) -> dict[str, Any]:
+    """`room`: how many new wallets can still be tracked (None: no limit). Enriching a find that
+    cannot be tracked would spend the budget on a wallet that is then dropped."""
     import gmgn
     units = 0
     errors: list[str] = []
@@ -1407,8 +1434,8 @@ def discover_and_enrich(client: Any, cfg: ScoutConfig, known: dict[str, dict[str
                 continue                                  # inventory that arrived by transfer is not a copyable buy
             note(address, f"top_traders:{token[:8]}", gmgn._tags(r))
             found[address]["rank_snapshots"].append({"ts": now, "scope": "token", "list": f"top_traders:{token[:8]}", "rank": rank, "population": len(rows)})
-    # Enrichment order: configured wallets due a refresh, then wallets this cycle just found,
-    # then the backlog, then the stalest. Backlog and stale are drawn from everything tracked,
+    # Enrichment order: configured wallets due a refresh, then the backlog (tracked, never
+    # enriched), then this cycle's new finds that fit the free room, then the stalest. Backlog and stale are drawn from everything tracked,
     # not only from what the feeds surfaced this cycle: a wallet discovered once and never
     # enriched would otherwise wait for a feed to mention it again, which may never happen.
     def refreshed(address: str) -> float:
@@ -1419,12 +1446,14 @@ def discover_and_enrich(client: Any, cfg: ScoutConfig, known: dict[str, dict[str
 
     due = [a for a in configured if now - refreshed(a) >= cfg.refresh_hours * 3600]
     fresh_new = [a for a in found if a not in known]
+    if room is not None:
+        fresh_new = fresh_new[:max(0, room)]
     backlog = sorted((a for a in known if worth_enriching(a) and not refreshed(a)),
                      key=lambda a: float((known[a].get("discovered_at") or 0)))
     stale = sorted((a for a in known if worth_enriching(a) and refreshed(a)
                     and now - refreshed(a) >= cfg.refresh_hours * 3600), key=refreshed)
     queue, seen_queue = [], set()
-    for address in due + fresh_new + backlog + stale:
+    for address in due + backlog + fresh_new + stale:
         if address and address not in seen_queue:
             seen_queue.add(address)
             queue.append(address)
