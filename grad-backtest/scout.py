@@ -43,12 +43,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-POLICY_VERSION = "2026-09-23.1"
+POLICY_VERSION = "2026-09-23.2"
 # Every threshold that decides a gate. `policy_key` fingerprints them, so changing one (in
 # code or by variable) re-scores the stored candidates instead of leaving stale verdicts.
 POLICY_FIELDS = (
     "fast_track", "fast_track_min_history_days", "fast_track_dense_episodes", "fast_track_min_episodes_30d",
-    "fast_track_min_tokens_30d", "fast_track_min_active_days_30d", "min_history_days", "min_episodes_30d",
+    "fast_track_min_tokens_30d", "fast_track_recent_days", "min_history_days", "min_episodes_30d",
     "min_tokens_30d", "min_active_days_30d", "min_profit_factor", "max_best_token_share", "max_drawdown",
     "min_median_hold_minutes", "max_fast_exit_fraction", "leaderboard_top_fraction", "leaderboard_top_n",
     "leaderboard_min_snapshots", "leaderboard_span_days", "shadow_min_days", "shadow_min_trades",
@@ -109,10 +109,12 @@ class ScoutConfig:
         # A wallet trading hundreds of times a day fills the activity page cap in days, not
         # weeks, so a short window is not thin evidence: this many closed episodes inside it
         # count instead of the calendar requirement.
-        self.fast_track_dense_episodes = _env_int("SCOUT_FAST_TRACK_DENSE_EPISODES", 40)
+        self.fast_track_dense_episodes = _env_int("SCOUT_FAST_TRACK_DENSE_EPISODES", 30)
         self.fast_track_min_episodes_30d = _env_int("SCOUT_FAST_TRACK_MIN_EPISODES_30D", 20)
         self.fast_track_min_tokens_30d = _env_int("SCOUT_FAST_TRACK_MIN_TOKENS_30D", 10)
-        self.fast_track_min_active_days_30d = _env_int("SCOUT_FAST_TRACK_MIN_ACTIVE_DAYS_30D", 7)
+        # Fast track asks only that the wallet still trades: some activity in this many days.
+        # Consistency is carried by the 7d/30d/all realized-profit, profit-factor and outlier gates.
+        self.fast_track_recent_days = _env_float("SCOUT_FAST_TRACK_RECENT_DAYS", 7)
         self.tripwire_trades = _env_int("SCOUT_TRIPWIRE_TRADES", 10)              # live wallet paused when shadow net < 0 after this many
         self.max_shadow = _env_int("SCOUT_MAX_SHADOW", 25)                     # wallets polled on-chain
         self.max_candidates = _env_int("SCOUT_MAX_CANDIDATES", 200)
@@ -456,21 +458,24 @@ def evaluate_candidate(cand: dict[str, Any], cfg: ScoutConfig, now: float, min_f
              f"{coverage_days:.1f} days of activity (fast track needs {cfg.fast_track_min_history_days:.0f})")
     min_eps = cfg.fast_track_min_episodes_30d if cfg.fast_track else cfg.min_episodes_30d
     min_tok = cfg.fast_track_min_tokens_30d if cfg.fast_track else cfg.min_tokens_30d
-    min_days = cfg.fast_track_min_active_days_30d if cfg.fast_track else cfg.min_active_days_30d
     if not m30:
         for name in ("episodes_30d", "tokens_30d", "active_days_30d", "profit_factor_30d", "outlier_30d", "best_token_share", "drawdown", "hold_time", "fast_exits"):
             gate(name, "missing", "no episode metrics")
     else:
         gate("episodes_30d", "pass" if m30["closed_episodes"] >= min_eps else "fail", f"{m30['closed_episodes']} closed episodes (need {min_eps})")
         gate("tokens_30d", "pass" if m30["distinct_tokens"] >= min_tok else "fail", f"{m30['distinct_tokens']} tokens (need {min_tok})")
-        days_needed = min_days
-        if cfg.fast_track and hist.get("truncated") and coverage_days is not None and coverage_days < 30:
-            # The page cap cut the window to a few days, so a busy wallet cannot show seven
-            # active days in it. Fast track asks for activity on every day fetched instead;
-            # consistency over the month is carried by the 7d/30d/all realized-profit gates.
-            days_needed = max(1, min(min_days, math.ceil(coverage_days)))
-        gate("active_days_30d", "pass" if m30["active_days"] >= days_needed else "fail",
-             f"{m30['active_days']} active days (need {days_needed}" + (f" of the {coverage_days:.1f} days fetched)" if days_needed != min_days else ")"))
+        if cfg.fast_track:
+            last_seen = max([float(e.get("closed_ts") or e.get("opened_ts") or 0) for e in hist.get("episodes") or []]
+                            + [_f(row.get("last_timestamp")) / (1000.0 if _f(row.get("last_timestamp")) > 1e11 else 1.0)
+                               for row in (s7, s30, sall) if row] + [0.0])
+            days_ago = (now - last_seen) / DAY if last_seen > 0 else None
+            recent = days_ago is not None and days_ago <= cfg.fast_track_recent_days
+            gate("active_days_30d", "pass" if recent else "fail",
+                 (f"last trade {days_ago:.1f} days ago" if days_ago is not None else "no trade timestamp")
+                 + f" (needs one within {cfg.fast_track_recent_days:.0f})")
+        else:
+            gate("active_days_30d", "pass" if m30["active_days"] >= cfg.min_active_days_30d else "fail",
+                 f"{m30['active_days']} active days (need {cfg.min_active_days_30d})")
         pf = m30.get("profit_factor")
         if pf is None:
             gate("profit_factor_30d", "missing", "no scored losses or profits")
