@@ -699,6 +699,24 @@ class LaneTests(unittest.TestCase):
         self.assertIn("tripwire", cand["lifecycle"][-1]["reason"])
         self.assertEqual(ex.scout.live_wallets(), {})
 
+    def test_active_days_are_judged_on_the_days_fetched_when_the_page_cap_cut_the_window(self):
+        cfg = cfg_with(GMGN_API_KEY="k", SCOUT_FAST_TRACK="1")
+        cand = good_candidate(OTHER)
+        cand["history"].update({"coverage_days": 1.9, "truncated": True})          # 800 events in under 2 days
+        cand["history"]["metrics_30d"] = dict(cand["history"]["metrics_30d"], active_days=2)
+        ev = scout.evaluate_candidate(cand, cfg, NOW, 300.0)
+        self.assertEqual(ev["gates"]["active_days_30d"]["status"], "pass")
+        self.assertIn("of the 1.9 days fetched", ev["gates"]["active_days_30d"]["detail"])
+        cand["history"]["metrics_30d"]["active_days"] = 1                           # a gap inside the window
+        self.assertEqual(scout.evaluate_candidate(cand, cfg, NOW, 300.0)["gates"]["active_days_30d"]["status"], "fail")
+        # A full window, or the full policy, still needs the seven (ten) days.
+        cand["history"]["metrics_30d"]["active_days"] = 2
+        cand["history"].update({"coverage_days": 45.0, "truncated": False})
+        self.assertEqual(scout.evaluate_candidate(cand, cfg, NOW, 300.0)["gates"]["active_days_30d"]["status"], "fail")
+        cand["history"].update({"coverage_days": 1.9, "truncated": True})
+        full = cfg_with(GMGN_API_KEY="k", SCOUT_FAST_TRACK="0")
+        self.assertEqual(scout.evaluate_candidate(cand, full, NOW, 300.0)["gates"]["active_days_30d"]["status"], "fail")
+
     def test_dense_history_counts_when_the_page_cap_cut_the_window_short(self):
         """A wallet trading hundreds of times a day can never show 15 calendar days inside the
         activity page cap. Its episodes are the evidence, so they qualify it instead."""

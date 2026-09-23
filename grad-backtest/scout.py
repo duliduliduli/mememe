@@ -43,7 +43,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-POLICY_VERSION = "2026-09-22.3"
+POLICY_VERSION = "2026-09-23.1"
 # Every threshold that decides a gate. `policy_key` fingerprints them, so changing one (in
 # code or by variable) re-scores the stored candidates instead of leaving stale verdicts.
 POLICY_FIELDS = (
@@ -463,7 +463,14 @@ def evaluate_candidate(cand: dict[str, Any], cfg: ScoutConfig, now: float, min_f
     else:
         gate("episodes_30d", "pass" if m30["closed_episodes"] >= min_eps else "fail", f"{m30['closed_episodes']} closed episodes (need {min_eps})")
         gate("tokens_30d", "pass" if m30["distinct_tokens"] >= min_tok else "fail", f"{m30['distinct_tokens']} tokens (need {min_tok})")
-        gate("active_days_30d", "pass" if m30["active_days"] >= min_days else "fail", f"{m30['active_days']} active days (need {min_days})")
+        days_needed = min_days
+        if cfg.fast_track and hist.get("truncated") and coverage_days is not None and coverage_days < 30:
+            # The page cap cut the window to a few days, so a busy wallet cannot show seven
+            # active days in it. Fast track asks for activity on every day fetched instead;
+            # consistency over the month is carried by the 7d/30d/all realized-profit gates.
+            days_needed = max(1, min(min_days, math.ceil(coverage_days)))
+        gate("active_days_30d", "pass" if m30["active_days"] >= days_needed else "fail",
+             f"{m30['active_days']} active days (need {days_needed}" + (f" of the {coverage_days:.1f} days fetched)" if days_needed != min_days else ")"))
         pf = m30.get("profit_factor")
         if pf is None:
             gate("profit_factor_30d", "missing", "no scored losses or profits")
