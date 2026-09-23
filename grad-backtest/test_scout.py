@@ -279,7 +279,11 @@ class ConfigTests(unittest.TestCase):
             cfg = scout.ScoutConfig()
             self.assertEqual(cfg.mode, "shadow")
             self.assertTrue(cfg.live)                                             # promotion on: fast track + tripwire + budget guard it
-            self.assertFalse(cfg.elite_only)
+            self.assertTrue(cfg.elite_only)                                       # unproven configured wallets are not copied
+            self.assertFalse(cfg_with(SCOUT_ELITE_ONLY="0").elite_only)
+            self.assertTrue(cfg.convergence)
+            self.assertEqual(cfg.convergence_min_wallets, 2)
+            self.assertEqual(cfg.convergence_window_seconds, 600.0)
             self.assertEqual(cfg.max_live, 3)
             self.assertEqual(cfg.live_size, 0.5)
             self.assertEqual(cfg.max_open_positions, 3)
@@ -421,7 +425,7 @@ class LaneTests(unittest.TestCase):
         self.assertTrue(skips and "below the $5.00 minimum" in skips[-1], skips)
 
     def test_scouted_wallets_share_a_small_pool_of_slots(self):
-        executor, ex = self.make(SCOUT_LIVE="1", SCOUT_MAX_OPEN_POSITIONS="2")
+        executor, ex = self.make(SCOUT_LIVE="1", SCOUT_MAX_OPEN_POSITIONS="2", SCOUT_ELITE_ONLY="0")
         self.seed(ex, OTHER, state="live")
         entered = []
         ex.enter_with_retry = lambda item, sol_price: entered.append(item)
@@ -456,8 +460,8 @@ class LaneTests(unittest.TestCase):
         rows = list(__import__("csv").DictReader(open(os.path.join(os.environ["DATA_DIR"], "copy_signals.csv"))))
         self.assertEqual([r["reason"] for r in rows if r["status"] == "blocked"], ["elite_only", "elite_only"])
 
-    def test_elite_only_off_by_default_changes_nothing(self):
-        executor, ex = self.make()
+    def test_elite_only_off_changes_nothing(self):
+        executor, ex = self.make(SCOUT_ELITE_ONLY="0")
         entered = []
         ex.enter_with_retry = lambda item, sol_price: entered.append(item)
         ex.copy_handle_event(WALLET, "buy1", int(time.time()), tx(10.0, 5.0, 0, 1000), SOL, True)
@@ -1066,3 +1070,134 @@ class ServerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConvergenceTests(unittest.TestCase):
+    """Several independent tracked wallets entering one coin inside the window is one shadow
+    signal of its own, judged beside single-wallet copying and never traded live."""
+    make, seed, fake_market = LaneTests.make, LaneTests.seed, LaneTests.fake_market
+
+    def buy(self, lane, wallet, sig, mint=MINT, ts=None, usd=500.0):
+        swap = {"side": "buy", "mint": mint, "tokens": 1000, "sol": 5.0, "stable_usd": 0.0, "pre_tokens": 0}
+        lane.shadow_handle_buy(wallet, sig, int(ts or time.time()), swap, usd, 1.0, SOL)
+
+    def test_two_independent_wallets_in_the_window_open_one_convergence_position(self):
+        executor, ex = self.make(SCOUT_QUOTE_BUDGET="20")
+        self.seed(ex, OTHER, state="shadow")
+        self.seed(ex, THIRD, state="shadow")
+        self.fake_market(ex)
+        lane = ex.scout
+        lane.reset_quote_budget()
+        self.buy(lane, OTHER, "s1")
+        self.assertEqual(lane.st["convergence_events"], [])                      # one wallet is not a convergence
+        self.buy(lane, THIRD, "s2")
+        events = lane.st["convergence_events"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(sorted(events[0]["wallets"]), sorted([OTHER, THIRD]))
+        self.assertEqual(events[0]["independent"], 2)
+        self.assertTrue(events[0]["shadow_opened"])
+        conv = [p for p in lane.st["positions"] if p.get("kind") == "convergence"]
+        self.assertEqual(len(conv), 1)
+        self.assertEqual(conv[0]["wallet"], scout.CONVERGENCE)
+        self.assertEqual(conv[0]["source_usd"], 1000)                           # both source buys combined
+        self.assertEqual(len(lane.st["positions"]), 3)                         # two single-wallet shadows + the group
+        self.assertEqual(ex.state["positions"], [])                             # nothing real
+        self.assertNotIn(scout.CONVERGENCE, lane.shadow_wallets())              # never polled as a wallet
+        # A third buyer inside the cooldown does not open a second one.
+        self.buy(lane, WALLET, "s3")
+        self.assertEqual(len(lane.st["convergence_events"]), 1)
+        self.assertTrue(os.path.exists(os.path.join(os.environ["DATA_DIR"], "scout_convergence.csv")))
+
+    def test_related_wallets_count_as_one_participant(self):
+        executor, ex = self.make(SCOUT_QUOTE_BUDGET="20")
+        a, b = self.seed(ex, OTHER, state="shadow"), self.seed(ex, THIRD, state="shadow")
+        a["relationship"] = {"cluster": "grp1", "confidence": "medium", "evidence": ["synchronised buys"]}
+        b["relationship"] = {"cluster": "grp1", "confidence": "medium", "evidence": ["synchronised buys"]}
+        self.fake_market(ex)
+        lane = ex.scout
+        lane.reset_quote_budget()
+        self.buy(lane, OTHER, "s1")
+        self.buy(lane, THIRD, "s2")
+        self.assertEqual(lane.st["convergence_events"], [])
+        self.assertFalse(any(p.get("kind") == "convergence" for p in lane.st["positions"]))
+
+    def test_buys_outside_the_window_do_not_converge(self):
+        executor, ex = self.make(SCOUT_QUOTE_BUDGET="20", SCOUT_CONVERGENCE_WINDOW_MINUTES="5")
+        self.seed(ex, OTHER, state="shadow")
+        self.seed(ex, THIRD, state="shadow")
+        self.fake_market(ex)
+        lane = ex.scout
+        lane.reset_quote_budget()
+        now = time.time()
+        self.buy(lane, OTHER, "s1", ts=now - 20 * 60)
+        self.buy(lane, THIRD, "s2", ts=now - 10)
+        self.assertEqual(lane.st["convergence_events"], [])
+
+    def test_first_member_full_exit_closes_the_group_and_reports_separately(self):
+        executor, ex = self.make(SCOUT_QUOTE_BUDGET="20")
+        self.seed(ex, OTHER, state="shadow")
+        self.seed(ex, THIRD, state="shadow")
+        self.fake_market(ex)
+        lane = ex.scout
+        lane.reset_quote_budget()
+        self.buy(lane, OTHER, "s1")
+        self.buy(lane, THIRD, "s2")
+        lane.shadow_follow_sell(THIRD, MINT, 0.3, SOL, "sell0")                 # a trim does not end it
+        self.assertTrue(any(p.get("kind") == "convergence" for p in lane.st["positions"]))
+        lane.shadow_follow_sell(THIRD, MINT, 1.0, SOL, "sell1")
+        conv_trades = [t for t in lane.st["trades"] if t.get("kind") == "convergence"]
+        self.assertEqual(len(conv_trades), 1)
+        self.assertEqual(conv_trades[0]["reason"], "convergence_member_sell")
+        self.assertEqual(conv_trades[0]["exit_wallet"], THIRD)
+        self.assertFalse(any(p.get("kind") == "convergence" for p in lane.st["positions"]))
+        self.assertTrue(os.path.exists(os.path.join(os.environ["DATA_DIR"], "scout_convergence_trades.csv")))
+        # The group's trades never count toward a wallet's own shadow record, and the report
+        # shows them beside single-wallet copying.
+        lane.evaluate_all()
+        self.assertNotIn(scout.CONVERGENCE, lane.st["candidates"])
+        report = lane.report()["convergence"]
+        self.assertEqual(report["events"], 1)
+        self.assertEqual(report["shadow"]["trades"], 1)
+        self.assertGreaterEqual(report["single_wallet_shadow"]["trades"], 1)
+        self.assertIn("conv=1/0/1", lane.heartbeat())
+
+    def test_convergence_can_be_switched_off(self):
+        executor, ex = self.make(SCOUT_QUOTE_BUDGET="20", SCOUT_CONVERGENCE="0")
+        self.seed(ex, OTHER, state="shadow")
+        self.seed(ex, THIRD, state="shadow")
+        self.fake_market(ex)
+        lane = ex.scout
+        lane.reset_quote_budget()
+        self.buy(lane, OTHER, "s1")
+        self.buy(lane, THIRD, "s2")
+        self.assertEqual(lane.st["convergence_events"], [])
+
+
+class ExpectancyTests(unittest.TestCase):
+    def test_live_fills_are_attributed_to_their_source_wallets(self):
+        import copy_expectancy
+        d = tempfile.mkdtemp(prefix="grad-expectancy-test-")
+        with open(os.path.join(d, "live_trades.csv"), "w") as fh:
+            fh.write("opened_at,closed_at,mint,position_usd,exit_usd,net_return,exit_reason,buy_signature\n"
+                     "t,t,m1,16.0,10.8,-0.325,stop_loss,buyA\n"
+                     "t,t,m2,16.0,20.0,0.25,ladder_1.4x,buyB\n"
+                     "t,t,m3,16.0,13.0,-0.1875,copy_sell,unknown\n")
+        with open(os.path.join(d, "copy_signals.csv"), "w") as fh:
+            fh.write("timestamp,wallet,status,source_usd,fill_signature\n"
+                     f"t,{WALLET},filled,5300,buyA\n"
+                     f"t,{OTHER},filled,4900,buyB\n"
+                     f"t,{WALLET},blocked,200,\n")
+        with open(os.path.join(d, "scout_convergence_trades.csv"), "w") as fh:
+            fh.write("opened_at,closed_at,mint,cost_usd,pnl_base,pnl_stress\n"
+                     "t,t,m9,16.0,4.0,3.5\n")
+        report = copy_expectancy.expectancy(__import__("pathlib").Path(d))
+        by_wallet = {r["wallet"]: r for r in report["live"]["by_wallet"]}
+        self.assertAlmostEqual(by_wallet[WALLET]["net_pnl_usd"], -5.2)
+        self.assertEqual(by_wallet[WALLET]["signals_blocked"], 1)
+        self.assertEqual(by_wallet[OTHER]["win_rate"], 1.0)
+        self.assertEqual(report["live"]["unattributed"]["trades"], 1)
+        self.assertEqual(report["live"]["overall"]["trades"], 3)
+        self.assertEqual(report["live"]["by_exit_reason"]["stop_loss"]["trades"], 1)
+        self.assertEqual(report["convergence"]["trades"], 1)
+        self.assertEqual(report["convergence"]["net_pnl_stress_usd"], 3.5)
+        self.assertEqual(report["shadow"]["overall"], {"trades": 0})

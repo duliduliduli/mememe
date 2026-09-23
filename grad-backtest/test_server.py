@@ -181,3 +181,14 @@ class AutostartTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExpectancyEndpointTests(unittest.TestCase):
+    def test_expectancy_endpoint_reads_the_data_dir(self):
+        client = TestClient(server.app)
+        (Path(os.environ["DATA_DIR"]) / "live_trades.csv").write_text(
+            "opened_at,closed_at,mint,position_usd,exit_usd,net_return,exit_reason,buy_signature\nt,t,m,10,12,0.2,take_profit,sig\n")
+        body = client.get("/api/copy/expectancy").json()
+        self.assertEqual(body["live"]["overall"]["trades"], 1)
+        self.assertEqual(body["live"]["unattributed"]["trades"], 1)
+        self.assertIn("convergence", body)
