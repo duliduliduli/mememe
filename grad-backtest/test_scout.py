@@ -67,7 +67,8 @@ def good_candidate(address, now=NOW, configured=False, **over):
         "sources": [{"source": "configured" if configured else "smartmoney", "ts": now - 20 * DAY}], "last_refresh": now - 3600,
         "tags": ["smart_degen"], "profile": {"fund_from_address": "", "followers_count": 1000, "is_blue_verified": False},
         "exposure": {"known": True, "followers": 1000, "verified": False},
-        "stats": {p: {"realized_profit": 2000.0, "buys": 60, "sells": 60, "bought_cost": 20000.0, "winrate": 0.7, "token_num": 40}
+        "stats": {p: {"realized_profit": 2000.0, "buys": 60, "sells": 60, "bought_cost": 20000.0, "winrate": 0.7, "token_num": 40,
+                      "last_timestamp": int(now - 3600)}
                   for p in ("7d", "30d", "all")},
         "holdings": {"tokens": 5, "transfer_in_tokens": 0, "transfer_in_cost_usd": 0.0, "open_loss_usd": 50.0},
         "rank_snapshots": [{"ts": now - d * DAY, "scope": "global", "list": "gmgn:smart_degen", "rank": 12, "population": 0}
@@ -285,7 +286,8 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(cfg.live_loss_budget_usd, 25.0)
             self.assertTrue(cfg.fast_track)
             self.assertEqual(cfg.fast_track_min_history_days, 15.0)
-            self.assertEqual(cfg.fast_track_dense_episodes, 40)
+            self.assertEqual(cfg.fast_track_dense_episodes, 30)
+            self.assertEqual(cfg.fast_track_recent_days, 7.0)
             self.assertEqual(cfg.discovery_hours, 2.0)
             self.assertEqual(cfg.enrich_per_cycle, 12)
             self.assertEqual(cfg.pause_seconds, 2.0)
@@ -699,21 +701,21 @@ class LaneTests(unittest.TestCase):
         self.assertIn("tripwire", cand["lifecycle"][-1]["reason"])
         self.assertEqual(ex.scout.live_wallets(), {})
 
-    def test_active_days_are_judged_on_the_days_fetched_when_the_page_cap_cut_the_window(self):
+    def test_fast_track_only_asks_that_the_wallet_traded_this_week(self):
         cfg = cfg_with(GMGN_API_KEY="k", SCOUT_FAST_TRACK="1")
         cand = good_candidate(OTHER)
-        cand["history"].update({"coverage_days": 1.9, "truncated": True})          # 800 events in under 2 days
-        cand["history"]["metrics_30d"] = dict(cand["history"]["metrics_30d"], active_days=2)
+        cand["history"]["metrics_30d"] = dict(cand["history"]["metrics_30d"], active_days=2)   # two busy days
         ev = scout.evaluate_candidate(cand, cfg, NOW, 300.0)
         self.assertEqual(ev["gates"]["active_days_30d"]["status"], "pass")
-        self.assertIn("of the 1.9 days fetched", ev["gates"]["active_days_30d"]["detail"])
-        cand["history"]["metrics_30d"]["active_days"] = 1                           # a gap inside the window
-        self.assertEqual(scout.evaluate_candidate(cand, cfg, NOW, 300.0)["gates"]["active_days_30d"]["status"], "fail")
-        # A full window, or the full policy, still needs the seven (ten) days.
-        cand["history"]["metrics_30d"]["active_days"] = 2
-        cand["history"].update({"coverage_days": 45.0, "truncated": False})
-        self.assertEqual(scout.evaluate_candidate(cand, cfg, NOW, 300.0)["gates"]["active_days_30d"]["status"], "fail")
-        cand["history"].update({"coverage_days": 1.9, "truncated": True})
+        self.assertIn("last trade 0.0 days ago", ev["gates"]["active_days_30d"]["detail"])
+        for row in cand["stats"].values():
+            row["last_timestamp"] = int(NOW - 9 * DAY) * 1000                      # milliseconds, gone quiet
+        ev = scout.evaluate_candidate(cand, cfg, NOW, 300.0)
+        self.assertEqual(ev["gates"]["active_days_30d"]["status"], "fail")
+        self.assertIn("9.0 days ago", ev["gates"]["active_days_30d"]["detail"])
+        cand["history"]["episodes"] = [{"token": "t", "opened_ts": NOW - 3 * DAY, "closed_ts": NOW - 2 * DAY}]
+        self.assertEqual(scout.evaluate_candidate(cand, cfg, NOW, 300.0)["gates"]["active_days_30d"]["status"], "pass")
+        # The full policy still counts active days.
         full = cfg_with(GMGN_API_KEY="k", SCOUT_FAST_TRACK="0")
         self.assertEqual(scout.evaluate_candidate(cand, full, NOW, 300.0)["gates"]["active_days_30d"]["status"], "fail")
 
