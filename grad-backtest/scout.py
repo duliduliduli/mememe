@@ -45,7 +45,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-POLICY_VERSION = "2026-09-23.2"
+POLICY_VERSION = "2026-09-24.1"
 # The pseudo-wallet that owns convergence shadow positions (several tracked wallets entering
 # one coin together); never a real address, never polled, never promoted.
 CONVERGENCE = "convergence"
@@ -58,6 +58,7 @@ POLICY_FIELDS = (
     "min_median_hold_minutes", "max_fast_exit_fraction", "leaderboard_top_fraction", "leaderboard_top_n",
     "leaderboard_min_snapshots", "leaderboard_span_days", "shadow_min_days", "shadow_min_trades",
     "shadow_min_tokens", "shadow_min_active_days", "shadow_min_profit_factor", "shadow_max_drawdown",
+    "sniper_median_hold_seconds", "promote_min_paper_fills", "demote_idle_days",
 )
 
 
@@ -99,17 +100,54 @@ class ScoutConfig:
     def __init__(self) -> None:
         self.mode = os.getenv("SCOUT_MODE", "shadow").strip().lower()          # off | shadow
         self.live = os.getenv("SCOUT_LIVE", "1") == "1"                        # promotion switch
-        # On by default since 2026-09-23: the configured wallets' unproven buys lost money
-        # (EC2f5DnH twice at -33%, 498g1rVn flipped its coin in 13s); a wallet must be
-        # qualified or live with a fresh evaluation before its buys are mirrored. Sells and
-        # open positions are never affected. SCOUT_ELITE_ONLY=0 restores unconditional copying.
-        self.elite_only = os.getenv("SCOUT_ELITE_ONLY", "1") == "1"
+        # Off by default again since the copy funnel: requiring a qualified scout verdict for
+        # every buy left the lane with zero wallets. Wallets now earn and lose the live set on
+        # our own fills instead (promotion on paper results, demotion when red for us), and the
+        # wallets that already failed are watch-only (COPY_WATCH_ONLY). SCOUT_ELITE_ONLY=1
+        # still gates every buy on a fresh qualified/live verdict.
+        self.elite_only = os.getenv("SCOUT_ELITE_ONLY", "0") == "1"
+        # ---- the copy funnel: watchlist -> live set -> one position per coin ----
+        # Watchlist: tracked wallets whose buys are recorded and paper traded but never bought
+        # on their own. Polled on-chain in rotation, SCOUT_WATCH_POLL_WALLETS per poll, so a
+        # few hundred wallets cost a steady trickle of RPC calls instead of a burst.
+        self.watchlist_max = _env_int("WATCHLIST_MAX", 400)
+        self.watch_poll_wallets = max(1, _env_int("SCOUT_WATCH_POLL_WALLETS", 8))
+        # Live set: configured plus promoted wallets whose first buys are copied on their own.
+        self.live_copy_max = _env_int("LIVE_COPY_MAX", 40)
+        # Promotion on paper results: this many closed paper trades (baseline and 20 s stress
+        # quotes), net positive at both, and a trade inside DEMOTE_IDLE_DAYS.
+        self.promote_min_paper_fills = _env_int("PROMOTE_MIN_PAPER_FILLS", 8)
+        # Demotion on our own results: after this many of our closed positions from a wallet
+        # with a negative net, or no source trade in DEMOTE_IDLE_DAYS, it leaves the live set.
+        self.demote_after_live_fills = _env_int("DEMOTE_AFTER_LIVE_FILLS", 10)
+        self.demote_idle_days = _env_float("DEMOTE_IDLE_DAYS", 7)
+        # Configured wallets that already failed as copy sources: they stay on the watchlist
+        # (their buys feed confluence and paper data) but are never copied on their own.
+        # Addresses or address prefixes. EC2f5DnH: buys too big for the pools, its exit is our
+        # stop. 498g1rVn: flips in 13 s. CxWRfadz: never buys >= $300.
+        self.copy_watch_only = tuple(w.strip() for w in os.getenv("COPY_WATCH_ONLY", "EC2f5DnH,498g1rVn,CxWRfadz").split(",") if w.strip())
+        # Sniper farms: a median hold under this many seconds rejects the wallet outright (not
+        # copyable at our latency, not worth paper trading). Hold time above it is a score and
+        # the SCOUT_MIN_MEDIAN_HOLD_MINUTES history gate, never a veto.
+        self.sniper_median_hold_seconds = _env_float("SCOUT_SNIPER_MEDIAN_HOLD_SEC", 60)
+        # The hard filter on a buy: a source wallet whose measured median hold is under this
+        # many seconds is never copied, whatever set it is in.
+        self.sniper_max_hold_seconds = _env_float("SNIPER_MAX_HOLD_SEC", 10)
+        # Runner overlap discovery: coins that ran (pool at most SCOUT_OVERLAP_MAX_AGE_HOURS old
+        # with a market cap of at least SCOUT_OVERLAP_MIN_MCAP_USD, about 3x a pump.fun
+        # graduation), their top traders, wallets ranked by how many of those runners they hit.
+        self.overlap = os.getenv("SCOUT_OVERLAP", "1") == "1"
+        self.overlap_max_age_hours = _env_float("SCOUT_OVERLAP_MAX_AGE_HOURS", 72)
+        self.overlap_min_mcap_usd = _env_float("SCOUT_OVERLAP_MIN_MCAP_USD", 200_000)
+        self.overlap_runners = _env_int("SCOUT_OVERLAP_RUNNERS", 12)
+        self.overlap_top = _env_int("SCOUT_OVERLAP_TOP", 30)
+        self.overlap_min_entry_delay_seconds = _env_float("SCOUT_OVERLAP_MIN_ENTRY_DELAY_SEC", 5)
         self.discovery_hours = _env_float("SCOUT_DISCOVERY_HOURS", 2)
         self.refresh_hours = _env_float("SCOUT_REFRESH_HOURS", 24)
         self.max_qualification_age_hours = _env_float("SCOUT_MAX_QUALIFICATION_AGE_HOURS", 48)
-        self.max_live = _env_int("SCOUT_MAX_LIVE", 3)
-        self.live_size = _env_float("SCOUT_LIVE_SIZE", 0.5)                    # of the usual size; 0.25 falls under the $5 minimum on a small account
-        self.max_open_positions = _env_int("SCOUT_MAX_OPEN_POSITIONS", 3)      # open positions from scouted wallets at once (0: no cap)
+        self.max_live = _env_int("SCOUT_MAX_LIVE", 40)                         # scouted wallets live at once (LIVE_COPY_MAX caps the whole set)
+        self.live_size = _env_float("SCOUT_LIVE_SIZE", 1.0)                    # of the usual size; 0.25 falls under the $5 minimum on a small account
+        self.max_open_positions = _env_int("SCOUT_MAX_OPEN_POSITIONS", 0)      # open positions from scouted wallets at once (0: no cap beyond MAX_CONCURRENT_POSITIONS)
         self.live_loss_budget_usd = _env_float("SCOUT_LIVE_LOSS_BUDGET_USD", 25)  # 0: promotion refused
         # Fast track: qualify on fetched history alone, waiving the gates GMGN cannot evidence
         # (leaderboard, holdings) and the 14-day shadow sample. Shadow still runs as the tripwire.
@@ -126,8 +164,8 @@ class ScoutConfig:
         self.fast_track_recent_days = _env_float("SCOUT_FAST_TRACK_RECENT_DAYS", 7)
         self.tripwire_trades = _env_int("SCOUT_TRIPWIRE_TRADES", 10)              # live wallet paused when shadow net < 0 after this many
         self.max_shadow = _env_int("SCOUT_MAX_SHADOW", 25)                     # wallets polled on-chain
-        self.max_candidates = _env_int("SCOUT_MAX_CANDIDATES", 200)
-        self.poll_seconds = _env_float("SCOUT_POLL_SECONDS", 10)
+        self.max_candidates = _env_int("SCOUT_MAX_CANDIDATES", _env_int("WATCHLIST_MAX", 400))
+        self.poll_seconds = _env_float("SCOUT_POLL_SECONDS", 5)
         self.decode_budget = _env_int("SCOUT_DECODE_BUDGET", 20)               # transactions per poll, all shadow wallets
         self.quote_budget = _env_int("SCOUT_QUOTE_BUDGET", 6)                  # Jupiter quotes per poll
         self.stress_seconds = _env_float("SCOUT_STRESS_SECONDS", 20)
@@ -148,7 +186,7 @@ class ScoutConfig:
         self.min_profit_factor = _env_float("SCOUT_MIN_PROFIT_FACTOR", 1.5)
         self.max_best_token_share = _env_float("SCOUT_MAX_BEST_TOKEN_SHARE", 0.4)
         self.max_drawdown = _env_float("SCOUT_MAX_DRAWDOWN", 0.25)
-        self.min_median_hold_minutes = _env_float("SCOUT_MIN_MEDIAN_HOLD_MINUTES", 30)
+        self.min_median_hold_minutes = _env_float("SCOUT_MIN_MEDIAN_HOLD_MINUTES", 5)
         self.max_fast_exit_fraction = _env_float("SCOUT_MAX_FAST_EXIT_FRACTION", 0.1)
         # Leaderboard gate
         self.leaderboard_top_fraction = _env_float("SCOUT_LEADERBOARD_TOP_FRACTION", 0.05)
@@ -167,8 +205,15 @@ class ScoutConfig:
         # traded like a wallet's first buy. Reported separately, so it can be judged against
         # single-wallet copying before it is ever given real money.
         self.convergence = os.getenv("SCOUT_CONVERGENCE", "1") == "1"
-        self.convergence_min_wallets = max(2, _env_int("SCOUT_CONVERGENCE_MIN_WALLETS", 2))
-        self.convergence_window_seconds = _env_float("SCOUT_CONVERGENCE_WINDOW_MINUTES", 10) * 60
+        self.convergence_min_wallets = max(2, _env_int("CONFLUENCE_K", _env_int("SCOUT_CONVERGENCE_MIN_WALLETS", 2)))
+        self.convergence_window_seconds = (_env_float("CONFLUENCE_WINDOW_SEC", 180) if os.getenv("SCOUT_CONVERGENCE_WINDOW_MINUTES") is None
+                                           else _env_float("SCOUT_CONVERGENCE_WINDOW_MINUTES", 3) * 60)
+        # A smaller buy still counts toward confluence (a wallet's $100 entry is evidence when
+        # a second wallet confirms it); the lone-wallet copy keeps COPY_MIN_SOURCE_USD.
+        self.confluence_min_source_usd = _env_float("CONFLUENCE_MIN_SOURCE_USD", 100)
+        # How old the newest converging buy may be when the live buy is placed. Watchlist
+        # wallets are polled in rotation, so this is looser than COPY_MAX_TX_AGE_SECONDS.
+        self.confluence_max_age_seconds = _env_float("CONFLUENCE_MAX_AGE_SEC", 150)
         self.convergence_cooldown_hours = _env_float("SCOUT_CONVERGENCE_COOLDOWN_HOURS", 6)   # one event per coin per this long
         # Live convergence: a convergence event also buys for real, at its own reduced size,
         # with its own cap on open positions and its own loss budget. Once realized P&L of
@@ -176,8 +221,8 @@ class ScoutConfig:
         # The shadow tripwire stops it too: after this many closed shadow convergence trades
         # with a negative baseline net. SCOUT_CONVERGENCE_LIVE=0 turns the real buys off.
         self.convergence_live = os.getenv("SCOUT_CONVERGENCE_LIVE", "1") == "1"
-        self.convergence_live_size = _env_float("SCOUT_CONVERGENCE_LIVE_SIZE", 0.5)
-        self.convergence_max_open = _env_int("SCOUT_CONVERGENCE_MAX_OPEN", 2)
+        self.convergence_live_size = _env_float("SCOUT_CONVERGENCE_LIVE_SIZE", 1.0)
+        self.convergence_max_open = _env_int("SCOUT_CONVERGENCE_MAX_OPEN", 3)
         self.convergence_loss_budget_usd = _env_float("SCOUT_CONVERGENCE_LOSS_BUDGET_USD", 15)
         self.convergence_tripwire_trades = _env_int("SCOUT_CONVERGENCE_TRIPWIRE_TRADES", 10)
 
@@ -519,12 +564,19 @@ def evaluate_candidate(cand: dict[str, Any], cfg: ScoutConfig, now: float, min_f
         if hold is None:
             gate("hold_time", "missing", "no qualifying first buys to time")
         else:
-            gate("hold_time", "pass" if hold >= cfg.min_median_hold_minutes else "fail", f"median {hold:.0f} min to first material sell (need {cfg.min_median_hold_minutes:.0f})")
+            gate("hold_time", "pass" if hold >= cfg.min_median_hold_minutes else "fail", f"median {hold:.1f} min to first material sell (need {cfg.min_median_hold_minutes:.0f})")
         fe = m30.get("fast_exit_fraction")
         if fe is None:
             gate("fast_exits", "missing", "no qualifying first buys")
         else:
             gate("fast_exits", "pass" if fe <= cfg.max_fast_exit_fraction else "fail", f"{fe:.0%} of first buys exited within 60s (max {cfg.max_fast_exit_fraction:.0%})")
+    hold = (m30 or {}).get("median_hold_minutes")
+    if hold is None:
+        gate("sniper", "missing", "no qualifying first buys to time")
+    else:
+        sniper = hold * 60 < cfg.sniper_median_hold_seconds
+        gate("sniper", "fail" if sniper else "pass",
+             f"median hold {hold * 60:.0f}s " + ("< " if sniper else ">= ") + f"{cfg.sniper_median_hold_seconds:.0f}s (sniper farm below)")
     open_loss = _f((cand.get("holdings") or {}).get("open_loss_usd"))
     if cand.get("holdings") is None:
         gate("open_inventory", "missing", "holdings not fetched")
@@ -736,10 +788,38 @@ class ScoutLane:
         ev = cand.get("evaluation") or {}
         return bool(ev) and self.now() - float(ev.get("evaluated_at") or 0) <= self.cfg.max_qualification_age_hours * 3600
 
+    # ---- the copy funnel: who may trigger a copy on its own ------------------------------
+    def watch_only(self, wallet: str) -> bool:
+        """A configured wallet listed in COPY_WATCH_ONLY (address or prefix): its buys feed
+        confluence and paper data but are never copied on their own."""
+        return any(wallet == w or (len(w) < 32 and wallet.startswith(w)) for w in self.cfg.copy_watch_only)
+
+    def book(self, wallet: str) -> dict[str, Any]:
+        """Our own record of copying `wallet`: realized P&L, closed fills, and a demotion."""
+        return self.st.setdefault("live", {}).setdefault(wallet, {"realized_pnl_usd": 0.0, "fills": 0})
+
+    def median_hold_seconds(self, wallet: str) -> float | None:
+        hold = (((self.candidate(wallet) or {}).get("history") or {}).get("metrics_30d") or {}).get("median_hold_minutes")
+        return float(hold) * 60 if hold is not None else None
+
+    def configured_live(self) -> list[str]:
+        """Configured wallets currently in the live set: not watch-only, not demoted."""
+        return [w for w in self.ex.cfg.copy_wallets
+                if not self.watch_only(w) and not (self.st.get("live") or {}).get(w, {}).get("demoted_ts")]
+
     def entry_allowed(self, wallet: str) -> tuple[bool, str]:
-        """The elite-only gate for new buys (sells and open positions are never touched). Off
-        by default; when on, a configured wallet must be currently qualified or live with a
-        fresh evaluation, and a scouted wallet must be live."""
+        """May a new buy by `wallet` be copied on its own? Sells and open positions are never
+        touched. In order: watch-only, demoted on our own fills, a sniper by its measured
+        median hold, and (only with SCOUT_ELITE_ONLY=1 and GMGN evidence) a fresh qualified or
+        live verdict. The first three apply with or without GMGN scouting."""
+        if wallet in self.ex.cfg.copy_wallets and self.watch_only(wallet):
+            return False, "watch_only: in COPY_WATCH_ONLY, its buys only count toward confluence"
+        demoted = (self.st.get("live") or {}).get(wallet, {})
+        if demoted.get("demoted_ts"):
+            return False, f"demoted: {demoted.get('demoted_reason') or 'red for us'}"
+        hold = self.median_hold_seconds(wallet)
+        if hold is not None and hold < self.cfg.sniper_max_hold_seconds:
+            return False, f"sniper: median hold {hold:.0f}s < SNIPER_MAX_HOLD_SEC {self.cfg.sniper_max_hold_seconds:.0f}s"
         if not self.cfg.elite_only or not self.enabled:
             return True, ""          # without GMGN scouting there is no evidence to gate on
         cand = self.candidate(wallet)
@@ -751,15 +831,100 @@ class ScoutLane:
             return False, "elite_only: qualification stale"
         return True, ""
 
-    def note_live_pnl(self, wallet: str, pnl: float) -> None:
-        """Realized P&L of production positions copied from a scouted live wallet, against its
-        loss budget. Configured wallets are tracked too but have no budget here."""
-        book = self.st.setdefault("live", {})
-        entry = book.setdefault(wallet, {"realized_pnl_usd": 0.0})
+    def note_live_pnl(self, wallet: str, pnl: float, closed: bool = False) -> None:
+        """Realized P&L of production positions copied from `wallet` (a closed position counts
+        as one of our fills). Two rules act on it: a scouted wallet's loss budget pauses it,
+        and any wallet, configured or scouted, that is net red for us after
+        DEMOTE_AFTER_LIVE_FILLS fills leaves the live set (its sells are still followed)."""
+        entry = self.book(wallet)
         entry["realized_pnl_usd"] = round(float(entry.get("realized_pnl_usd") or 0.0) + pnl, 4)
+        if closed:
+            entry["fills"] = int(entry.get("fills") or 0) + 1
         cand = self.candidate(wallet)
         if cand and cand.get("state") == "live" and self.cfg.live_loss_budget_usd > 0 and entry["realized_pnl_usd"] <= -self.cfg.live_loss_budget_usd:
             self.transition(cand, "paused", f"live loss budget breached ({entry['realized_pnl_usd']:+.2f} USD)")
+        if (wallet != CONVERGENCE and self.cfg.demote_after_live_fills > 0 and not entry.get("demoted_ts")
+                and int(entry.get("fills") or 0) >= self.cfg.demote_after_live_fills and entry["realized_pnl_usd"] < 0):
+            self.demote(wallet, f"red for us: {entry['realized_pnl_usd']:+.2f} USD over {entry['fills']} fills")
+
+    def demote(self, wallet: str, reason: str) -> None:
+        """Live set -> watchlist. The wallet keeps being watched and paper traded; getting back
+        in takes PROMOTE_MIN_PAPER_FILLS new paper fills, net positive, after this moment."""
+        entry = self.book(wallet)
+        entry["demoted_ts"] = self.now()
+        entry["demoted_reason"] = reason
+        cand = self.candidate(wallet)
+        if cand is not None:
+            cand["demoted_ts"] = self.now()
+            if cand.get("state") in ("live", "qualified"):
+                self.transition(cand, "shadow", f"demoted to the watchlist: {reason}")
+        self.log(f"{wallet[:8]} demoted from the live set: {reason}")
+
+    def note_source_trade(self, wallet: str, ts: float | None = None) -> None:
+        """Any buy or sell seen from a watched or followed wallet: the idle clock."""
+        seen = self.st.setdefault("last_trade", {})
+        ts = float(ts) if ts else self.now()
+        if ts > float(seen.get(wallet) or 0):
+            seen[wallet] = ts
+
+    def last_trade_ts(self, wallet: str) -> float:
+        """Newest evidence the wallet traded: our own on-chain observations, its fetched
+        history and GMGN's last-activity field. The first time a wallet is looked at counts,
+        so a fresh deploy never demotes a wallet it has not had the chance to watch."""
+        cand = self.candidate(wallet) or {}
+        hist = cand.get("history") or {}
+        stamps = [float((self.st.get("last_trade") or {}).get(wallet) or 0)]
+        stamps += [float(e.get("closed_ts") or e.get("opened_ts") or 0) for e in (hist.get("episodes") or [])[-50:]]
+        for row in ((cand.get("stats") or {}).get(k) or {} for k in ("7d", "30d", "all")):
+            t = _f(row.get("last_timestamp"))
+            stamps.append(t / 1000.0 if t > 1e11 else t)
+        first = self.st.setdefault("first_watched", {})
+        stamps.append(float(first.setdefault(wallet, self.now())))
+        return max(stamps)
+
+    def idle(self, wallet: str) -> bool:
+        return self.cfg.demote_idle_days > 0 and self.now() - self.last_trade_ts(wallet) > self.cfg.demote_idle_days * DAY
+
+    def paper_record(self, wallet: str, since: float | None = None) -> dict[str, Any]:
+        """Closed paper trades of a wallet (optionally only those opened after `since`):
+        count, baseline net, and stress net over the trades that have a stress quote."""
+        rows = [t for t in self.st["trades"] if t.get("wallet") == wallet and t.get("kind") != "convergence"
+                and t.get("closed_ts") and not str(t.get("reason") or "").startswith("missed")
+                and (since is None or float(t.get("opened_ts") or 0) > since)]
+        stressed = [t for t in rows if t.get("pnl_stress") not in (None, "")]
+        return {"fills": len(rows), "net_base_usd": round(sum(_f(t.get("pnl_base")) for t in rows), 4),
+                "net_stress_usd": round(sum(_f(t.get("pnl_stress")) for t in stressed), 4) if stressed else None,
+                "stress_fills": len(stressed)}
+
+    def paper_green(self, wallet: str, since: float | None = None) -> tuple[bool, str]:
+        """The paper route into the live set: enough closed paper fills, net positive at the
+        baseline quote and at the 20 s stress quote (when stress quotes exist)."""
+        rec = self.paper_record(wallet, since)
+        if rec["fills"] < self.cfg.promote_min_paper_fills:
+            return False, f"{rec['fills']} paper fills (need {self.cfg.promote_min_paper_fills})"
+        if rec["net_base_usd"] <= 0:
+            return False, f"paper net {rec['net_base_usd']:+.2f} USD over {rec['fills']} fills"
+        if rec["net_stress_usd"] is not None and rec["net_stress_usd"] <= 0:
+            return False, f"paper net {rec['net_base_usd']:+.2f} USD but {rec['net_stress_usd']:+.2f} with 20s latency"
+        return True, f"paper net {rec['net_base_usd']:+.2f} USD over {rec['fills']} fills" + (
+            f" ({rec['net_stress_usd']:+.2f} with 20s latency)" if rec["net_stress_usd"] is not None else "")
+
+    def review_live_set(self) -> None:
+        """Idle demotions and re-promotions for configured wallets (scouted wallets go through
+        the candidate lifecycle): a configured wallet idle for DEMOTE_IDLE_DAYS leaves the live
+        set; a demoted one comes back once its new paper fills are green."""
+        for wallet in self.ex.cfg.copy_wallets:
+            if self.watch_only(wallet):
+                continue
+            entry = (self.st.get("live") or {}).get(wallet) or {}
+            if entry.get("demoted_ts"):
+                ok, detail = self.paper_green(wallet, since=float(entry["demoted_ts"]))
+                if ok and not self.idle(wallet):
+                    self.st["live"][wallet] = {"realized_pnl_usd": 0.0, "fills": 0, "repromoted_ts": self.now(),
+                                               "previous": {k: entry.get(k) for k in ("realized_pnl_usd", "fills", "demoted_reason")}}
+                    self.log(f"{wallet[:8]} back in the live set: {detail}")
+            elif self.idle(wallet):
+                self.demote(wallet, f"no trade in {self.cfg.demote_idle_days:.0f} days")
 
     # ---- per-cycle entry point ------------------------------------------------------------
     def tick(self, sol_price: float) -> None:
@@ -774,6 +939,9 @@ class ScoutLane:
         self.st["policy_version"] = key
         self.apply_discovery()
         self.maybe_discover()
+        if self.now() - float(self.st.get("reviewed_ts") or 0) >= 600:
+            self.st["reviewed_ts"] = self.now()
+            self.review_live_set()
         if self.now() - self._poll_ts >= self.cfg.poll_seconds:
             self._poll_ts = self.now()
             self.poll_shadow_wallets(sol_price)
@@ -871,6 +1039,12 @@ class ScoutLane:
             self.st["discovered_ts"] = self.now()
             self.st.pop("rate_limited_until", None)
         self.st["token_sample"] = payload.get("token_sample", [])
+        if payload.get("overlap") is not None and (payload.get("overlap") or payload.get("runners")):
+            self.st["overlap"] = {"ts": self.now(), "runners": payload.get("runners") or [], "wallets": payload.get("overlap") or []}
+            for row in payload.get("overlap") or []:
+                cand = self.st["candidates"].get(row["address"])
+                if cand is not None:
+                    cand["overlap_hits"] = row["hits"]
         self.st["last_units"] = payload.get("units", 0)
         for err in payload.get("errors", []):
             self.st.setdefault("errors", []).append({"ts": self.now(), "what": "enrich", "why": err})
@@ -897,6 +1071,9 @@ class ScoutLane:
             for key in ("tags", "profile", "exposure", "stats", "holdings", "holdings_error", "history", "risk_flags", "last_refresh", "refresh_error"):
                 if key in update:
                     cand[key] = update[key]
+        for row in payload.get("overlap") or []:
+            if row["address"] in cands:
+                cands[row["address"]]["overlap_hits"] = row["hits"]
         clusters = relationship_clusters(cands)
         for a, c in cands.items():
             c["relationship"] = clusters.get(a)
@@ -923,12 +1100,20 @@ class ScoutLane:
         self.select_live()
 
     def apply_lifecycle(self, cand: dict[str, Any], ev: dict[str, Any]) -> None:
+        """discovered -> research -> shadow (the watchlist) -> qualified -> live, and back.
+        Into the live set by either route: every history gate (the fast track, profit factor
+        included), or paper-green (PROMOTE_MIN_PAPER_FILLS closed paper fills since any
+        demotion, net positive at baseline and 20 s stress). Out of it when red for us after
+        DEMOTE_AFTER_LIVE_FILLS fills (note_live_pnl), idle for DEMOTE_IDLE_DAYS, or when
+        neither route holds any more. Bad tags, hard risk flags or a sniper-farm hold time
+        reject the wallet from the watchlist altogether."""
         state = cand.get("state")
         gates = ev["gates"]
-        if gates["tags"]["status"] == "fail" or gates["risk_flags"]["status"] == "fail":
-            if state != "rejected":
-                self.transition(cand, "rejected", gates["tags"]["detail"] if gates["tags"]["status"] == "fail" else gates["risk_flags"]["detail"])
-            return
+        for name in ("tags", "risk_flags", "sniper"):
+            if (gates.get(name) or {}).get("status") == "fail":
+                if state != "rejected":
+                    self.transition(cand, "rejected", gates[name]["detail"])
+                return
         if state == "rejected":
             self.transition(cand, "research", "flags cleared on refresh")
             state = "research"
@@ -937,29 +1122,36 @@ class ScoutLane:
             state = "research"
         historical_failed = [k for k in ev["failed"] if not k.startswith("shadow")]
         if state == "research" and cand.get("last_refresh"):
-            self.transition(cand, "shadow", "watching first buys with executable quotes; " + (
+            self.transition(cand, "shadow", "on the watchlist: first buys paper traded with executable quotes; " + (
                 f"open gates: {', '.join(historical_failed)}" if historical_failed else "history gates pass so far"))
             state = "shadow"
-        if state == "shadow" and ev["qualified"]:
-            cooldown = cand.get("demoted_ts")
-            if cooldown and self.now() - float(cooldown) < self.cfg.requalify_hours * 3600:
+        demoted_ts = cand.get("demoted_ts")
+        paper_ok, paper_detail = self.paper_green(cand["address"], since=float(demoted_ts) if demoted_ts else None)
+        route = "history" if ev["qualified"] else ("paper" if paper_ok else "")
+        cand["route"] = route
+        cand["paper"] = {"ok": paper_ok, "detail": paper_detail, **self.paper_record(cand["address"])}
+        idle = self.idle(cand["address"])
+        if state == "shadow" and route and not idle:
+            if demoted_ts and self.now() - float(demoted_ts) < self.cfg.requalify_hours * 3600:
                 return
-            self.transition(cand, "qualified", "every gate passed with fresh evidence")
+            self.transition(cand, "qualified", "every history gate passed with fresh evidence" if route == "history" else paper_detail)
             return
         sh = cand.get("shadow") or {}
-        if state == "live" and sh.get("trades", 0) >= self.cfg.tripwire_trades and _f(sh.get("net_base_usd")) < 0:
+        if state == "live" and sh.get("trades", 0) >= self.cfg.tripwire_trades and _f(sh.get("net_base_usd")) < 0 and not paper_ok:
             cand["demoted_ts"] = self.now()
             self.transition(cand, "paused", f"tripwire: shadow net {sh['net_base_usd']:+.2f} USD after {sh['trades']} trades")
             return
-        if state in ("qualified", "live") and not ev["qualified"]:
+        if state in ("qualified", "live") and idle:
+            self.demote(cand["address"], f"no trade in {self.cfg.demote_idle_days:.0f} days")
+            return
+        if state in ("qualified", "live") and not route:
             why = ", ".join(ev["failed"]) or ("missing " + ", ".join(ev["missing"]))
             target = "paused" if state == "live" else "shadow"
             cand["demoted_ts"] = self.now()
-            self.transition(cand, target, f"gate no longer passes: {why}")
+            self.transition(cand, target, f"no route into the live set any more: history ({why}); {paper_detail}")
             return
-        if state == "paused" and ev["qualified"]:
-            cooldown = cand.get("demoted_ts")
-            if cooldown and self.now() - float(cooldown) < self.cfg.requalify_hours * 3600:
+        if state == "paused" and route:
+            if demoted_ts and self.now() - float(demoted_ts) < self.cfg.requalify_hours * 3600:
                 return
             budget = (self.st.get("live") or {}).get(cand["address"], {}).get("realized_pnl_usd", 0.0)
             if self.cfg.live_loss_budget_usd > 0 and budget <= -self.cfg.live_loss_budget_usd:
@@ -967,29 +1159,35 @@ class ScoutLane:
             self.transition(cand, "qualified", "requalified with fresh evidence after the cooldown")
 
     def select_live(self) -> dict[str, Any]:
-        """Promote at most SCOUT_MAX_LIVE qualified wallets, one per evidenced cluster, only with
-        the live switch on and a positive per-wallet loss budget. Returns the decision record."""
+        """Promote qualified wallets into the live set, best score first, one per evidenced
+        cluster, only with the live switch on and a positive per-wallet loss budget. The live
+        set (configured wallets still live plus scouted live wallets) never exceeds
+        LIVE_COPY_MAX, and scouted wallets never exceed SCOUT_MAX_LIVE."""
         cands = self.st["candidates"]
-        qualified = [c for c in cands.values() if c.get("state") == "qualified" and self.qualification_fresh(c)
-                     and c["address"] not in self.ex.cfg.copy_wallets]
+        configured = set(self.ex.cfg.copy_wallets)
+        qualified = [c for c in cands.values() if c.get("state") == "qualified" and c["address"] not in configured
+                     and (c.get("route") == "paper" or self.qualification_fresh(c))]
         live = [c for c in cands.values() if c.get("state") == "live"]
-        decision: dict[str, Any] = {"ts": self.now(), "promoted": [], "reason": ""}
+        cap = min(self.cfg.max_live, max(0, self.cfg.live_copy_max - len(self.configured_live())))
+        decision: dict[str, Any] = {"ts": self.now(), "promoted": [], "reason": "", "cap": cap}
         if not qualified:
-            decision["reason"] = "no wallet passes every mandatory gate" + (" (live switch off)" if not self.cfg.live else "")
+            decision["reason"] = "no wallet on the watchlist has a route into the live set yet" + (" (live switch off)" if not self.cfg.live else "")
         elif not self.cfg.live:
             decision["reason"] = f"{len(qualified)} qualified; SCOUT_LIVE=0 so none is promoted"
         elif self.cfg.live_loss_budget_usd <= 0:
             decision["reason"] = "SCOUT_LIVE_LOSS_BUDGET_USD must be set above 0 before any promotion"
         else:
             taken_clusters = {(c.get("relationship") or {}).get("cluster") for c in live if (c.get("relationship") or {}).get("cluster")}
-            for c in sorted(qualified, key=lambda c: -(c.get("evaluation") or {}).get("score", {}).get("total", 0)):
-                if len(live) >= self.cfg.max_live:
-                    decision["reason"] = f"{self.cfg.max_live} live wallets already"
+            for c in sorted(qualified, key=lambda c: (c.get("route") != "paper", -(c.get("evaluation") or {}).get("score", {}).get("total", 0))):
+                if len(live) >= cap:
+                    decision["reason"] = f"live set full ({len(live)} scouted, cap {cap})"
                     break
                 rel = c.get("relationship") or {}
                 if rel.get("cluster") and rel.get("confidence") in ("medium", "high") and rel["cluster"] in taken_clusters:
                     continue
-                self.transition(c, "live", f"promoted at {self.cfg.live_size:.0%} size, budget {self.cfg.live_loss_budget_usd:.0f} USD")
+                self.book(c["address"]).pop("demoted_ts", None)
+                self.transition(c, "live", f"promoted ({c.get('route') or 'history'} route) at {self.cfg.live_size:.0%} size, "
+                                           f"budget {self.cfg.live_loss_budget_usd:.0f} USD")
                 live.append(c)
                 decision["promoted"].append(c["address"])
                 if rel.get("cluster"):
@@ -1006,7 +1204,9 @@ class ScoutLane:
         never enriched keeps its slot until it has had its turn, and rejected wallets stay so
         they are not enriched again."""
         cands = self.st["candidates"]
-        polled = set(self.shadow_wallets())
+        # Protected: the best SCOUT_MAX_SHADOW of the watchlist and any wallet with an open
+        # paper position. (Reading the rotation here would move it.)
+        polled = set(self.watchlist()[: self.cfg.max_shadow]) | {p["wallet"] for p in self.st["positions"]}
         configured = set(self.ex.cfg.copy_wallets)
         out = []
         for address, c in cands.items():
@@ -1017,17 +1217,31 @@ class ScoutLane:
         out.sort(key=lambda a: ((cands[a].get("evaluation") or {}).get("score", {}).get("total", 0), float(cands[a].get("last_refresh") or 0)))
         return out
 
-    def shadow_wallets(self) -> list[str]:
-        """Wallets polled on-chain: shadow and qualified candidates (best score first, capped),
-        plus any wallet with an open shadow position so its sells keep being followed."""
+    def watchlist(self) -> list[str]:
+        """Every wallet on the watchlist: enriched, not rejected, best score first, capped at
+        WATCHLIST_MAX."""
         cands = self.st["candidates"]
-        watch = [a for a, c in cands.items() if c.get("state") in ("shadow", "qualified")]
+        watch = [a for a, c in cands.items() if c.get("state") in ("shadow", "qualified", "live", "paused")]
         watch.sort(key=lambda a: -((cands[a].get("evaluation") or {}).get("score", {}).get("total", 0)))
-        watch = watch[: self.cfg.max_shadow]
+        return watch[: self.cfg.watchlist_max]
+
+    def shadow_wallets(self) -> list[str]:
+        """Wallets polled on-chain this round: first those with an open paper position (their
+        sells close it), then the next SCOUT_WATCH_POLL_WALLETS of the watchlist in rotation,
+        so a few hundred wallets are each visited every few minutes at a steady RPC cost."""
+        watch = self.watchlist()
+        per = self.cfg.watch_poll_wallets
+        out: list[str] = []
         for p in self.st["positions"]:
-            if p["wallet"] not in watch and p["wallet"] != CONVERGENCE:
-                watch.append(p["wallet"])
-        return watch
+            if p["wallet"] not in out and p["wallet"] != CONVERGENCE and len(out) < per:
+                out.append(p["wallet"])
+        if watch:
+            cursor = int(self.st.get("watch_cursor") or 0) % len(watch)
+            ring = watch[cursor:] + watch[:cursor]
+            picked = [w for w in ring if w not in out][:per]
+            out.extend(picked)
+            self.st["watch_cursor"] = (cursor + len(picked)) % len(watch)
+        return out
 
     def poll_shadow_wallets(self, sol_price: float) -> None:
         wallets = self.shadow_wallets()
@@ -1095,6 +1309,7 @@ class ScoutLane:
         swap = self.mod.wallet_swap_from_transaction(tx, wallet)
         if not swap:
             return
+        self.note_source_trade(wallet, block_time)
         usd = swap["sol"] * sol_price + swap.get("stable_usd", 0.0)
         age = self.now() - int(block_time) if block_time else 0.0
         if swap["side"] == "sell":
@@ -1115,7 +1330,10 @@ class ScoutLane:
         base = {"wallet": wallet, "mint": mint, "signature": sig, "source_usd": round(usd)}
         minimum = float(cfg.copy_wallet_min_usd.get(wallet, cfg.copy_min_buy_usd))
         if usd < minimum:
-            return                                                              # below the copy minimum: not a signal at all
+            # Below the lone-copy minimum: no paper position of its own, but a first buy of at
+            # least CONFLUENCE_MIN_SOURCE_USD still counts toward confluence.
+            self.note_confluence_buy(wallet, sig, block_time, swap, usd, sol_price)
+            return
         if age > cfg.copy_max_tx_age_seconds:
             self.record_signal({**base, "status": "blocked", "reason": "too_late"})
             return
@@ -1194,6 +1412,18 @@ class ScoutLane:
         return pos
 
     # ---- convergence: several independent tracked wallets entering the same coin ------------
+    def note_confluence_buy(self, wallet: str, sig: str, block_time: Any, swap: dict[str, Any], usd: float, sol_price: float) -> None:
+        """A first buy by any watched or followed wallet, for confluence: at least
+        CONFLUENCE_MIN_SOURCE_USD, a first buy (not an add), then check whether it completes a
+        confluence on its coin. Idempotent per signature."""
+        if not self.enabled or usd < self.cfg.confluence_min_source_usd:
+            return
+        pre, bought = int(swap.get("pre_tokens") or 0), int(swap.get("tokens") or 0)
+        if bought > 0 and pre > bought * self.ex.cfg.copy_add_dust_ratio:
+            return
+        self.note_first_buy(wallet, swap["mint"], sig, block_time, usd, bought)
+        self.check_convergence(swap["mint"], sol_price)
+
     def note_first_buy(self, wallet: str, mint: str, sig: str, block_time: Any, usd: float, tokens: int = 0) -> None:
         ts = float(block_time) if block_time else self.now()
         recent = self.st.setdefault("recent_buys", {})
@@ -1291,8 +1521,8 @@ class ScoutLane:
         why = self.convergence_live_block()
         if not why and ex.state.get("draining"):
             why = "draining"
-        if not why and self.now() - last_ts > ex.cfg.copy_max_tx_age_seconds:
-            why = f"last buy {self.now() - last_ts:.0f}s old > {ex.cfg.copy_max_tx_age_seconds:.0f}s"
+        if not why and self.now() - last_ts > self.cfg.confluence_max_age_seconds:
+            why = f"last buy {self.now() - last_ts:.0f}s old > CONFLUENCE_MAX_AGE_SEC {self.cfg.confluence_max_age_seconds:.0f}s"
         if not why and (any(p.get("mint") == mint for p in ex.state["positions"]) or any(p.get("mint") == mint for p in ex.pending)):
             why = "already held"
         if why:
@@ -1304,7 +1534,8 @@ class ScoutLane:
                              "copy_buy_usd": round(source_usd), "copy_signature": sig, "copy_size": self.cfg.convergence_live_size,
                              # The whole group leaving at once is the exit to survive: the
                              # source-exit guard quotes the sell of everything they just bought.
-                             "copy_tokens": group_tokens},
+                             "copy_tokens": group_tokens, "convergence_wallets": wallets,
+                             "convergence_spread_s": round(max(0.0, last_ts - min(float(r["ts"]) for r in (self.st.get("recent_buys") or {}).get(mint, [{"ts": last_ts}]))), 1)},
                             sol_price)
         pos = next((p for p in ex.state["positions"] if p.get("copy_signature") == sig), None)
         if pos is None:
@@ -1532,6 +1763,8 @@ class ScoutLane:
                 f"qualified={n['qualified']},live={n['live']},paused={n['paused']},rejected={n['rejected']},"
                 f"shadow_pos={len(self.st['positions'])},shadow_trades={len(self.st['trades'])},"
                 f"conv={len(self.st.get('convergence_events') or [])}/{conv_open}/{conv_closed},"
+                f"watch={len(self.watchlist())},live_set={len(self.configured_live()) + n['live']}/{self.cfg.live_copy_max},"
+                f"overlap={len((self.st.get('overlap') or {}).get('wallets') or [])},"
                 f"discovery={'never' if age is None else f'{age / 3600:.1f}h'}")
 
     def startup_line(self) -> str:
@@ -1545,11 +1778,17 @@ class ScoutLane:
                 f"live_loss_budget=${c.live_loss_budget_usd:,.0f}{' (promotion refused until set)' if c.live_loss_budget_usd <= 0 else ''} "
                 f"shadow>={c.shadow_min_days}d/{c.shadow_min_trades}trades/{c.shadow_min_tokens}tokens PF>={c.shadow_min_profit_factor} "
                 f"DD<={c.shadow_max_drawdown:.0%} history>={c.min_history_days}d PF>={c.min_profit_factor} "
-                f"tracked={len(self.st['candidates'])} policy={policy_key(c)}")
+                f"tracked={len(self.st['candidates'])} policy={policy_key(c)} | funnel: watchlist<={c.watchlist_max} "
+                f"({c.watch_poll_wallets}/poll every {c.poll_seconds:.0f}s) live_set<={c.live_copy_max} "
+                f"confluence K={c.convergence_min_wallets} in {c.convergence_window_seconds:.0f}s (buys>=${c.confluence_min_source_usd:.0f}) "
+                f"promote={c.promote_min_paper_fills} green paper fills demote={c.demote_after_live_fills} red fills or {c.demote_idle_days:.0f}d idle "
+                f"hold>={c.min_median_hold_minutes:.0f}m sniper<{c.sniper_median_hold_seconds:.0f}s rejected "
+                f"watch_only={','.join(c.copy_watch_only) or 'none'} overlap={'on' if c.overlap else 'off'}")
 
     # ---- report --------------------------------------------------------------------------
     def report(self) -> dict[str, Any]:
-        return candidate_report(self.st, self.cfg, self.now())
+        return {**candidate_report(self.st, self.cfg, self.now()),
+                "funnel": funnel_report(self.st, self.cfg, self.now(), list(self.ex.cfg.copy_wallets), self.ex.state.get("jev"))}
 
 
 def candidate_report(st: dict[str, Any], cfg: ScoutConfig, now: float) -> dict[str, Any]:
@@ -1584,18 +1823,88 @@ def candidate_report(st: dict[str, Any], cfg: ScoutConfig, now: float) -> dict[s
                                                    "last_transition": (c.get("lifecycle") or [{}])[-1]},
             "last_successful_refresh": c.get("last_refresh"), "refresh_error": c.get("refresh_error"),
             "policy_version": ev.get("policy_version"),
+            "route_to_live": c.get("route") or None, "paper": c.get("paper"), "overlap_hits": c.get("overlap_hits"),
         })
     order = {s: i for i, s in enumerate(("live", "qualified", "shadow", "research", "discovered", "paused", "rejected"))}
     rows.sort(key=lambda r: (order.get(r["state"], 9), -((r.get("score_components") or {}).get("total") or 0)))
     counts: dict[str, int] = defaultdict(int)
     for r in rows:
         counts[r["state"]] += 1
-    return {"policy_version": policy_key(cfg), "mode": cfg.mode, "live_switch": cfg.live, "elite_only": cfg.elite_only,
+    # Which filter keeps wallets out: every deciding gate that failed, counted over the
+    # candidates not in the live set, plus what rejected the rejected ones.
+    gate_failures: dict[str, int] = defaultdict(int)
+    rejected_by: dict[str, int] = defaultdict(int)
+    for c in (st.get("candidates") or {}).values():
+        ev = c.get("evaluation") or {}
+        if c.get("state") in ("live", "qualified"):
+            continue
+        for name in ev.get("failed") or []:
+            gate_failures[name] += 1
+        if c.get("state") == "rejected":
+            gates = ev.get("gates") or {}
+            name = next((n for n in ("tags", "risk_flags", "sniper") if (gates.get(n) or {}).get("status") == "fail"), "other")
+            rejected_by[name] += 1
+    return {"gate_failures": dict(sorted(gate_failures.items(), key=lambda kv: -kv[1])), "rejected_by": dict(rejected_by),
+            "policy_version": policy_key(cfg), "mode": cfg.mode, "live_switch": cfg.live, "elite_only": cfg.elite_only,
             "track": "fast" if cfg.fast_track else "full", "live_loss_budget_usd": cfg.live_loss_budget_usd,
             "counts": dict(counts), "candidates": rows, "shadow_positions": st.get("positions", []),
             "convergence": convergence_report(st, cfg),
             "last_selection": st.get("last_selection"), "discovered_at": st.get("discovered_ts"), "errors": (st.get("errors") or [])[-10:],
             "token_sample": st.get("token_sample", []), "gmgn_units_last_cycle": st.get("last_units")}
+
+
+def configured_wallets_from_env() -> list[str]:
+    """COPY_WALLETS as the executor reads it (address, or address:min[:size]), for read-only
+    reports that do not construct an executor."""
+    return [w.split(":")[0].strip() for w in os.getenv("COPY_WALLETS", "").split(",") if w.split(":")[0].strip()]
+
+
+def funnel_report(st: dict[str, Any], cfg: ScoutConfig, now: float, configured: list[str] | None = None,
+                  jev: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The copy funnel at a glance: watchlist, live set, paper P&L by wallet, confluence
+    today, runner-overlap candidates and the Jev gate's counts."""
+    configured = list(configured if configured is not None else configured_wallets_from_env())
+    cands = st.get("candidates") or {}
+    book = st.get("live") or {}
+
+    def watch_only(w: str) -> bool:
+        return any(w == x or (len(x) < 32 and w.startswith(x)) for x in cfg.copy_watch_only)
+
+    watch = [a for a, c in cands.items() if c.get("state") in ("shadow", "qualified", "live", "paused")]
+    configured_rows = [{"wallet": w, "status": "watch_only" if watch_only(w) else ("demoted" if (book.get(w) or {}).get("demoted_ts") else "live"),
+                        "our_fills": (book.get(w) or {}).get("fills", 0), "our_net_usd": (book.get(w) or {}).get("realized_pnl_usd", 0.0),
+                        "demoted_reason": (book.get(w) or {}).get("demoted_reason"),
+                        "last_trade_ts": (st.get("last_trade") or {}).get(w)} for w in configured]
+    scouted_live = [{"wallet": a, "route": c.get("route"), "our_fills": (book.get(a) or {}).get("fills", 0),
+                     "our_net_usd": (book.get(a) or {}).get("realized_pnl_usd", 0.0)}
+                    for a, c in cands.items() if c.get("state") == "live"]
+    paper: dict[str, dict[str, Any]] = {}
+    for t in st.get("trades") or []:
+        if t.get("kind") == "convergence" or not t.get("closed_ts") or str(t.get("reason") or "").startswith("missed"):
+            continue
+        row = paper.setdefault(t["wallet"], {"wallet": t["wallet"], "fills": 0, "net_base_usd": 0.0, "net_stress_usd": 0.0})
+        row["fills"] += 1
+        row["net_base_usd"] = round(row["net_base_usd"] + _f(t.get("pnl_base")), 4)
+        row["net_stress_usd"] = round(row["net_stress_usd"] + _f(t.get("pnl_stress")), 4)
+    today = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d")
+    events_today = [e for e in st.get("convergence_events") or []
+                    if datetime.fromtimestamp(float(e.get("ts") or 0), timezone.utc).strftime("%Y-%m-%d") == today]
+    return {
+        "watchlist": {"size": min(len(watch), cfg.watchlist_max), "max": cfg.watchlist_max, "tracked": len(cands),
+                      "poll_wallets_per_round": cfg.watch_poll_wallets, "poll_seconds": cfg.poll_seconds},
+        "live_set": {"max": cfg.live_copy_max, "configured": configured_rows, "scouted": scouted_live,
+                     "size": sum(1 for r in configured_rows if r["status"] == "live") + len(scouted_live)},
+        "promotion": {"paper_fills": cfg.promote_min_paper_fills, "demote_after_live_fills": cfg.demote_after_live_fills,
+                      "demote_idle_days": cfg.demote_idle_days, "sniper_max_hold_sec": cfg.sniper_max_hold_seconds,
+                      "sniper_median_hold_sec_rejects": cfg.sniper_median_hold_seconds},
+        "paper_pnl_by_wallet": sorted(paper.values(), key=lambda r: -r["net_base_usd"])[:100],
+        "confluence_today": {"events": len(events_today), "bought_live": sum(1 for e in events_today if e.get("live") == "bought"),
+                             "k": cfg.convergence_min_wallets, "window_sec": cfg.convergence_window_seconds},
+        "overlap_candidates": (st.get("overlap") or {}).get("wallets") or [],
+        "overlap_runners": (st.get("overlap") or {}).get("runners") or [],
+        "overlap_at": (st.get("overlap") or {}).get("ts"),
+        "jev": jev or {},
+    }
 
 
 def convergence_report(st: dict[str, Any], cfg: ScoutConfig) -> dict[str, Any]:
@@ -1627,6 +1936,90 @@ def convergence_report(st: dict[str, Any], cfg: ScoutConfig) -> dict[str, Any]:
 
 
 # ---- discovery + enrichment (runs on the worker thread, touches no executor state) --------------
+GECKO_API = "https://api.geckoterminal.com/api/v2"
+SNIPER_TAGS = ("sniper", "bundler", "rat_trader", "mev_bot", "sandwich_bot", "wash_trader")
+
+
+def _iso_ts(value: Any) -> float | None:
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_runners(cfg: ScoutConfig, now: float, http_get: Any = None) -> tuple[list[dict[str, Any]], list[str]]:
+    """Coins that ran recently, from GeckoTerminal (keyless): Solana pools on the trending
+    lists (1h, 6h, 24h) and the newest-pools pages, created at most
+    SCOUT_OVERLAP_MAX_AGE_HOURS ago, with a market cap of at least SCOUT_OVERLAP_MIN_MCAP_USD
+    (about 3x a pump.fun graduation). One row per base mint, largest cap first, at most
+    SCOUT_OVERLAP_RUNNERS. Returns (runners, errors); a failed page is an error, not a stop."""
+    if http_get is None:
+        import requests
+
+        def http_get(url: str) -> dict[str, Any]:
+            resp = requests.get(url, headers={"Accept": "application/json"}, timeout=15)
+            resp.raise_for_status()
+            return resp.json()
+    urls = [f"{GECKO_API}/networks/solana/trending_pools?duration={d}&page=1" for d in ("1h", "6h", "24h")]
+    urls += [f"{GECKO_API}/networks/solana/new_pools?page={n}" for n in (1, 2, 3)]
+    best: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    for url in urls:
+        try:
+            rows = (http_get(url) or {}).get("data") or []
+        except Exception as exc:
+            errors.append(f"geckoterminal {url.split('/networks/solana/')[-1]}: {exc}")
+            continue
+        for row in rows:
+            attrs = row.get("attributes") or {}
+            base = (((row.get("relationships") or {}).get("base_token") or {}).get("data") or {}).get("id") or ""
+            mint = base.split("_", 1)[-1] if base else ""
+            created = _iso_ts(attrs.get("pool_created_at"))
+            mcap = _f(attrs.get("market_cap_usd") or attrs.get("fdv_usd"))
+            if not mint or mint == WSOL or created is None:
+                continue
+            if now - created > cfg.overlap_max_age_hours * 3600 or mcap < cfg.overlap_min_mcap_usd:
+                continue
+            if mint not in best or mcap > best[mint]["mcap_usd"]:
+                best[mint] = {"mint": mint, "mcap_usd": round(mcap), "pool_created_ts": created, "name": attrs.get("name"),
+                              "dex": (((row.get("relationships") or {}).get("dex") or {}).get("data") or {}).get("id")}
+    runners = sorted(best.values(), key=lambda r: -r["mcap_usd"])[: cfg.overlap_runners]
+    return runners, errors
+
+
+def _first_seconds(row: dict[str, Any]) -> float | None:
+    """How many seconds after the token's creation this trader first bought, when GMGN's row
+    carries both timestamps; None otherwise."""
+    first = next((_f(row.get(k)) for k in ("start_holding_at", "first_buy_time", "first_buy_timestamp") if row.get(k)), 0.0)
+    created = next((_f(row.get(k)) for k in ("token_created_at", "created_timestamp", "open_timestamp") if row.get(k)), 0.0)
+    if first <= 0 or created <= 0:
+        return None
+    return first - created
+
+
+def overlap_rank(runner_traders: dict[str, list[dict[str, Any]]], cfg: ScoutConfig) -> list[dict[str, Any]]:
+    """Wallets ranked by how many runners they were a top trader of. Transfer-in inventory,
+    GMGN sniper/bundler-type tags and entries in the first SCOUT_OVERLAP_MIN_ENTRY_DELAY_SEC
+    seconds of a token do not count: a style that repeats across runners is the signal, a
+    block-0 fill is not copyable. Top SCOUT_OVERLAP_TOP."""
+    import gmgn
+    hits: dict[str, set[str]] = defaultdict(set)
+    tags_of: dict[str, set[str]] = defaultdict(set)
+    for mint, rows in runner_traders.items():
+        for r in rows:
+            address = gmgn.wallet_of(r)
+            tags = set(gmgn._tags(r))
+            if not address or r.get("transfer_in") or r.get("is_suspicious") or tags & set(SNIPER_TAGS):
+                continue
+            early = _first_seconds(r)
+            if early is not None and early < cfg.overlap_min_entry_delay_seconds:
+                continue
+            hits[address].add(mint)
+            tags_of[address] |= tags
+    ranked = sorted(hits, key=lambda a: (-len(hits[a]), a))[: cfg.overlap_top]
+    return [{"address": a, "hits": len(hits[a]), "runners": sorted(hits[a]), "tags": sorted(tags_of[a])} for a in ranked]
+
+
 def discover_and_enrich(client: Any, cfg: ScoutConfig, known: dict[str, dict[str, Any]], configured: list[str],
                         token_sample: list[str], now: float, min_first_buy_usd: float, room: int | None = None) -> dict[str, Any]:
     """`room`: how many new wallets can still be tracked (None: no limit). Enriching a find that
@@ -1692,6 +2085,26 @@ def discover_and_enrich(client: Any, cfg: ScoutConfig, known: dict[str, dict[str
                 continue                                  # inventory that arrived by transfer is not a copyable buy
             note(address, f"top_traders:{token[:8]}", gmgn._tags(r))
             found[address]["rank_snapshots"].append({"ts": now, "scope": "token", "list": f"top_traders:{token[:8]}", "rank": rank, "population": len(rows)})
+    overlap: list[dict[str, Any]] = []
+    runners: list[dict[str, Any]] = []
+    if cfg.overlap:
+        runners, gecko_errors = fetch_runners(cfg, now)
+        errors.extend(gecko_errors)
+        traders: dict[str, list[dict[str, Any]]] = {}
+        for runner in runners:
+            if units >= cfg.gmgn_units_per_cycle:
+                break
+            try:
+                time.sleep(client.pause_seconds)
+                traders[runner["mint"]] = client.top_traders("sol", runner["mint"], limit=20)
+                units += 5
+            except Exception as exc:
+                errors.append(f"overlap top_traders {runner['mint'][:8]}: {exc}")
+                if rate_limited(exc):
+                    break
+        overlap = overlap_rank(traders, cfg)
+        for row in overlap:
+            note(row["address"], f"overlap:{row['hits']}", row["tags"])
     # Enrichment order: configured wallets due a refresh, then the backlog (tracked, never
     # enriched), then this cycle's new finds that fit the free room, then the stalest. Backlog and stale are drawn from everything tracked,
     # not only from what the feeds surfaced this cycle: a wallet discovered once and never
@@ -1703,7 +2116,11 @@ def discover_and_enrich(client: Any, cfg: ScoutConfig, known: dict[str, dict[str
         return address not in configured and (known.get(address) or {}).get("state") != "rejected"
 
     due = [a for a in configured if now - refreshed(a) >= cfg.refresh_hours * 3600]
-    fresh_new = [a for a in found if a not in known]
+    # Runner-overlap finds jump the queue: a wallet that was a top trader of several runners
+    # is the best lead a cycle produces.
+    overlap_first = [r["address"] for r in overlap if r["address"] not in configured and not refreshed(r["address"])
+                     and (known.get(r["address"]) or {}).get("state") != "rejected"]
+    fresh_new = [a for a in found if a not in known and a not in overlap_first]
     if room is not None:
         fresh_new = fresh_new[:max(0, room)]
     backlog = sorted((a for a in known if worth_enriching(a) and not refreshed(a)),
@@ -1711,7 +2128,10 @@ def discover_and_enrich(client: Any, cfg: ScoutConfig, known: dict[str, dict[str
     stale = sorted((a for a in known if worth_enriching(a) and refreshed(a)
                     and now - refreshed(a) >= cfg.refresh_hours * 3600), key=refreshed)
     queue, seen_queue = [], set()
-    for address in due + backlog + fresh_new + stale:
+    if room is not None:
+        overlap_first = [a for a in overlap_first if a in known] + [a for a in overlap_first if a not in known][:max(0, room)]
+        fresh_new = fresh_new[:max(0, room - len([a for a in overlap_first if a not in known]))]
+    for address in due + overlap_first + backlog + fresh_new + stale:
         if address and address not in seen_queue:
             seen_queue.add(address)
             queue.append(address)
@@ -1739,6 +2159,7 @@ def discover_and_enrich(client: Any, cfg: ScoutConfig, known: dict[str, dict[str
         entry.setdefault("tags", sorted(set(entry.get("feed_tags") or []) | set(entry.get("tags") or [])))
         entry.pop("feed_tags", None)
     return {"candidates": dict(found), "token_sample": seen_tokens, "units": units, "errors": errors,
+            "overlap": overlap, "runners": runners,
             "rate_limited": any(rate_limited(Exception(e)) for e in errors)}
 
 

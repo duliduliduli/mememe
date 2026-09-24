@@ -1,0 +1,298 @@
+{
+  "meta": {
+    "title": "Solana memecoin bot: full handoff for another AI agent",
+    "written": "2026-09-24",
+    "written_by": "The Claude Code agent that has maintained this repo (duliduliduli/mememe) through most of September 2026",
+    "purpose": "This is everything you need to understand what this bot is, what has been tried, what the results were, and what state it is in now. Use it to propose and build a better bot. Read 'how_to_read_this' first.",
+    "how_to_read_this": [
+      "Each fact is tagged with where it came from: 'measured' (from live logs or trade files), 'code' (true of the code on main), 'backtest' (replay or simulation, not live), 'owner' (the owner said it), or 'unknown' (no data exists or it was never collected).",
+      "Dollar amounts are USD. SOL was about $121 on 2026-09-23.",
+      "The previous agent could NOT reach the live bot directly (no Railway access, no dashboard URL). Every live number here came from logs the owner pasted into chat. The raw trade files on the Railway volume have never been analyzed. See 'data_gaps'.",
+      "Wallet addresses are given as the 8-character prefixes used in logs. The full addresses are in the COPY_WALLETS env var on Railway, not in this file."
+    ]
+  },
+
+  "tl_dr": {
+    "what_it_is": "A single-process Python bot (executor.py) that trades Solana memecoins with real money through Jupiter, deployed on Railway with a FastAPI dashboard (server.py). It has had four strategy lanes over its life: buying pump.fun graduations, a tweet-driven launch sniper, momentum 'runners', and copy-trading chosen wallets. Copy-trading is the only lane running now.",
+    "how_its_going": "Losing. The account is at about $160 (1.325 SOL) on 2026-09-23. Every strategy tried so far has lost money live or has never been properly measured. No lane has shown a positive expectancy after costs on real fills.",
+    "current_state": "Commit c818b84 on main is deployed live as of 2026-09-23 15:28 UTC. Copy lane only. The 'elite only' filter is on, so wallets are mirrored only after the wallet scout has qualified them. Zero wallets are qualified, so the bot is almost idle by design. No open positions, 15 small moon bags.",
+    "what_the_owner_wants": "Something much more aggressive that gets into memecoins going from about $200K to $1M-$4M market cap. The owner is open to dropping copy-trading entirely for sniping or aggressive coin filtering.",
+    "previous_agents_view": "The most promising untested idea already in the code is the 'runner' lane (buy graduated tokens once they grow into a $400K-$4M band with momentum). It ran for only about 2 days before copy mode replaced it and was never measured. It needs a trade-activity ('dead tape') gate and a pullback entry before it deserves money. True block-0 sniping is not viable for this setup. The account size ($160) is a real constraint: fixed costs per trade are large relative to $5-$16 positions."
+  },
+
+  "owner_profile": {
+    "goals": [
+      "Profit, and more activity. Feels the bot is 'too calm' and misses the coins that run from $200K to several million. (owner)",
+      "Willing to be aggressive: sniping, aggressive filtering, lottery-ticket sizing. (owner)",
+      "Wants fast action: 'Do it all now not in a week'. Merges to main and deploys quickly. (owner)"
+    ],
+    "context": [
+      "Also runs a separate momentum strategy on large/mid-cap crypto perps (MOM_V5, Hyperliquid, TSMOM + cross-sectional + vol targeting). It is not part of this bot. Its 2021-2025 in-sample backtest: V5-R0 CAGR ~51%, Sharpe 1.8, MDD 20-23%. R3 (the file shared) CAGR 111%, MDD 41%, over the owner's 40% limit. (owner file)",
+      "Reads trading content (CBB sniping article, TRENCHNET, WolfBrain, Moon Dev) and asks whether to adopt it. See 'external_ideas_evaluated'."
+    ],
+    "capital": {
+      "current_equity_usd": 160,
+      "current_sol": 1.3252,
+      "history": [
+        {"when": "2026-09-12", "equity_usd_from": 139, "equity_usd_to": 118, "cause": "copy lane rotation bug: 60 round trips in 6h", "source": "measured (commit 19dfa62 message)"},
+        {"when": "around 2026-09-22", "equity_usd": "about 200", "note": "positions were $16 at 8% sizing", "source": "measured"},
+        {"when": "2026-09-23", "equity_usd": 160, "source": "measured (owner and startup log)"}
+      ],
+      "initial_deposit": "unknown"
+    }
+  },
+
+  "infrastructure": {
+    "repo": "github.com/duliduliduli/mememe. Everything lives in grad-backtest/. The root Dockerfile and railway.json build it.",
+    "deploy": "Railway auto-deploys main. A persistent volume is mounted at /data (DATA_DIR). EXECUTOR_AUTOSTART=1 makes the dashboard container launch the executor. EXECUTOR_MODE=live.",
+    "language_and_tests": "Python 3. About 16,500 lines. About 460 unit tests: 'cd grad-backtest && pip install -r requirements.txt && python -m unittest'. CI runs on GitHub Actions.",
+    "external_services": {
+      "solana_rpc": "Keyless public endpoints by default (PublicNode, then api.mainnet-beta). Overridable with RPC_URLS / RPC_WS_URLS. No paid RPC. Helius was removed from the live path after 429s.",
+      "jupiter": "lite-api v1 (keyless tier) for quotes, swaps, the batched price feed and the SOL price. It rate-limits, which is why several features were throttled or turned off.",
+      "gmgn": "GMGN OpenAPI with a read-only key (free tier, 5 units/s per IP; the bot uses 2.5). Used for wallet screening and the scout. There is no wallet leaderboard endpoint; tag_rank returns 0.",
+      "geckoterminal": "Used only by the research backtester (pools and OHLCV)."
+    },
+    "key_files": {
+      "grad-backtest/executor.py": "The live bot, one loop. Discovery, entry guards, Jupiter swaps, position management, exits, moon bags, copy lane, runner lane, reconcile and rent reclaim, state persistence.",
+      "grad-backtest/scout.py": "GMGN wallet discovery, qualification gates, on-chain shadow (paper) copying of candidate wallets, promotion to live, convergence signal.",
+      "grad-backtest/gmgn.py": "GMGN client with a shared rate limiter.",
+      "grad-backtest/bundle_analysis.py": "Holder funding-graph and bundle detection.",
+      "grad-backtest/server.py": "FastAPI dashboard and API, and launches the executor, market-making and EVM processes.",
+      "grad-backtest/copy_expectancy.py": "Per-wallet expectancy report (live and shadow, plus convergence). Served at /api/copy/expectancy.",
+      "grad-backtest/grad_backtest.py, optimize.py, position_sizing.py, score_skips.py": "Research tools: graduation backtest, parameter optimizer, small-account Monte Carlo, scoring of skipped entries.",
+      "grad-backtest/mm/": "Market-making / established-meme momentum research lane (Meteora DLMM). Off in copy-only deployments.",
+      "grad-backtest/evm/": "EVM copy lane (Robinhood Chain, Base, BNB) with its own wallet. Starts only if EVM_COPY_WALLETS is set.",
+      "grad-backtest/README.md": "1,100-line reference for every env var, guard and endpoint. Treat it as the source of truth for config."
+    },
+    "data_files_on_railway_volume": {
+      "executor_state.json": "Positions, moon bags, pending exits, copy inbox, scout state.",
+      "live_trades.csv": "Every closed trade: position_usd, exit_usd, net_return, exit_reason, buy_signature, and so on.",
+      "copy_signals.csv": "Every qualifying copied-wallet buy, mirrored or not, with status and reason, and fill_signature.",
+      "skips.csv": "Every skipped opportunity and the guard that skipped it.",
+      "scout_shadow_trades.csv": "Paper trades of scouted wallets (baseline and 20 s-stress quotes).",
+      "scout_convergence.csv / scout_convergence_trades.csv": "Convergence events and their paper trades (new on 2026-09-23).",
+      "executor.log": "Full log.",
+      "note": "Files are rotated when their columns change, so older rows can be in <name>.<timestamp>.csv."
+    },
+    "dashboard_endpoints": ["/healthz (deployed commit and effective config)", "/api/live", "/api/overview", "/api/trades", "/api/errors", "/api/activity", "/api/copy/signals", "/api/copy/expectancy", "/api/scout", "/api/scout/{address}", "/api/gmgn/screen?wallets=", "/api/gmgn/traders?token=", "/api/evm", "/api/mm/status", "/logs"],
+    "controls": "PANIC=1 sells everything at boot and drains. DATA_DIR/executor.stop drains. HOLD_MINTS protects hand-bought tokens. ADMIN_TOKEN protects write endpoints."
+  },
+
+  "execution_engine": {
+    "loop": "One process, POLL_SECONDS=5. Order each cycle: exits first (manage positions), then moon bags, the rent retry queue, the copy wallet poll (every 3 s), the scout worker (on a separate thread), and discovery if that lane is enabled. MAX_ENTRIES_PER_CYCLE=1 so entries never starve exits.",
+    "latency_reality": "Polling, not streaming. A copied buy is seen about 3-10 s after it lands, then quoted, guarded and sent. Positions are re-quoted every 8 s in copy mode; a batched price feed values them and a real sell quote is taken only near a threshold. Stop-losses set at -30% have filled at -33% because prices move about 5%/s when a large holder dumps.",
+    "swaps": "Jupiter quote then swap, signed locally. Buy slippage 10%, sell 15%, with retries. Preflight at 'confirmed' commitment (fixed 2026-09-23). A confirmation timeout does not count as a failure: the wallet is checked and tokens are adopted if they landed.",
+    "sizing": "Copy-only mode: ACCOUNT_FRACTION 0.08 of the whole account per copy, MIN_POSITION_USD 5, MAX_POSITION_USD 20, up to 10 slots, MAX_DEPLOYED_FRACTION 0.80. At $160 a copy is about $12-13. Scouted wallets and convergence trade at 0.5x size.",
+    "entry_guards_general": "Price impact at most 10%. Immediate round-trip sell quote must return at least 80%. Market-cap floor $25K. Curve age at least 120 s. Top holder at most 20%. Curve transactions at least 150. Early seller at most 3%. Creator prior launches at most 3. Creator holding at most 5%. Mandatory bundle graph over 50 holders (same-slot, funding clusters, two-hop ancestry, unpaid transfers, coordinated buys, repeat cohorts, dev-linked, top-10, first-3-slot). With COPY_FAST=1 (default) copied entries skip the slow holder and bundle analysis; only the impact, round-trip and source-exit checks run.",
+    "copy_specific_guards": "Mirror only buys of at least COPY_MIN_BUY_USD ($300). Buy must be at most 90 s old. Only the wallet's FIRST buy of a coin (adds and averaging down are skipped). GMGN verdict 'skip' blocks. SCOUT_ELITE_ONLY=1 blocks any wallet not qualified or live. Source-exit guard: skip if selling the tokens the source just bought would itself move the price 30% or more.",
+    "exits_copy_lane": "Ladder: sell 30% at 1.4x and 30% at 1.8x. The remaining 40% is a runner with a 40% trail from peak and no cap. Stop-loss -30%. Once up +20%, the stop moves to breakeven. A trailing stop arms only after +30% (TRAILING_ARM_GAIN). Time stop 24h. The followed wallet selling at least 80% of its stack closes ours; a smaller sell trims ours proportionally.",
+    "moon_bags": "10% of tokens kept on WINNING exits only. Sold at 100x, or by a 40% trail once the bag reaches 3x. Burned if it falls below 10% of its kept value. Bags under $0.50 are not kept.",
+    "housekeeping": "Startup reconcile adopts orphaned tokens, sweeps dust under $0.25 and closes empty token accounts (rent is about 0.002 SOL each). Every full sell closes its account. A failed close is retried 4 times over about 3 minutes (rent_pending)."
+  },
+
+  "strategy_lanes": [
+    {
+      "name": "Graduation buyer (the original lane)",
+      "status": "OFF (COPY_ONLY=1 disables it). Code still present.",
+      "logic": "Detect pump.fun to PumpSwap migrations via RPC WebSocket plus catch-up polling. Buy ENTRY_DELAY_SECONDS=30 after migration if every guard passes. Exit at TP +75%, SL -30%, 30-min time stop. Optional trail, scale-out and moon bag.",
+      "results": {
+        "live": "One overnight session, 52 closed round trips at $5: 37% win rate, average winner +33%, average loser -32%. Break-even at that win rate needs about +56% average winners. Net negative. (measured, README section 5)",
+        "loser_profile": "Bundled launches: the creator buys the curve, graduates in seconds, and dumps into the pool within a minute. Sub-$30K entries went 1 for 7. The motivating rug (SOLL) graduated 29 s after creation with 6 buyers; the creator held 59% and sold 78% of supply 24 s after migration. (measured)",
+        "interesting": "On the overnight sample the entries above $300K cap were the best-performing bucket on closed trades, so the market-cap ceiling was turned off. (measured, small sample)"
+      },
+      "why_stopped": "Negative expectancy. Its guards were built afterwards and never got a clean second live run before the owner moved to runners and then copy trading."
+    },
+    {
+      "name": "Launch sniper (tweet-driven)",
+      "status": "REMOVED 2026-09-09 at the owner's direction (commit b4321ba).",
+      "logic": "Watched X (free syndication feed, with Grok as a paid backup) for tweeted contract addresses, including ones inside images. Bought once on any chain (Solana, Base via KyberSwap), with a 3x/6x/10x take-profit ladder and a moon bag.",
+      "results": "unknown. No trade statistics were recorded in the repo. One 'sniped bag' was recovered after a lost data directory (commit 6e08e6c)."
+    },
+    {
+      "name": "Market-making / established-meme momentum (mm/)",
+      "status": "OFF in copy-only deployments (MM_AUTOSTART unset). It shadowed on paper for a while; live mode was built but its first funded end-to-end run was never documented.",
+      "logic": "Meteora DLMM liquidity ranges plus cost-aware momentum on established memes (30+ days old, $100K+ pools), with an edge gate that accounts for all costs.",
+      "results": "unknown. Its own README concludes that at a $40 position most pools fail the edge gate and that the lane needs about $400 positions to clear fixed costs.",
+      "side_effect": "Its universe refresh quoted dozens of tokens through Jupiter's keyless tier and starved the copy lane of quotes. That is why it is off."
+    },
+    {
+      "name": "Runner lane",
+      "status": "OFF since about 2026-09-11 (COPY_ONLY=1). Code intact (executor.py around lines 2748-2830). RUNNER_ENABLED=1 is the code default but is ignored in copy-only mode.",
+      "logic": "Every graduation goes on a watchlist for 6h (max 100 tokens). Its market cap is priced every 60 s from Jupiter's batched price feed. Enter when the cap is inside $400K-$4M AND up at least 10% from its low of the last 15 min. All general entry guards run at that moment. Exits: TP +100%, SL -30%, trail 25% (armed after +30%), time stop 240 min.",
+      "results": "unknown. It ran for about 2 days (Sep 9-11) mixed with other lanes and was never measured on its own.",
+      "known_weaknesses": [
+        "The only signal is price over 60 s samples. There is no check of trade count, unique buyers or volume, so one or two buys can fake '+10% in 15 min'.",
+        "Breakout-only (chases green candles). No pullback entry.",
+        "Only watches pump.fun graduations from the last 6h. Misses tokens from other launchpads, older tokens and GMGN trending.",
+        "The band starts at $400K; the owner wants $200K."
+      ],
+      "how_to_enable_without_code": "Railway env: COPY_ONLY=0, RUNNER_ONLY=1 (no at-graduation buys), MM_AUTOSTART=0 (REQUIRED, otherwise COPY_ONLY=0 also starts the MM lane and it starves Jupiter quotes), RUNNER_MIN_MARKET_CAP_USD=200000, and small sizing."
+    },
+    {
+      "name": "Copy-trading lane (Solana)",
+      "status": "ON and the only lane trading. Nearly idle since 2026-09-23 because of SCOUT_ELITE_ONLY=1.",
+      "logic": "Poll followed wallets every 3 s and decode buys and sells from balance changes. Mirror conviction first-buys (at least $300, at most 90 s old). Follow their sells. Exits as described in execution_engine.exits_copy_lane.",
+      "configured_wallets": {
+        "EC2f5DnH": "Also the one scout 'live' wallet. Makes $5K-$19K entries into thin pools and exits before we can. Produced two -33% trades on 2026-09-23 (E8fs, DEW9). The new source-exit guard targets exactly this. (measured)",
+        "498g1rVn": "Built-in terms: min $300, half size. Bought $7,500 of CGEDT and sold everything 13 s later. A scalper we cannot follow at our latency. (measured)",
+        "F5hkYsi8": "Source of Abkkk: +2.5% plus a moon bag, peaked +37%. (measured)",
+        "CxWRfadz": "Never buys $300 or more, so it is never mirrored. Log noise. (measured)",
+        "Beqv6dzT": "GMGN rates it 'skip'; now also blocked by elite_only. (measured)"
+      },
+      "results": {
+        "first_38_positions": "Every coin that passed +56% ended a winner. 8 of 38 popped +12% to +30% and then rode down to the -30% stop. The old 3x ladder rung sold CdhZy8 before another 4.4x and HhcfXbZ2 before another 12x. (measured)",
+        "exit_replay": "Replaying the current exits (breakeven at +20%, 1.4/1.8 ladder, uncapped runner) on 1-minute candles for 28 replayable entries beat the old exits by about $40 under both a close and a harsh reading. (backtest)",
+        "2026-09-12_rotation_disaster": "60 round trips in 6h, mostly matched pairs 3 s apart: rotation sold the oldest position at -5% to -28% to chase each new $100 'spray' buy. Equity went from $139 to $118. Fixed with no rotation, a $300 minimum buy and first-buy-only. (measured)",
+        "2026-09-21": "CALI (peaked +12.6%) was sold at -18% and PHAT at -13% by a trailing stop armed from entry. Fixed with TRAILING_ARM_GAIN=0.30. (measured)",
+        "2026-09-23_08:19-14:19_UTC": "4 trades: E8fs -33% (EC2f5DnH), DEW9 -33% (EC2f5DnH), CGEDT -14% (498g1rVn), Abkkk +2.5% plus moon bag (F5hkYsi8). About -$11. (measured)",
+        "2026-09-23_full_day_realized": "About -$16.5, including HgcxVs stopped at -30.7% after peaking +18.3% (held about 20h). (measured)",
+        "since_c818b84_deploy": "No live trades (elite_only is blocking every unqualified wallet). No convergence events yet as of the last log seen. (measured)",
+        "per_wallet_expectancy": "unknown. /api/copy/expectancy exists but its output has never been seen."
+      },
+      "fundamental_problem": "Latency. The profitable wallets' edge is mostly timing and size. We see their buy 3-10 s late and their sell 3-10 s late, and for large wallets their sell is our stop. Copying works only for slow, patient wallets in liquid coins, and the scout has not found any that pass its gates."
+    },
+    {
+      "name": "Wallet scout (scout.py)",
+      "status": "ON, mode shadow with live promotion enabled.",
+      "logic": "Every few hours, pull candidate wallets from GMGN smart-money and KOL feeds and from top traders of sampled tokens. Enrich them with 7d/30d/all stats and paged history. Qualify on mandatory gates: positive P&L in every window, enough episodes/tokens/days, profit factor at least 1.5, best token at most 40% of profit, drawdown at most 25%, median hold at least 30 min, fast exits at most 10%, no wash/bundler/MEV tags (a fast track waives the leaderboard and the 14-day shadow). Candidates are paper-copied on-chain with real Jupiter quotes (baseline and +20 s stress). Qualified wallets go live at half size with a $25 loss budget each and at most 3 live.",
+      "results": {
+        "latest": "About 39 wallets in shadow, 0 qualified, 1 live (EC2f5DnH, which was promoted before the current gates). Shadow trades were mostly losers: many time-outs and stops of -31%, -42% and -51%; one +23% in a 26-trade window. (measured 2026-09-23)",
+        "cumulative": "About 200 wallets evaluated since 2026-09-22, and zero passed. (measured)"
+      },
+      "interpretation": "Wallets that look great on GMGN leaderboards mostly do not survive being copied at our latency and after our costs. The scout finds wallets, not coins, and needs days of shadow evidence, so it can never catch this week's runner."
+    },
+    {
+      "name": "Convergence signal (scout.py)",
+      "status": "ON, live at half size since 2026-09-23. Loss budget $15, at most 2 open, auto-off after 10 negative shadow trades.",
+      "logic": "When 2 or more tracked wallets from DIFFERENT relationship clusters make a qualifying first buy of the same coin within 10 min, open one position for the group. It closes when the first member fully sells. This came from the TRENCHNET article.",
+      "results": "unknown. 0 events at the last log (conv=0/0/0)."
+    },
+    {
+      "name": "EVM copy lane (evm/)",
+      "status": "Built 2026-09-11. Runs only if EVM_COPY_WALLETS is set. Whether it is running is unknown.",
+      "logic": "Same copy rules on Robinhood Chain, Base and BNB through Uniswap/KyberSwap routing, with its own wallet.",
+      "results": "unknown"
+    }
+  ],
+
+  "timeline": [
+    {"date": "2026-09-03/04", "change": "Graduation backtester, then a live/paper executor with guards, sizing, trailing stop, moon bags, reconcile and rent reclaim. Bundle and funding-cluster detection hardened over many commits. Helius removed after rate limits."},
+    {"date": "2026-09-05/06", "change": "More guards (curve activity, early dump, creator). MM research lane added with live DLMM execution."},
+    {"date": "2026-09-07", "change": "Tweet-driven launch sniper added (X feed, Grok, images, Base). MM lane briefly live by default."},
+    {"date": "2026-09-09", "change": "Sniper removed at the owner's direction. MM back to paper. Runner lane added."},
+    {"date": "2026-09-11", "change": "Copy mode added (it replaced everything else via COPY_ONLY). Ladder, sell-following, EVM copy lane. MM lane off in copy-only."},
+    {"date": "2026-09-12", "change": "Rotation disaster ($139 to $118). No rotation, $300 minimum, then 8% sizing, 10 slots, 80% cap. Moon bags winners-only."},
+    {"date": "2026-09-13 to 21", "change": "Proportional sell-following, 24h hold, per-wallet terms, PANIC, HOLD_MINTS, first-buy-only, signal recording, GMGN gate, trailing-arm fix, daily loss limit off by default."},
+    {"date": "2026-09-22", "change": "Wallet scout built (GMGN discovery, gates, shadow, promotion) plus many fixes for rate limits and backlog. New exits (breakeven, uncapped runner, moon-bag trail)."},
+    {"date": "2026-09-23", "change": "PR #109 (c818b84): rent-reclaim root-cause fix (preflight commitment), source-exit-impact guard, convergence signal live, expectancy report, SCOUT_ELITE_ONLY default 1. Deployed 15:28 UTC."}
+  ],
+
+  "lessons_learned": [
+    "Bundled launches are the dominant loser at graduation. Filtering them helps, but the filters are slow (many RPC calls) and cannot run in a copy race.",
+    "A -30% stop fills at about -33% in a dump. Plan for 3-5% worse fills than the threshold.",
+    "Memes rip or die. A coin that pops +12-30% and returns to entry is usually dying, so the breakeven stop is worth it. Coins past +56% rarely came back, so never cap the runner.",
+    "Trailing stops armed at entry sell normal pullbacks at a loss. Arm them only after a meaningful gain.",
+    "Rotation (selling a held coin to buy the next signal) destroyed capital. Churn is the enemy at this account size.",
+    "Small 'spray' buys from followed wallets are noise. Only conviction buys and first buys carry signal. Adds and averaging down lose.",
+    "Copying a wallet whose stack is large relative to the pool makes you its exit liquidity.",
+    "Scalper wallets (sell within seconds) cannot be followed at 3-10 s latency.",
+    "Moon bags on losing exits are just locked rent; winners-only bags are fine.",
+    "Keyless Jupiter and public RPC rate-limit easily. Every lane you add competes for the same quote budget. The MM lane starved the copy lane.",
+    "Restarts without a volume orphan positions. The /data volume is required.",
+    "Rent: about 0.002 SOL per token account, around 2.5% of a $16 position if it is not reclaimed. Now reclaimed.",
+    "Fixed costs dominate small positions. With 10-15% slippage tolerance, fees, rent and a 30% stop, each loser costs about $5 on a $16 position and a typical winner nets $1-3. A strategy needs rare large winners (3x+) to pay for everything.",
+    "GMGN metrics (win rate, PnL) do not transfer to copy results. Zero of about 200 wallets passed forward-looking gates.",
+    "No change has ever been judged on more than a few dozen trades. Most decisions were made on 2-8 trades, which is noise."
+  ],
+
+  "known_issues_and_open_questions": [
+    "Is the bot actually running and healthy right now? Check /healthz and /api/live.",
+    "Has convergence fired since 2026-09-23 15:28, and with what result? Check /api/scout.",
+    "What does /api/copy/expectancy say per wallet? It has never been read.",
+    "11 held tokens were unquotable (Jupiter 400) at the last startup and are left alone. Possibly dead.",
+    "15 moon bags: their current value is unknown.",
+    "EC2f5DnH is still 'live' in the scout even though its record is 2 x -33%. Consider demoting it or removing it from COPY_WALLETS.",
+    "CxWRfadz is useless (never at least $300). Remove it.",
+    "Is the EVM lane running (EVM_COPY_WALLETS set?) and what are its results?"
+  ],
+
+  "data_gaps": {
+    "summary": "The biggest problem for any next agent: the real trade history has never been analyzed as a whole. All conclusions above come from a few pasted log windows.",
+    "get_these_first": [
+      "live_trades.csv (and every rotated live_trades.*.csv)",
+      "copy_signals.csv",
+      "skips.csv (which guards block the most, and would those coins have won?)",
+      "scout_shadow_trades.csv, scout_convergence.csv, scout_convergence_trades.csv",
+      "executor_state.json (open positions, moon bags, scout state)",
+      "Output of /healthz, /api/live, /api/scout, /api/copy/expectancy"
+    ],
+    "how": "They are on the Railway volume at /data. Use Railway's shell ('railway run' / 'railway ssh') or the dashboard endpoints. The previous agent had no access; the owner has to fetch them or give access."
+  },
+
+  "external_ideas_evaluated": [
+    {"source": "CBB sniping article (2020-21 EVM mempool sniping)", "verdict": "Not transferable. Solana has no public mempool; block-0 is a Jito tip auction won by co-located bots and by the bundlers who create the token. A Python loop on Railway is orders of magnitude too slow. The lesson kept: only deploy size where there is a measured structural edge."},
+    {"source": "TRENCHNET (wallet-graph convergence)", "verdict": "Adopted as the convergence signal (independent tracked wallets buying the same coin within 10 min). Live at half size, no results yet."},
+    {"source": "WolfBrain (wallet feed, 'pack alerts', wallet DNA)", "verdict": "Already covered by the scout gates and convergence. Not built in. Suggested as a free manual second opinion on wallets."},
+    {"source": "Moon Dev (@MoonDevOnYT) desk", "verdict": "Most of it is marketing. Worth copying: (1) a dead-tape gate, e.g. require at least 10-20 trades in the last 30 s or skip; (2) a 'hit list' of launches that survive N minutes with minimum volume and holders; (3) a pullback entry: buy a 40-60% retrace from the launch high with a tiny size and a 60-min time stop; (4) tiny tickets and time stops; (5) an LLM only edits code and filters offline, never places live orders; (6) the 'Karpathy loop' (patch, backtest, keep or revert) only offline with a frozen scorer and no leverage. His own sniper is described as a lottery ticket, not proven."},
+    {"source": "Owner's MOM_V5 (TSMOM/XS momentum on majors)", "verdict": "Not portable directly (needs 60 days of history, 7.5 bp costs, shorting and funding). Possibly useful pieces: a SOL regime gate (price above its 50-day SMA and 20-day vol below its 80th percentile scales meme sizing), a kill switch (own drawdown AND a market vol spike), and a vol-scaled multi-lookback momentum exit for runners (5m/15m/1h/4h). Suggested test: split historical meme trade P&L by SOL regime at entry."}
+  ],
+
+  "candidate_directions": {
+    "note": "These are the previous agent's hypotheses, ranked. None is proven. Measure before scaling.",
+    "ranked": [
+      {
+        "idea": "Runner lane v2 ('hit list + tape gate + two entries')",
+        "why": "Directly targets what the owner wants ($200K to $4M runners), is coin-first rather than wallet-first, and most of the code exists.",
+        "design": [
+          "Universe: every pump.fun graduation plus GMGN trending tokens plus optionally other launchpads (Bonk/LetsBonk, Meteora DBC). Keep a hit list of tokens that survive N minutes past graduation with minimum volume, holder count and holder growth.",
+          "Dead-tape gate: at least X swaps and Y unique buyers in the last 30-60 s, buy/sell ratio, and volume not collapsing. Skip otherwise. Needs a trade feed: GMGN token endpoints, Birdeye, GeckoTerminal trades, or decoding pool transactions over RPC. Pick the cheapest one that is fast enough.",
+          "Entry A (breakout): cap inside $200K-$4M and above its recent low with the tape alive.",
+          "Entry B (pullback): 40-60% off the post-graduation high while the tape is still alive and holders are not collapsing. Time stop about 60 min.",
+          "Keep the bundle, top-holder, dev and impact/round-trip guards (they are the hard-won part). Consider running the slow bundle graph once when a token joins the hit list, so the entry path stays fast.",
+          "Exits: reuse the copy exits (breakeven after +20%, 1.4/1.8 ladder, uncapped 40% trail runner, moon bag), plus a time stop."
+        ],
+        "sizing": "Lottery tickets: $5-8 each, a hard daily loss limit of about $20, at most 3-5 open.",
+        "how_to_validate": "First replay the rules on recent graduations with 1-minute OHLCV (grad_backtest.py can be extended) with realistic costs: 1-3% per side plus impact. Then run live at minimum size and read the expectancy after 50+ trades, not 5."
+      },
+      {
+        "idea": "Keep copy plus convergence running, but slim",
+        "why": "It costs nothing while idle. Convergence is untested but plausible.",
+        "actions": "Remove CxWRfadz. Demote EC2f5DnH. Read /api/copy/expectancy after about 30 convergence trades and kill it if negative."
+      },
+      {
+        "idea": "Market-regime gate over all meme lanes",
+        "why": "Memes are high-beta to SOL and to risk appetite. It is cheap and hard to overfit.",
+        "test": "Tag historical trades with the SOL regime at entry (50-day SMA and vol percentile) and compare P&L."
+      },
+      {
+        "idea": "Mine skips.csv",
+        "why": "It shows which guard blocks the most tokens and whether those tokens would have won. That tells you which guards cost more than they save."
+      },
+      {
+        "idea": "Speed: WebSocket/Geyser or a paid RPC plus Jito bundles",
+        "why": "Every lane suffers from 3-10 s latency. This is a cost decision: a paid RPC is about $50+/month, which is a big fraction of a $160 account."
+      }
+    ],
+    "not_recommended": [
+      "Block-0 / launch sniping on pump.fun (a Jito tip war against the token creators' own bundles).",
+      "Bigger size or leverage before any lane shows positive expectancy on 50+ trades.",
+      "An LLM in the live order path."
+    ]
+  },
+
+  "hard_constraints": [
+    "Real money, burner wallet, about $160. Never log or commit the private key (WALLET_PRIVATE_KEY is a Railway env var only).",
+    "main auto-deploys to live. Run the unit tests before merging. Owner-facing config changes happen in Railway env vars.",
+    "Keyless Jupiter and public RPC budgets are shared by every lane. Adding a lane can starve exits. Exits must always run first.",
+    "The /data volume holds state. Do not change state schemas without migration, and CSVs rotate when columns change.",
+    "Never sell HOLD_MINTS. PANIC=1 is the emergency stop."
+  ],
+
+  "suggested_first_steps_for_next_agent": [
+    "1. Get the data in 'data_gaps' and compute the real per-lane and per-wallet expectancy after costs, including every rotated CSV. Everything else depends on this.",
+    "2. Read /healthz to learn the actual live config (env overrides differ from code defaults).",
+    "3. Decide with the owner: keep copy as a slim background lane, and build runner lane v2 as the main aggressive lane.",
+    "4. Backtest runner v2 on recent graduations before spending money, with honest costs and without look-ahead.",
+    "5. Go live at $5-8 tickets with a daily loss cap and judge only after 50+ trades."
+  ]
+}
