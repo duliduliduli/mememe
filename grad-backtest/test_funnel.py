@@ -124,6 +124,16 @@ class FunnelTests(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertIn("sniper", why)
 
+    def test_a_rejected_wallet_opens_no_new_paper_trades(self):
+        executor, ex = self.setup()
+        cand = self.seed(ex, OTHER, state="shadow")
+        self.buy(ex.scout, OTHER, "before")
+        self.assertEqual(len(ex.scout.st["positions"]), 1)
+        cand["state"] = "rejected"
+        self.buy(ex.scout, OTHER, "after", mint="Other")
+        self.assertEqual(len(ex.scout.st["positions"]), 1)                     # the open one still follows its sells
+        self.assertNotIn("Other", ex.scout.st.get("recent_buys") or {})
+
     # -- promote / demote ---------------------------------------------------------------------
     def test_a_configured_wallet_red_after_ten_fills_is_demoted_and_its_sells_still_followed(self):
         executor, ex = self.setup()

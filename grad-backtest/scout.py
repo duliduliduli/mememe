@@ -1327,6 +1327,11 @@ class ScoutLane:
     def shadow_handle_buy(self, wallet: str, sig: str, block_time: Any, swap: dict[str, Any], usd: float, age: float, sol_price: float) -> None:
         ex, cfg = self.ex, self.ex.cfg
         mint = swap["mint"]
+        if self.state_of(wallet) == "rejected":
+            # A rejected wallet (sniper farm, bad tags) is still polled while a paper position of
+            # its own is open, so that position can follow its sells; it opens nothing new and
+            # never counts toward confluence.
+            return
         base = {"wallet": wallet, "mint": mint, "signature": sig, "source_usd": round(usd)}
         minimum = float(cfg.copy_wallet_min_usd.get(wallet, cfg.copy_min_buy_usd))
         if usd < minimum:
