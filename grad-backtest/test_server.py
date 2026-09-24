@@ -183,6 +183,23 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class ScoutFunnelEndpointTests(unittest.TestCase):
+    def test_scout_report_carries_the_funnel_and_jev_counts(self):
+        import json as _json
+        client = TestClient(server.app)
+        state = {"scout": {"candidates": {"W1": {"address": "W1", "state": "shadow", "evaluation": {"failed": ["hold_time"]}}},
+                           "trades": [{"wallet": "W1", "closed_ts": 1, "pnl_base": 1.5, "pnl_stress": 1.0}]},
+                 "jev": {"calls": 3, "buy": 1, "skip": 2}}
+        with patch.object(server, "EXECUTOR_STATE", Path(os.environ["DATA_DIR"]) / "funnel_state.json"):
+            server.EXECUTOR_STATE.write_text(_json.dumps(state))
+            body = client.get("/api/scout").json()
+        self.assertEqual(body["gate_failures"], {"hold_time": 1})
+        self.assertEqual(body["funnel"]["watchlist"]["size"], 1)
+        self.assertEqual(body["funnel"]["paper_pnl_by_wallet"][0]["net_base_usd"], 1.5)
+        self.assertEqual(body["funnel"]["jev"], {"calls": 3, "buy": 1, "skip": 2})
+        self.assertIn("jev", client.get("/healthz").json())
+
+
 class ExpectancyEndpointTests(unittest.TestCase):
     def test_expectancy_endpoint_reads_the_data_dir(self):
         client = TestClient(server.app)

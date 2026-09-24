@@ -14,6 +14,7 @@ os.environ.setdefault("DATA_DIR", tempfile.mkdtemp(prefix="grad-scout-test-"))
 os.environ["SCOUT_FAST_TRACK"] = "0"
 os.environ["GMGN_UNITS_PER_SECOND"] = "100000"      # the shared GMGN limiter never waits in tests
 os.environ["SCOUT_LIVE"] = "0"                      # promotion is on in production; tests that need it set it explicitly
+os.environ["SCOUT_OVERLAP"] = "0"                   # runner overlap calls GeckoTerminal; its own tests mock it
 
 import scout
 from test_copy import MINT, OTHER, SOL, WALLET, WSOL, fresh, tx
@@ -279,14 +280,22 @@ class ConfigTests(unittest.TestCase):
             cfg = scout.ScoutConfig()
             self.assertEqual(cfg.mode, "shadow")
             self.assertTrue(cfg.live)                                             # promotion on: fast track + tripwire + budget guard it
-            self.assertTrue(cfg.elite_only)                                       # unproven configured wallets are not copied
-            self.assertFalse(cfg_with(SCOUT_ELITE_ONLY="0").elite_only)
+            self.assertFalse(cfg.elite_only)                                      # the funnel's live-set rules replace it
+            self.assertTrue(cfg_with(SCOUT_ELITE_ONLY="1").elite_only)
             self.assertTrue(cfg.convergence)
             self.assertEqual(cfg.convergence_min_wallets, 2)
-            self.assertEqual(cfg.convergence_window_seconds, 600.0)
-            self.assertEqual(cfg.max_live, 3)
-            self.assertEqual(cfg.live_size, 0.5)
-            self.assertEqual(cfg.max_open_positions, 3)
+            self.assertEqual(cfg.convergence_window_seconds, 180.0)
+            self.assertEqual(cfg.max_live, 40)
+            self.assertEqual(cfg.live_copy_max, 40)
+            self.assertEqual(cfg.watchlist_max, 400)
+            self.assertEqual(cfg.max_candidates, 400)
+            self.assertEqual(cfg.live_size, 1.0)
+            self.assertEqual(cfg.max_open_positions, 0)
+            self.assertEqual(cfg.min_median_hold_minutes, 5.0)
+            self.assertEqual(cfg.promote_min_paper_fills, 8)
+            self.assertEqual(cfg.demote_after_live_fills, 10)
+            self.assertEqual(cfg.demote_idle_days, 7.0)
+            self.assertEqual(cfg.copy_watch_only, ("EC2f5DnH", "498g1rVn", "CxWRfadz"))
             self.assertEqual(cfg.live_loss_budget_usd, 25.0)
             self.assertTrue(cfg.fast_track)
             self.assertEqual(cfg.fast_track_min_history_days, 15.0)
@@ -329,14 +338,16 @@ class LaneTests(unittest.TestCase):
         executor, ex = self.make(SCOUT_LIVE="1", SCOUT_LIVE_LOSS_BUDGET_USD="50")
         self.seed(ex, OTHER, state="shadow")
         ex.scout.st["candidates"][OTHER]["rank_snapshots"] = []
+        ex.scout.st["trades"] = []                                                # no paper route either
+        ex.scout.cfg.fast_track = False                                           # full policy: the leaderboard gate is missing
         ex.scout.evaluate_all()
         self.assertEqual(ex.scout.st["candidates"][OTHER]["state"], "shadow")
         self.assertEqual(ex.scout.live_wallets(), {})
         self.assertEqual(ex.followed_wallets(), [WALLET])
-        self.assertIn("no wallet passes every mandatory gate", ex.scout.st["last_selection"]["reason"])
+        self.assertIn("has a route into the live set yet", ex.scout.st["last_selection"]["reason"])
 
     def test_promotion_needs_switch_and_budget(self):
-        executor, ex = self.make(SCOUT_LIVE_LOSS_BUDGET_USD="0")                 # SCOUT_LIVE unset, budget cleared
+        executor, ex = self.make(SCOUT_LIVE_LOSS_BUDGET_USD="0", SCOUT_LIVE_SIZE="0.5")  # SCOUT_LIVE unset, budget cleared
         self.seed(ex, OTHER, state="shadow")
         ex.scout.evaluate_all()
         self.assertEqual(ex.scout.st["candidates"][OTHER]["state"], "qualified")
@@ -391,11 +402,13 @@ class LaneTests(unittest.TestCase):
     def test_demotion_when_a_gate_stops_passing(self):
         executor, ex = self.make(SCOUT_LIVE="1", SCOUT_LIVE_LOSS_BUDGET_USD="50")
         cand = self.seed(ex, OTHER, state="live")
+        ex.scout.st["trades"] = []                                                # the paper route is not holding it either
         cand["stats"]["7d"]["realized_profit"] = -5.0
         ex.scout.evaluate_all()
         self.assertEqual(cand["state"], "paused")
         self.assertIn("pnl_7d", cand["lifecycle"][-1]["reason"])
         cand["stats"]["7d"]["realized_profit"] = 50.0
+        ex.scout.st["trades"] = good_shadow_trades(OTHER, time.time() - 3 * DAY)  # history route again (its shadow gates)
         ex.scout.evaluate_all()
         self.assertEqual(cand["state"], "paused")                                 # requalification cooldown
         cand["demoted_ts"] = time.time() - 2 * DAY
@@ -404,7 +417,7 @@ class LaneTests(unittest.TestCase):
 
     # -- the production copy lane ----------------------------------------------------------
     def test_scouted_live_wallet_is_copied_at_reduced_size(self):
-        executor, ex = self.make(SCOUT_LIVE="1", SCOUT_LIVE_LOSS_BUDGET_USD="50")
+        executor, ex = self.make(SCOUT_LIVE="1", SCOUT_LIVE_LOSS_BUDGET_USD="50", SCOUT_LIVE_SIZE="0.5")
         self.seed(ex, OTHER, state="live")
         entered = []
         ex.enter_with_retry = lambda item, sol_price: entered.append(item)
@@ -687,7 +700,7 @@ class LaneTests(unittest.TestCase):
         self.assertIn("pnl_7d", cand["evaluation"]["failed"])
 
     def test_fast_track_promotes_with_switch_and_budget_and_tripwire_pauses(self):
-        executor, ex = self.make(SCOUT_FAST_TRACK="1", SCOUT_LIVE="1")            # budget defaults to 25
+        executor, ex = self.make(SCOUT_FAST_TRACK="1", SCOUT_LIVE="1", SCOUT_LIVE_SIZE="0.5")  # budget defaults to 25
         cand = self.seed(ex, OTHER, state="shadow")
         cand["rank_snapshots"], cand["holdings"] = [], None
         ex.scout.st["trades"] = []
@@ -1232,7 +1245,7 @@ class ConvergenceLiveTests(unittest.TestCase):
         self.assertEqual(ex.scout.st["convergence_events"][-1]["live"], "bought")
         self.assertNotIn(scout.CONVERGENCE, ex.followed_wallets())            # not a wallet to poll
         full = next(p for p in ex.scout.st["positions"] if p["wallet"] == OTHER)["size_usd"]   # the usual copy size
-        self.assertAlmostEqual(live[0]["position_usd"], max(ex.cfg.min_position_usd, round(full * 0.5, 2)), delta=0.01)
+        self.assertAlmostEqual(live[0]["position_usd"], max(ex.cfg.min_position_usd, round(full * ex.scout.cfg.convergence_live_size, 2)), delta=0.01)
         ex.scout.shadow_follow_sell(OTHER, MINT, 0.3, SOL, "trim")             # a trim keeps it
         self.assertEqual(len([p for p in ex.state["positions"] if p.get("convergence")]), 1)
         ex.scout.shadow_follow_sell(OTHER, MINT, 1.0, SOL, "out")

@@ -142,11 +142,19 @@ def healthz() -> dict[str, Any]:
                 "COPY_SELL_SCOPE", "COPY_GMGN_GATE", "COPY_ROTATE", "COPY_TIME_STOP_MINUTES", "COPY_LADDER", "HOLD_MINTS",
                 "DAILY_LOSS_LIMIT_USD", "PANIC", "COPY_RUNNER_TRAIL", "COPY_BREAKEVEN_ARM", "COPY_BREAKEVEN_FLOOR",
                 "MOON_BAG_TRAIL", "MOON_BAG_TRAIL_ARM_X", "SCOUT_MODE", "SCOUT_LIVE", "SCOUT_ELITE_ONLY", "SCOUT_MAX_LIVE",
-                "SCOUT_LIVE_SIZE", "SCOUT_LIVE_LOSS_BUDGET_USD"]
+                "SCOUT_LIVE_SIZE", "SCOUT_LIVE_LOSS_BUDGET_USD", "MAX_POSITION_USD", "COPY_MIN_SOURCE_USD",
+                "SCOUT_MIN_MEDIAN_HOLD_MINUTES", "WATCHLIST_MAX", "LIVE_COPY_MAX", "CONFLUENCE_K", "CONFLUENCE_WINDOW_SEC",
+                "CONFLUENCE_MIN_SOURCE_USD", "CONFLUENCE_MAX_AGE_SEC", "SNIPER_MAX_HOLD_SEC", "PROMOTE_MIN_PAPER_FILLS",
+                "DEMOTE_AFTER_LIVE_FILLS", "DEMOTE_IDLE_DAYS", "COPY_WATCH_ONLY", "SCOUT_OVERLAP", "JEV_ENABLED",
+                "JEV_FAIL_OPEN", "JEV_PROVIDER", "JEV_MODEL", "JEV_BUY_MIN_P", "JEV_SELL_MIN_P", "JEV_DUMP_MAX",
+                "JEV_TIMEOUT_MS", "JEV_MAX_CALLS_PER_MIN", "JEV_EXIT_ENABLED"]
+    import jev
+    jev_cfg = jev.JevConfig()
     return {"status": "ok", "commit": os.getenv("RAILWAY_GIT_COMMIT_SHA", "unknown"),
             "settings": {k: os.getenv(k) for k in settings if os.getenv(k) is not None},
             "copy_wallets": [w.strip()[:8] + "…" for w in os.getenv("COPY_WALLETS", "").replace("\n", ",").split(",") if w.strip()],
-            "gmgn_key_set": bool(os.getenv("GMGN_API_KEY", "").strip())}
+            "gmgn_key_set": bool(os.getenv("GMGN_API_KEY", "").strip()),
+            "jev": jev_cfg.describe()}
 
 
 @app.get("/")
@@ -511,6 +519,15 @@ def copy_expectancy() -> JSONResponse:
     return JSONResponse(ce.expectancy(DATA_DIR))
 
 
+def _executor_state() -> dict[str, Any]:
+    if not EXECUTOR_STATE.exists():
+        return {}
+    try:
+        return json.loads(EXECUTOR_STATE.read_text())
+    except Exception:
+        return {}
+
+
 def _scout_state() -> dict[str, Any]:
     if not EXECUTOR_STATE.exists():
         return {}
@@ -526,7 +543,9 @@ def scout_report() -> JSONResponse:
     history and shadow metrics, relationships and the last live selection. Built from the
     executor's persisted state; nothing here can promote or trade."""
     import scout
-    return JSONResponse(scout.candidate_report(_scout_state(), scout.ScoutConfig(), time.time()))
+    st, cfg, now = _scout_state(), scout.ScoutConfig(), time.time()
+    return JSONResponse({**scout.candidate_report(st, cfg, now),
+                         "funnel": scout.funnel_report(st, cfg, now, None, _executor_state().get("jev"))})
 
 
 @app.get("/api/scout/{address}")

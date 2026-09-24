@@ -153,7 +153,7 @@ class SolPriceTests(unittest.TestCase):
 
 class DeploymentCapTests(unittest.TestCase):
     def test_size_is_a_share_of_the_whole_account_and_stops_at_the_cap(self):
-        executor, p = fresh(PAPER_BALANCE_USD="40")            # $40 free
+        executor, p = fresh(PAPER_BALANCE_USD="40", MAX_POSITION_USD="20")   # $40 free; sizing formula, not the funnel cap
         self.addCleanup(p.stop)
         ex = executor.Executor(executor.Config())
         ex.state["paper_balance_usd"] = 40.0
@@ -177,7 +177,7 @@ class DeploymentCapTests(unittest.TestCase):
 
 class WalletSizeTests(unittest.TestCase):
     def test_a_wallet_copied_at_half_size_gets_half_the_position(self):
-        executor, p = fresh(PAPER_BALANCE_USD="200", COPY_WALLETS=f"{WALLET}:300:0.5, {OTHER}")
+        executor, p = fresh(PAPER_BALANCE_USD="200", COPY_WALLETS=f"{WALLET}:300:0.5, {OTHER}", MAX_POSITION_USD="20")
         self.addCleanup(p.stop)
         ex = executor.Executor(executor.Config())
         ex.state["paper_balance_usd"] = 200.0                     # $200 equity: 8% is $16

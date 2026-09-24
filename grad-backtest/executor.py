@@ -387,6 +387,12 @@ class Config:
             self.max_concurrent = 10
         if self.copy_only and os.getenv("ACCOUNT_FRACTION") is None:
             self.account_fraction = 0.08
+        # The copy funnel trades many small tickets: at most $8 a copy and a $10 daily stop,
+        # which counts open positions' unrealized loss as well as realized P&L.
+        if self.copy_only and os.getenv("MAX_POSITION_USD") is None:
+            self.max_position_usd = 8.0
+        if self.copy_only and os.getenv("DAILY_LOSS_LIMIT_USD") is None:
+            self.daily_loss_limit_usd = 10.0
         # Copy-only sizing: 8% of the whole account (free SOL plus open positions) per copy, up
         # to ten at once, and never more than MAX_DEPLOYED_FRACTION of the account in positions.
         self.max_deployed_fraction = min(1.0, max(0.1, float(os.getenv("MAX_DEPLOYED_FRACTION", "0.80"))))
@@ -399,11 +405,13 @@ class Config:
         self.price_first_valuation = os.getenv("PRICE_FIRST_VALUATION", "1") == "1"
         self.price_first_margin_pct = float(os.getenv("PRICE_FIRST_MARGIN_PCT", "8"))
         self.copy_poll_seconds = max(1.0, float(os.getenv("COPY_POLL_SECONDS", "3")))
+        # Wallets polled per round when the live set is larger (0: all every round).
+        self.copy_poll_wallets_per_poll = int(os.getenv("COPY_POLL_WALLETS_PER_POLL", "10"))
         # Followed wallets scatter $3-$10 probe buys between their real entries; mirroring a
         # probe with a full-size position would out-bet the wallet itself. $50 skips the probes.
         # $300: only a wallet's conviction buys. Its $10-$100 sprays drove 60 round trips in
         # six hours, each paying the buy and sell slippage on a coin that did not move.
-        self.copy_min_buy_usd = float(os.getenv("COPY_MIN_BUY_USD", "300"))
+        self.copy_min_buy_usd = float(os.getenv("COPY_MIN_SOURCE_USD") or os.getenv("COPY_MIN_BUY_USD", "300"))
         self.copy_follow_sells = os.getenv("COPY_FOLLOW_SELLS", "1") == "1"
         # Mirror only a wallet's FIRST buy of a coin (its stack before the swap was empty, or
         # dust under COPY_ADD_DUST_RATIO of what it just bought). A buy into a coin it already
@@ -601,6 +609,9 @@ def save_state(state: dict[str, Any]) -> None:
     tmp = STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, indent=2))
     tmp.replace(STATE_FILE)
+
+
+JEV_CALL_COLUMNS = ["ts", "key", "questions", "route", "latency_ms", "input_tokens", "output_tokens", "answers", "error"]
 
 
 def roll_daily(state: dict[str, Any]) -> None:
@@ -2474,6 +2485,16 @@ class Executor:
             self.scout = scout.ScoutLane(self)
         except Exception as exc:
             log(f"WARN scout lane unavailable: {describe_error(exc)}")
+        # Jev (TypeSafe's decision model) as a second vote on copy entries, after every hard
+        # filter; see jev.py. Its counters live in the state so /api/scout can show them.
+        self.jev: Any = None
+        try:
+            import jev
+            self.jev = jev.Jev(jev.JevConfig(), stats=self.state.setdefault("jev", {}), log=log,
+                               record=lambda row: _append_row(DATA_DIR / "jev_calls.csv", JEV_CALL_COLUMNS,
+                                                              {**row, "ts": utc_iso(row["ts"])}))
+        except Exception as exc:
+            log(f"WARN Jev gate unavailable: {describe_error(exc)}")
 
     # ---- followed wallets -------------------------------------------------
     def followed_wallets(self) -> list[str]:
@@ -2522,15 +2543,16 @@ class Executor:
             return float(terms.get("min_usd") or cfg.copy_min_buy_usd), float(terms.get("size") or 1.0), True
         return cfg.copy_min_buy_usd, 1.0, True
 
-    def note_copy_pnl(self, source: dict[str, Any], pnl: float) -> None:
+    def note_copy_pnl(self, source: dict[str, Any], pnl: float, closed: bool = False) -> None:
         """Realized P&L of a position (or its moon bag) copied from a wallet, reported to the
-        scout for the per-wallet live loss budget."""
+        scout for the per-wallet live book: the loss budget and the demotion rule, which counts
+        `closed` positions as our fills from that wallet."""
         scout = getattr(self, "scout", None)
         wallet = source.get("copy")
         if scout is None or not wallet:
             return
         try:
-            scout.note_live_pnl(wallet, float(pnl))
+            scout.note_live_pnl(wallet, float(pnl), closed=closed)
         except Exception as exc:
             log(f"WARN scout pnl note: {describe_error(exc)}")
 
@@ -2560,6 +2582,18 @@ class Executor:
             return float(self.state["paper_balance_usd"])
         spendable = max(0.0, self.rpc.sol_balance(self.wallet.pubkey) - self.cfg.min_sol_reserve)
         return spendable * sol_price
+
+    def daily_pnl_usd(self) -> float:
+        """What the daily stop measures: today's realized P&L plus the unrealized loss of every
+        open position (a position under water counts now, not only once it is sold; open gains
+        do not offset realized losses). Kept in the state file, so a restart does not reset it."""
+        realized = float(self.state["daily"]["realized_pnl_usd"])
+        unrealized = 0.0
+        for p in self.state.get("positions") or []:
+            value, basis = p.get("last_value_usd"), p.get("position_usd")
+            if value is not None and basis is not None and not p.get("adopted"):
+                unrealized += min(0.0, float(value) - float(basis))
+        return round(realized + unrealized, 4)
 
     def deployed_usd(self) -> float:
         """Current value of every open position (last mark, else its basis)."""
@@ -2872,7 +2906,7 @@ class Executor:
         self.copy_retry_pending_exits(sol_price)
         self.copy_retry_unresolved(sol_price, allow_buys)
         seen_all = self.state.setdefault("copy_seen", {})
-        for wallet in wallets:
+        for wallet in self.copy_poll_round(wallets):
             seen = seen_all.setdefault(wallet, [])
             baselined = self.state.setdefault("copy_baselined", [])
             try:
@@ -2912,6 +2946,24 @@ class Executor:
                 self.copy_fetch_and_handle(wallet, entry["signature"], entry.get("blockTime"), sol_price, allow_buys)
             if inbox:
                 log(f"COPY {wallet[:8]}: {len(inbox)} discovered event(s) still queued for the next poll")
+
+    def copy_poll_round(self, wallets: list[str]) -> list[str]:
+        """The followed wallets polled this round. Up to COPY_POLL_WALLETS_PER_POLL all of them
+        (the old behaviour); beyond that, wallets we hold a position from first (their sells
+        are our exits), then the rest in rotation, so a live set of 40 costs the RPC the same
+        per second as ten."""
+        per = self.cfg.copy_poll_wallets_per_poll
+        if per <= 0 or len(wallets) <= per:
+            return wallets
+        held = {p.get("copy") for p in self.state.get("positions") or []} | {w for p in self.state.get("positions") or []
+                                                                             for w in (p.get("convergence_wallets") or [])}
+        out = [w for w in wallets if w in held][:per]
+        rest = [w for w in wallets if w not in out]
+        cursor = int(self.state.get("copy_poll_cursor") or 0) % max(1, len(rest))
+        ring = rest[cursor:] + rest[:cursor]
+        take = ring[: max(1, per - len(out))]
+        self.state["copy_poll_cursor"] = (cursor + len(take)) % max(1, len(rest))
+        return out + take
 
     def copy_fetch_rows(self, wallet: str, seen: list[str], baselined: bool) -> list[dict[str, Any]]:
         """The wallet's newest signatures, paging back (a few pages per poll) until a signature
@@ -2995,10 +3047,32 @@ class Executor:
         usd = swap["sol"] * sol_price + swap.get("stable_usd", 0.0)
         mint = swap["mint"]
         age = now_ts() - int(block_time) if block_time else 0.0
+        scout = getattr(self, "scout", None)
+        if scout is not None:
+            try:
+                scout.note_source_trade(wallet, block_time)
+            except Exception as exc:
+                log(f"WARN scout trade note: {describe_error(exc)}")
         if swap["side"] == "sell":
             if cfg.copy_follow_sells:
                 self.copy_handle_sell(wallet, sig, block_time, mint, float(swap.get("fraction") or 1.0), usd, age, sol_price)
             return
+        try:
+            self.copy_handle_buy(wallet, sig, block_time, swap, usd, age, sol_price, allow_buys)
+        finally:
+            # Every first buy of a followed wallet is watchlist evidence too: after the lone
+            # copy has had its turn (one position per coin), it may complete a confluence.
+            if scout is not None and allow_buys:
+                try:
+                    scout.note_confluence_buy(wallet, sig, block_time, swap, usd, sol_price)
+                except Exception as exc:
+                    log(f"WARN confluence: {describe_error(exc)}")
+
+    def copy_handle_buy(self, wallet: str, sig: str, block_time: Any, swap: dict[str, Any], usd: float, age: float,
+                        sol_price: float, allow_buys: bool) -> None:
+        """A followed wallet's buy, copied on its own when it passes every gate."""
+        cfg = self.cfg
+        mint = swap["mint"]
         if age > cfg.copy_max_tx_age_seconds:
             log(f"COPY {wallet[:8]}: buy of {mint} is {age:.0f}s old; too late to mirror")
             return
@@ -3041,7 +3115,7 @@ class Executor:
             allowed, why = self.scout.entry_allowed(wallet)
             if not allowed:
                 log(f"COPY {wallet[:8]} bought {mint} for ${usd:,.0f}; {why}; not mirrored (sells still followed)")
-                blocked("elite_only")
+                blocked(why.split(":")[0] or "elite_only")
                 return
         if verdict == "skip" and cfg.copy_gmgn_gate == "enforce":
             if self.gmgn_verdict_stale(verdict_row):
@@ -3208,7 +3282,7 @@ class Executor:
         if not cfg.copy_rotate:
             log(f"COPY {mint}: all {cfg.max_concurrent} slots full and COPY_ROTATE=0; skipped")
             return False
-        if cfg.daily_loss_limit_usd > 0 and float(self.state["daily"]["realized_pnl_usd"]) <= -cfg.daily_loss_limit_usd:
+        if cfg.daily_loss_limit_usd > 0 and self.daily_pnl_usd() <= -cfg.daily_loss_limit_usd:
             log(f"COPY {mint}: daily loss limit reached; not rotating")
             return False
         # Adopted positions were bought before this process started, so they are the oldest.
@@ -3422,6 +3496,72 @@ class Executor:
             log(f"COPY {item['copy'][:8]}: selling its {mint} stack would move the price {impact:.1f}%")
         return impact
 
+    def jev_entry_vote(self, mint: str, item: dict[str, Any], size_usd: float, tokens: int, impact: float | None,
+                       round_trip_pct: float, source_exit_impact: float | None) -> str:
+        """Jev's vote on a copy entry that passed every hard filter. Returns a skip reason, or
+        "" to go ahead. Only copied and confluence entries are asked; with no key the gate is
+        off; no decision (timeout, error, rate cap) skips unless JEV_FAIL_OPEN=1."""
+        gate = getattr(self, "jev", None)
+        if gate is None or not item.get("copy") or not gate.cfg.active:
+            return ""
+        supply_raw = None
+        try:
+            _ui, _decimals, supply_raw = self.rpc.token_supply_details(mint)
+        except Exception:
+            pass
+        wallets = item.get("convergence_wallets") or []
+        scout = getattr(self, "scout", None)
+        source = item.get("copy")
+        book = ((scout.st.get("live") or {}).get(source) if scout is not None else None) or {}
+        state = {
+            "mint": mint,
+            "mcap_usd": round(size_usd * int(supply_raw) / tokens) if supply_raw and tokens else None,
+            "source_wallet": source if source != "convergence" else None,
+            "source_buy_usd": item.get("copy_buy_usd"),
+            "source_age_sec": round(now_ts() - float(item.get("graduated_ts") or now_ts())),
+            "wallets_hit": len(wallets) if wallets else 1,
+            "window_sec": item.get("convergence_spread_s"),
+            "our_ticket_usd": round(size_usd, 2),
+            "our_impact_bps": round(impact * 100) if impact is not None else None,
+            "round_trip_pct": round(round_trip_pct, 1),
+            "source_exit_impact_pct": round(source_exit_impact, 1) if source_exit_impact is not None else None,
+            "our_fills_from_source": book.get("fills"),
+            "our_net_usd_from_source": book.get("realized_pnl_usd"),
+        }
+        decision, detail = gate.entry({k: v for k, v in state.items() if v is not None}, mint)
+        log(f"JEV {mint}: {decision} ({detail})")
+        if decision == "buy":
+            return ""
+        if decision == "no_decision" and gate.cfg.fail_open:
+            log(f"JEV {mint}: no decision; JEV_FAIL_OPEN=1 so the hard filters decide")
+            return ""
+        return f"jev: {detail}" if decision == "skip" else "jev: no decision (JEV_FAIL_OPEN=0)"
+
+    def jev_exit_review(self, sol_price: float) -> None:
+        """Opt-in (JEV_EXIT_ENABLED=1): ask Jev hold-or-sell for each copied position at most
+        every JEV_EXIT_CHECK_SECONDS; a confident sell closes it. Every other exit still runs
+        on its own; this can only close a position earlier."""
+        gate = getattr(self, "jev", None)
+        if gate is None or not gate.cfg.active or not gate.cfg.exit_enabled:
+            return
+        for pos in list(self.state["positions"]):
+            if not pos.get("copy") or now_ts() - float(pos.get("jev_checked_ts") or 0) < gate.cfg.exit_check_seconds:
+                continue
+            pos["jev_checked_ts"] = now_ts()
+            basis, value = float(pos.get("position_usd") or 0), float(pos.get("last_value_usd") or pos.get("position_usd") or 0)
+            state = {"mint": pos["mint"], "held_minutes": round((now_ts() - float(pos.get("opened_ts") or now_ts())) / 60, 1),
+                     "return_pct": round((value / basis - 1) * 100, 1) if basis else None,
+                     "peak_return_pct": round((float(pos.get("peak_usd") or basis) / basis - 1) * 100, 1) if basis else None,
+                     "ladder_rungs_sold": sum(1 for r in pos.get("ladder") or [] if r.get("done")),
+                     "source_wallet": pos.get("copy") if pos.get("copy") != "convergence" else None}
+            decision, detail = gate.exit({k: v for k, v in state.items() if v is not None}, pos["mint"])
+            if decision == "sell":
+                log(f"JEV {pos['mint']}: sell ({detail}); closing")
+                try:
+                    self.close_position(pos, "jev_sell", sol_price)
+                except Exception as exc:
+                    log(f"WARN jev sell {pos['mint']}: {describe_error(exc)}")
+
     def try_enter(self, item: dict[str, Any], sol_price: float) -> None:
         if item["mint"] in self.cfg.hold_mints:
             self.skip(item["mint"], "in HOLD_MINTS (held by hand, never traded)")
@@ -3433,7 +3573,7 @@ class Executor:
             "seconds_after_graduation": round(since_graduation),
             "in_boost_window": since_graduation <= self.cfg.boost_window_seconds,
         }
-        daily_pnl = float(self.state["daily"]["realized_pnl_usd"])
+        daily_pnl = self.daily_pnl_usd()
         # Adopted bags are money already in the market, not a choice we are making now, so they
         # do not take an entry slot: three $2 leftovers must not block every new graduation.
         # In copy-only mode they do count: a redeploy must not let the book grow past the slots.
@@ -3574,6 +3714,10 @@ class Executor:
                 f">= {self.cfg.copy_max_source_exit_impact_pct:.0f}% (its sell would be our stop)",
             )
             return
+        jev_verdict = self.jev_entry_vote(mint, item, size_usd, tokens, impact, round_trip_pct, source_exit_impact)
+        if jev_verdict:
+            self.skip(mint, jev_verdict)
+            return
         buy_sig = ""
         if self.cfg.mode == "live":
             # The wallet may already hold this mint (a moon bag from an earlier exit), so the
@@ -3702,7 +3846,7 @@ class Executor:
                     f"(${est:.2f}). Confirm the actual proceeds on an explorer."
                 )
                 self.state["daily"]["realized_pnl_usd"] = float(self.state["daily"]["realized_pnl_usd"]) + (est - pos["position_usd"])
-                self.note_copy_pnl(pos, est - pos["position_usd"])
+                self.note_copy_pnl(pos, est - pos["position_usd"], closed=True)
                 self.state["positions"].remove(pos)
                 save_state(self.state)
                 self._record_close(pos, f"{reason}_unconfirmed", est, "", pos["position_usd"])
@@ -3737,7 +3881,7 @@ class Executor:
             target = f", sells at {self.cfg.moon_bag_target_x:.0f}x (${kept_usd * self.cfg.moon_bag_target_x:,.0f})" if self.cfg.moon_bag_target_x > 0 else ", held until panic"
             log(f"MOONBAG {mint}: keeping {mb:.0%} ({keep} tokens, worth ${kept_usd:.2f} now{target})")
         self.state["daily"]["realized_pnl_usd"] = float(self.state["daily"]["realized_pnl_usd"]) + (exit_usd - sold_cost)
-        self.note_copy_pnl(pos, exit_usd - sold_cost)
+        self.note_copy_pnl(pos, exit_usd - sold_cost, closed=True)
         self.state["positions"].remove(pos)
         save_state(self.state)
         self._record_close(pos, reason, exit_usd, sell_sig, sold_cost)
@@ -4314,6 +4458,11 @@ class Executor:
         if self.state["positions"]:
             sol_price = self.sol_price_usd()
             self.manage_positions(sol_price, panic)
+        if self.state["positions"] and not panic:
+            try:
+                self.jev_exit_review(sol_price or self.sol_price_usd())
+            except Exception as exc:
+                log(f"WARN jev exit review: {describe_error(exc)}")
         if self.state.get("moon_bags") and not panic:
             self.manage_moon_bags(sol_price or self.sol_price_usd())
         if self.cfg.mode == "live" and self.state.get("rent_pending"):
@@ -4479,6 +4628,8 @@ class Executor:
         log("RPC endpoints: " + ", ".join(redact_endpoint(url) for url in self.cfg.rpc_urls))
         if self.scout is not None:
             log("SCOUT " + self.scout.startup_line())
+        if getattr(self, "jev", None) is not None:
+            log("JEV gate " + self.jev.cfg.describe())
         if self.cfg.mode == "live":
             log(f"live wallet: {self.wallet.pubkey} (burner only!)")
             startup_provider_limited = False
