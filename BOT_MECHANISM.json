@@ -1,0 +1,139 @@
+{
+  "bot": "Solana memecoin trading bot (repo duliduliduli/mememe, grad-backtest/). Python, one process, deployed on Railway, trades real money through Jupiter. Values are code defaults on main (commit c818b84, 2026-09-23); Railway env vars can override them.",
+  "status_now": {
+    "active_lane": "copy_trading (COPY_ONLY=1). The graduation and runner lanes are in the code but switched off.",
+    "account": "about $160 (1.325 SOL)",
+    "activity": "Nearly idle: SCOUT_ELITE_ONLY=1 mirrors only wallets the scout has qualified, and 0 are qualified. 1 wallet is live (EC2f5DnH). Convergence is live but has not fired yet.",
+    "results_so_far": "Every lane has lost money live or was never measured. Graduation lane: 52 trades, 37% win rate, +33% avg winner, -32% avg loser. Copy lane: small net losses, most losers are the full -30% stop filling at -33%."
+  },
+
+  "main_loop": {
+    "cycle_seconds": 5,
+    "order_each_cycle": ["manage open positions and exits (always first)", "moon bags (every 180 s)", "retry failed rent closes", "poll copied wallets (every 3 s)", "discovery / runner watchlist (if enabled)", "the scout runs on its own thread"],
+    "max_new_entries_per_cycle": 1,
+    "data_sources": {"chain": "public Solana RPC (PublicNode, mainnet-beta), WebSocket plus polling", "prices_and_swaps": "Jupiter lite-api (keyless, rate-limited)", "wallet_intel": "GMGN OpenAPI, read-only key, 2.5 units/s"},
+    "latency": "3-10 s from a source event to our transaction. Polling, not streaming. No Jito."
+  },
+
+  "coin_selection": {
+    "copy_lane_ACTIVE": {
+      "idea": "We don't pick coins ourselves. We mirror chosen wallets' conviction first-buys.",
+      "wallet_sources": ["COPY_WALLETS env (5 configured: EC2f5DnH, 498g1rVn, F5hkYsi8, CxWRfadz, Beqv6dzT)", "wallets the scout promotes to live"],
+      "detect": "Poll each wallet's recent signatures every 3 s (100-signature window). Decode balance changes: token up while SOL/WSOL/USDC/USDT goes down = buy; the reverse = sell (with the fraction of the stack sold).",
+      "buy_is_mirrored_only_if": [
+        "source buy >= $300 (COPY_MIN_BUY_USD; a per-wallet override is allowed, e.g. address:300:0.5)",
+        "source tx is <= 90 s old when we see it",
+        "it is the wallet's FIRST buy of the coin (stack was empty or under 2% dust). Adds and averaging down are skipped",
+        "we don't already hold the coin and a slot is free (max 10 open, max 80% of the account deployed)",
+        "the wallet's GMGN verdict is not 'skip' (COPY_GMGN_GATE=enforce)",
+        "SCOUT_ELITE_ONLY=1: the wallet must be qualified or live in the scout with a fresh evaluation",
+        "source-exit guard: quote selling the exact tokens the source just bought; skip if that sell alone moves the price >= 30% (our stop)",
+        "every standard entry guard marked applies_to_copy=true passes"
+      ],
+      "no_rotation": "When the book is full the new buy is skipped. We never sell a held coin to chase a new one."
+    },
+    "convergence_ACTIVE": {
+      "idea": "Coin-level signal built from the wallets the scout is tracking.",
+      "trigger": ">= 2 tracked wallets from DIFFERENT relationship clusters (wallets that look commonly controlled count once) make a qualifying first buy of the same coin within 10 min",
+      "cooldown_per_coin_hours": 6,
+      "live": {"size": "0.5x a normal copy", "max_open": 2, "loss_budget_usd": 15, "auto_off": "after 10 closed shadow convergence trades with negative net"},
+      "exit": "Copy exits, and the position closes when the first converging wallet sells >= 80% of its stack."
+    },
+    "scout_wallet_discovery_ACTIVE": {
+      "idea": "Find wallets worth copying, paper-trade them, promote the ones that prove out.",
+      "discovery": "Every few hours, pull candidates from GMGN smart-money and KOL feeds and from top traders of sampled tokens (what followed wallets bought, what we traded, GMGN trending). Track up to 200.",
+      "enrichment": "7d/30d/all stats plus up to 40 pages of buy/sell history per wallet, split into episodes (empty stack, then buy, then back to dust).",
+      "history_gates_all_mandatory": {
+        "realized_pnl_positive": "7d AND 30d AND all-time",
+        "history": ">= 60 days (fast track: 15 days fetched, or 30 dense episodes)",
+        "episodes_30d": ">= 30 (fast track 20)",
+        "tokens_30d": ">= 20 (fast track 10)",
+        "active_days_30d": ">= 10 (fast track: traded within 7 days)",
+        "profit_factor": ">= 1.5",
+        "best_token_share_of_profit": "<= 40%, and still net positive without the best token",
+        "max_drawdown_realized": "<= 25%",
+        "median_hold_minutes": ">= 30",
+        "fast_exit_fraction": "<= 10% of first buys exited within 60 s",
+        "open_losses": "unrealized losses not larger than 30d realized profit",
+        "transfer_in_tokens": "excluded from profitability",
+        "reject_tags": "wash trading, bundler, MEV",
+        "leaderboard": "top 5% on 3 snapshots over 7 days. GMGN doesn't provide this, so it is waived on the fast track"
+      },
+      "shadow_paper_copy": "Follow candidates' first buys on-chain with real Jupiter quotes: a baseline quote, then another 20 s later as a latency stress test. Same sizing, ladder and exits as live. Nothing is swapped.",
+      "shadow_gates_full_policy": {"days": 14, "trades": 30, "tokens": 15, "active_days": 7, "net": "positive at baseline AND at +20 s", "profit_factor": 1.3, "max_drawdown": 0.15, "bootstrap": "95% lower bound of mean return > 0 (resampled by token and by day)"},
+      "promotion": "Fast track qualifies on history alone. At most 3 live wallets, 1 per cluster, 0.5x size, max 3 scouted positions open, $25 loss budget per wallet (paused after that). Tripwire: 10 shadow trades with negative net pauses the wallet. A qualification goes stale after 48 h.",
+      "result": "About 200 wallets evaluated, 0 qualified under the current gates."
+    },
+    "graduation_lane_OFF": {
+      "idea": "Buy pump.fun tokens right after they migrate to PumpSwap.",
+      "detect": "Decode pump.fun migrate/migrate_v2 plus a matching PumpSwap create_pool, via WebSocket and 30 s catch-up polling.",
+      "entry": "30 s after migration. Skip if first seen more than 120 s late or more than 60 s past the target time. Every entry guard applies.",
+      "exits": {"take_profit": 0.75, "stop_loss": 0.30, "time_stop_min": 30}
+    },
+    "runner_lane_OFF": {
+      "idea": "Buy graduated tokens once they grow into a proven band with momentum. The closest thing we have to catching $200K to $4M runners.",
+      "watchlist": "Every graduation, for 6 h, max 100 tokens. Priced every 60 s from Jupiter's batched price feed. Market cap = price x supply.",
+      "entry": "Market cap between $400K and $4M AND >= +10% above its low of the last 15 min. The strongest gainers are bought first. Every entry guard applies.",
+      "exits": {"take_profit": 1.0, "stop_loss": 0.30, "trailing_stop": 0.25, "time_stop_min": 240},
+      "weaknesses": "Price-only signal (no trade count or unique-buyer check), breakout entries only, only watches pump.fun graduations",
+      "enable": "COPY_ONLY=0, RUNNER_ONLY=1, MM_AUTOSTART=0, RUNNER_MIN_MARKET_CAP_USD=200000"
+    }
+  },
+
+  "entry_filters": {
+    "order": "Sizing, then buy quote, then metadata and bundle lookups, then guards (first failure skips), then the executable round-trip check, then the swap.",
+    "sizing": {"per_position": "8% of the whole account in copy mode (10% otherwise)", "min_usd": 5, "max_usd": 20, "max_open": 10, "max_deployed": 0.80, "sol_reserve": 0.05, "daily_loss_limit_usd": "0 (off)"},
+    "guards": [
+      {"name": "stale_entry", "rule": "more than 60 s past target entry time", "applies_to_copy": false},
+      {"name": "price_impact", "rule": "buy quote price impact > 10%", "applies_to_copy": true},
+      {"name": "round_trip", "rule": "an immediate sell quote must return >= 80% of what we put in", "applies_to_copy": true},
+      {"name": "source_exit_impact", "rule": "selling the source wallet's new stack would move the price >= 30%", "applies_to_copy": "copy only"},
+      {"name": "market_cap_ceiling", "rule": "off (0). A $2M ceiling blocked the best bucket", "applies_to_copy": false},
+      {"name": "market_cap_floor", "rule": "cap < $25K (already dumped)", "applies_to_copy": false},
+      {"name": "curve_age", "rule": "graduated < 120 s after creation (one buyer filled the curve)", "applies_to_copy": false},
+      {"name": "curve_transactions", "rule": "< 150 successful txs on the bonding curve (rugs seen: 2-15; organic: 311-2,293)", "applies_to_copy": false},
+      {"name": "top_holder", "rule": "largest plain wallet > 20% of supply", "applies_to_copy": false},
+      {"name": "creator_holding", "rule": "creator still holds > 5%", "applies_to_copy": false},
+      {"name": "creator_launches", "rule": "creator has > 3 prior pump.fun launches (launch factory)", "applies_to_copy": false},
+      {"name": "early_seller", "rule": "any wallet already sold > 3% of supply since migration", "applies_to_copy": false},
+      {"name": "bundle_graph", "rule": "Inspect 50 holders and trace funding for the top 20. Block if any cluster share is over its limit: same-slot buys 30%, shared direct funder 30%, two-hop funding ancestry 20%, unpaid wallet-to-wallet token transfers 12%, coordinated buys within 12 slots 20%, wallet cohort seen on earlier launches 12%, creator-linked 15%, top-10 wallets 50%, first-3-slot buys 30%. Fails closed if lookup completion < 80% or funder coverage < 30%. At 30-60% coverage every limit is multiplied by 0.67.", "applies_to_copy": false}
+    ],
+    "why_copy_skips_most_guards": "COPY_FAST=1. The holder and bundle analysis takes many RPC calls and would lose the race. Copied entries run only impact, round-trip and source-exit."
+  },
+
+  "execution": {
+    "buy": "Jupiter quote then swap, 10% slippage, entry retries. A timed-out confirmation checks the wallet and adopts tokens if they landed.",
+    "sell": "15% slippage, retries. Preflight at 'confirmed' commitment.",
+    "position_tokens": "Exactly what our buy delivered, never the whole wallet balance.",
+    "valuation": "Batched Jupiter price feed. A real sell quote is taken only when an exit is within 8%. Copy positions are checked every 8 s."
+  },
+
+  "exits": {
+    "copy_and_convergence": {
+      "stop_loss": "-30% (fills about -33% in dumps)",
+      "breakeven": "once up +20%, the stop moves to entry",
+      "ladder": "sell 30% of tokens at 1.4x and 30% at 1.8x",
+      "runner": "the remaining 40% trails 40% from its peak, with no take-profit cap",
+      "trailing_arm": "no trailing stop until the position has been up +30%",
+      "time_stop": "24 h",
+      "follow_source_sells": "source sells >= 80% of its stack: close ours. A smaller sell trims ours by the same fraction (trims under $1 skipped). Any followed wallet's sell counts."
+    },
+    "priority": "panic, then take profit, then stop loss, then trailing, then time stop. Ladder rungs are checked before exits."
+  },
+
+  "moon_bags": {"keep": "10% of tokens, only on WINNING exits, only if worth >= $0.50", "sell_at": "100x kept value, or once it reaches 3x, a 40% trail from its peak", "burn": "below 10% of kept value (and reclaim rent)"},
+
+  "housekeeping": {
+    "rent": "Every full sell closes the token account (about 0.002 SOL). A failed close retries 4 times over about 3 min, then startup reconcile handles it.",
+    "startup_reconcile": "Adopts orphaned tokens (small ones as moon bags), burns dust under $0.25, closes empty accounts.",
+    "controls": "PANIC=1 sells everything and stops. HOLD_MINTS = never touch these tokens. A stop file drains the bot."
+  },
+
+  "known_problems": [
+    "Too slow to copy fast wallets. Large-stack wallets dump through our stop before we can sell.",
+    "Scout gates are strict and slow (days of evidence). It finds wallets, not coins, so it misses this week's runners.",
+    "No trade-activity (tape) filter anywhere: no trades-per-30s, unique-buyer or volume-trend check.",
+    "Fixed costs (slippage, fees, rent) are large relative to $5-20 positions. It needs rare 3x+ winners to profit.",
+    "Keyless Jupiter and public RPC rate limits: every added lane competes for the same quote budget."
+  ]
+}
