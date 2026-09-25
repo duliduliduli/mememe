@@ -227,7 +227,7 @@ class BuiltinDefaultsTests(unittest.TestCase):
         cfg = executor.Config()
         self.assertEqual((cfg.copy_wallet_min_usd[self.BIG], cfg.copy_wallet_size[self.BIG]), (300.0, 1.0))
         self.assertNotIn(WALLET, cfg.copy_wallet_size)
-        self.assertEqual(cfg.copy_gmgn_gate, "enforce")         # GMGN "skip" wallets are not bought
+        self.assertEqual(cfg.copy_gmgn_gate, "shadow")          # configured wallets are always copied; GMGN only logs
 
     def test_terms_written_in_the_variable_still_win(self):
         executor, p = fresh(COPY_WALLETS=f"{self.BIG}:500:0.25")

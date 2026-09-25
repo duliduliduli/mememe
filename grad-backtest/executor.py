@@ -426,7 +426,9 @@ class Config:
         # GMGN marks skip, and lets them back in once a daily re-check rates them better (their
         # sells are always followed); "shadow" logs what it would block and mirrors anyway;
         # "off" ignores it.
-        self.copy_gmgn_gate = os.getenv("COPY_GMGN_GATE", "enforce").strip().lower()
+        # Only ever applied to the configured wallets, which the owner wants copied always: so
+        # the default only logs GMGN's verdict ("shadow"); "enforce" makes it block again.
+        self.copy_gmgn_gate = os.getenv("COPY_GMGN_GATE", "shadow").strip().lower()
         self.gmgn_refresh_hours = float(os.getenv("GMGN_REFRESH_HOURS", "24"))
         self.gmgn_retry_minutes = float(os.getenv("GMGN_RETRY_MINUTES", "60"))
         # Source-event bookkeeping: how many source transactions to decode per wallet per poll

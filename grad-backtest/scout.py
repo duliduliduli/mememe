@@ -121,12 +121,10 @@ class ScoutConfig:
         # with a negative net, or no source trade in DEMOTE_IDLE_DAYS, it leaves the live set.
         self.demote_after_live_fills = _env_int("DEMOTE_AFTER_LIVE_FILLS", 10)
         self.demote_idle_days = _env_float("DEMOTE_IDLE_DAYS", 7)
-        # Configured wallets that already failed as copy sources: they stay on the watchlist
-        # (their buys feed confluence and paper data) but are never copied on their own.
-        # Addresses or address prefixes. EC2f5DnH: buys too big for the pools, its exit is our
-        # stop. CxWRfadz: mostly sub-$300 sprays. (498g1rVn was here for one 13 s flip; it is
-        # frankdegods, a +$363K/30d wallet averaging a 327 h hold, now copied in hold mode.)
-        self.copy_watch_only = tuple(w.strip() for w in os.getenv("COPY_WATCH_ONLY", "EC2f5DnH,CxWRfadz").split(",") if w.strip())
+        # Configured wallets are the owner's picks and are always copied; this optional list
+        # (addresses or prefixes, empty by default) is the owner's own switch to make one of
+        # them watch-only: its buys then feed confluence and paper data but are not copied.
+        self.copy_watch_only = tuple(w.strip() for w in os.getenv("COPY_WATCH_ONLY", "").split(",") if w.strip())
         # Sniper farms: a median hold under this many seconds rejects the wallet outright (not
         # copyable at our latency, not worth paper trading). Hold time above it is a score and
         # the SCOUT_MIN_MEDIAN_HOLD_MINUTES history gate, never a veto.
@@ -805,16 +803,21 @@ class ScoutLane:
 
     def configured_live(self) -> list[str]:
         """Configured wallets currently in the live set: not watch-only, not demoted."""
-        return [w for w in self.ex.cfg.copy_wallets
-                if not self.watch_only(w) and not (self.st.get("live") or {}).get(w, {}).get("demoted_ts")]
+        return [w for w in self.ex.cfg.copy_wallets if not self.watch_only(w)]
 
     def entry_allowed(self, wallet: str) -> tuple[bool, str]:
         """May a new buy by `wallet` be copied on its own? Sells and open positions are never
         touched. In order: watch-only, demoted on our own fills, a sniper by its measured
         median hold, and (only with SCOUT_ELITE_ONLY=1 and GMGN evidence) a fresh qualified or
         live verdict. The first three apply with or without GMGN scouting."""
-        if wallet in self.ex.cfg.copy_wallets and self.watch_only(wallet):
-            return False, "watch_only: in COPY_WATCH_ONLY, its buys only count toward confluence"
+        if wallet in self.ex.cfg.copy_wallets:
+            # The owner's own wallets are always copied: the scout's rules (promotion,
+            # demotion, sniper filter, elite gate) are only for wallets it found itself. The
+            # hard execution filters (size, impact, round trip, source exit, daily stop) still
+            # apply to every buy.
+            if self.watch_only(wallet):
+                return False, "watch_only: in COPY_WATCH_ONLY, its buys only count toward confluence"
+            return True, ""
         demoted = (self.st.get("live") or {}).get(wallet, {})
         if demoted.get("demoted_ts"):
             return False, f"demoted: {demoted.get('demoted_reason') or 'red for us'}"
@@ -844,7 +847,8 @@ class ScoutLane:
         cand = self.candidate(wallet)
         if cand and cand.get("state") == "live" and self.cfg.live_loss_budget_usd > 0 and entry["realized_pnl_usd"] <= -self.cfg.live_loss_budget_usd:
             self.transition(cand, "paused", f"live loss budget breached ({entry['realized_pnl_usd']:+.2f} USD)")
-        if (wallet != CONVERGENCE and self.cfg.demote_after_live_fills > 0 and not entry.get("demoted_ts")
+        if (wallet != CONVERGENCE and wallet not in self.ex.cfg.copy_wallets and self.cfg.demote_after_live_fills > 0
+                and not entry.get("demoted_ts")
                 and int(entry.get("fills") or 0) >= self.cfg.demote_after_live_fills and entry["realized_pnl_usd"] < 0):
             self.demote(wallet, f"red for us: {entry['realized_pnl_usd']:+.2f} USD over {entry['fills']} fills")
 
@@ -911,21 +915,14 @@ class ScoutLane:
             f" ({rec['net_stress_usd']:+.2f} with 20s latency)" if rec["net_stress_usd"] is not None else "")
 
     def review_live_set(self) -> None:
-        """Idle demotions and re-promotions for configured wallets (scouted wallets go through
-        the candidate lifecycle): a configured wallet idle for DEMOTE_IDLE_DAYS leaves the live
-        set; a demoted one comes back once its new paper fills are green."""
+        """Configured wallets are never demoted (the owner's picks are always copied); this only
+        clears a demotion an earlier version stored for one."""
         for wallet in self.ex.cfg.copy_wallets:
-            if self.watch_only(wallet):
-                continue
             entry = (self.st.get("live") or {}).get(wallet) or {}
             if entry.get("demoted_ts"):
-                ok, detail = self.paper_green(wallet, since=float(entry["demoted_ts"]))
-                if ok and not self.idle(wallet):
-                    self.st["live"][wallet] = {"realized_pnl_usd": 0.0, "fills": 0, "repromoted_ts": self.now(),
-                                               "previous": {k: entry.get(k) for k in ("realized_pnl_usd", "fills", "demoted_reason")}}
-                    self.log(f"{wallet[:8]} back in the live set: {detail}")
-            elif self.idle(wallet):
-                self.demote(wallet, f"no trade in {self.cfg.demote_idle_days:.0f} days")
+                entry.pop("demoted_ts", None)
+                entry.pop("demoted_reason", None)
+                self.log(f"{wallet[:8]} is a configured wallet: always copied, demotion cleared")
 
     # ---- per-cycle entry point ------------------------------------------------------------
     def tick(self, sol_price: float) -> None:
@@ -1887,9 +1884,8 @@ def funnel_report(st: dict[str, Any], cfg: ScoutConfig, now: float, configured: 
         return any(w == x or (len(x) < 32 and w.startswith(x)) for x in cfg.copy_watch_only)
 
     watch = [a for a, c in cands.items() if c.get("state") in ("shadow", "qualified", "live", "paused")]
-    configured_rows = [{"wallet": w, "status": "watch_only" if watch_only(w) else ("demoted" if (book.get(w) or {}).get("demoted_ts") else "live"),
+    configured_rows = [{"wallet": w, "status": "watch_only" if watch_only(w) else "always_copied",
                         "our_fills": (book.get(w) or {}).get("fills", 0), "our_net_usd": (book.get(w) or {}).get("realized_pnl_usd", 0.0),
-                        "demoted_reason": (book.get(w) or {}).get("demoted_reason"),
                         "last_trade_ts": (st.get("last_trade") or {}).get(w)} for w in configured]
     scouted_live = [{"wallet": a, "route": c.get("route"), "our_fills": (book.get(a) or {}).get("fills", 0),
                      "our_net_usd": (book.get(a) or {}).get("realized_pnl_usd", 0.0)}
@@ -1909,7 +1905,7 @@ def funnel_report(st: dict[str, Any], cfg: ScoutConfig, now: float, configured: 
         "watchlist": {"size": min(len(watch), cfg.watchlist_max), "max": cfg.watchlist_max, "tracked": len(cands),
                       "poll_wallets_per_round": cfg.watch_poll_wallets, "poll_seconds": cfg.poll_seconds},
         "live_set": {"max": cfg.live_copy_max, "configured": configured_rows, "scouted": scouted_live,
-                     "size": sum(1 for r in configured_rows if r["status"] == "live") + len(scouted_live)},
+                     "size": sum(1 for r in configured_rows if r["status"] == "always_copied") + len(scouted_live)},
         "promotion": {"paper_fills": cfg.promote_min_paper_fills, "demote_after_live_fills": cfg.demote_after_live_fills,
                       "demote_idle_days": cfg.demote_idle_days, "sniper_max_hold_sec": cfg.sniper_max_hold_seconds,
                       "sniper_median_hold_sec_rejects": cfg.sniper_median_hold_seconds},

@@ -148,7 +148,10 @@ class FunnelTests(unittest.TestCase):
         executor, ex = self.setup()
         cand = self.seed(ex, WALLET, state="shadow")
         cand["history"]["metrics_30d"]["median_hold_minutes"] = 0.1              # 6 s median hold
-        allowed, why = ex.scout.entry_allowed(WALLET)
+        self.assertTrue(ex.scout.entry_allowed(WALLET)[0])                       # the owner's wallet: always copied
+        scouted = self.seed(ex, OTHER, state="live")
+        scouted["history"]["metrics_30d"]["median_hold_minutes"] = 0.1
+        allowed, why = ex.scout.entry_allowed(OTHER)
         self.assertFalse(allowed)
         self.assertIn("sniper", why)
 
@@ -163,21 +166,16 @@ class FunnelTests(unittest.TestCase):
         self.assertNotIn("Other", ex.scout.st.get("recent_buys") or {})
 
     # -- promote / demote ---------------------------------------------------------------------
-    def test_a_configured_wallet_red_after_ten_fills_is_demoted_and_its_sells_still_followed(self):
+    def test_a_configured_wallet_red_for_us_is_still_always_copied(self):
         executor, ex = self.setup()
-        for _ in range(9):
+        for _ in range(15):
             ex.note_copy_pnl({"copy": WALLET}, -1.0, closed=True)
-        self.assertTrue(ex.scout.entry_allowed(WALLET)[0])                       # nine fills: not yet judged
-        ex.note_copy_pnl({"copy": WALLET}, -0.5)                                 # a moon bag is P&L, not a fill
         self.assertTrue(ex.scout.entry_allowed(WALLET)[0])
-        ex.note_copy_pnl({"copy": WALLET}, -1.0, closed=True)
-        allowed, why = ex.scout.entry_allowed(WALLET)
-        self.assertFalse(allowed)
-        self.assertIn("red for us", why)
+        self.assertEqual(ex.scout.st["live"][WALLET]["fills"], 15)               # still tracked, for the report
         entered = []
         ex.enter_with_retry = lambda item, sol_price: entered.append(item)
         ex.copy_handle_event(WALLET, "buy1", int(time.time()), tx(10.0, 5.0, 0, 1000), SOL, True)
-        self.assertEqual(entered, [])
+        self.assertEqual(len(entered), 1)
         ex.state["positions"] = [{"mint": MINT, "tokens": 1000, "position_usd": 8.0, "last_value_usd": 8.0, "peak_usd": 8.0,
                                   "opened_ts": time.time() - 600, "opened_at": "t", "copy": WALLET, "buy_signature": "b"}]
         exits = []
@@ -185,7 +183,7 @@ class FunnelTests(unittest.TestCase):
         ex.copy_handle_event(WALLET, "sell1", int(time.time()), tx(5.0, 9.0, 1000, 0), SOL, True)
         self.assertEqual(exits, [(WALLET, 0)])
         report = scout.funnel_report(ex.scout.st, ex.scout.cfg, time.time(), [WALLET])
-        self.assertEqual(report["live_set"]["configured"][0]["status"], "demoted")
+        self.assertEqual(report["live_set"]["configured"][0]["status"], "always_copied")
 
     def test_a_green_wallet_is_not_demoted_after_ten_fills(self):
         executor, ex = self.setup()

@@ -295,7 +295,7 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(cfg.promote_min_paper_fills, 8)
             self.assertEqual(cfg.demote_after_live_fills, 10)
             self.assertEqual(cfg.demote_idle_days, 7.0)
-            self.assertEqual(cfg.copy_watch_only, ("EC2f5DnH", "CxWRfadz"))
+            self.assertEqual(cfg.copy_watch_only, ())
             self.assertEqual(cfg.live_loss_budget_usd, 25.0)
             self.assertTrue(cfg.fast_track)
             self.assertEqual(cfg.fast_track_min_history_days, 15.0)
@@ -454,24 +454,19 @@ class LaneTests(unittest.TestCase):
         rows = list(__import__("csv").DictReader(open(os.path.join(os.environ["DATA_DIR"], "copy_signals.csv"))))
         self.assertEqual([r["reason"] for r in rows if r["status"] == "blocked"], ["scout_slots"])
 
-    def test_stale_elite_only_blocks_buys_but_never_sells(self):
+    def test_elite_only_never_gates_the_owners_configured_wallets(self):
         executor, ex = self.make(SCOUT_ELITE_ONLY="1")
-        self.seed(ex, WALLET, state="qualified", evaluated_at=time.time() - 3 * DAY, configured=True)
+        self.seed(ex, WALLET, state="shadow", evaluated_at=time.time() - 3 * DAY, configured=True)
         entered, sells = [], []
         ex.enter_with_retry = lambda item, sol_price: entered.append(item)
         ex.copy_handle_sell = lambda *a, **k: sells.append(a)
         ex.copy_handle_event(WALLET, "buy1", int(time.time()), tx(10.0, 5.0, 0, 1000), SOL, True)
-        self.assertEqual(entered, [])                                             # stale qualification: no new buy
+        self.assertEqual(len(entered), 1)                                         # configured: always copied
         ex.copy_handle_event(WALLET, "sell1", int(time.time()), tx(5.0, 9.0, 1000, 0), SOL, True)
-        self.assertEqual(len(sells), 1)                                           # sells are always followed
-        ex.scout.st["candidates"][WALLET]["evaluation"]["evaluated_at"] = time.time()
-        ex.copy_handle_event(WALLET, "buy2", int(time.time()), tx(10.0, 5.0, 0, 1000), SOL, True)
-        self.assertEqual(len(entered), 1)                                         # fresh: mirrored
-        ex.scout.st["candidates"][WALLET]["state"] = "shadow"
-        ex.copy_handle_event(WALLET, "buy3", int(time.time()), tx(10.0, 5.0, 0, 1000), SOL, True)
-        self.assertEqual(len(entered), 1)                                         # not qualified: blocked
-        rows = list(__import__("csv").DictReader(open(os.path.join(os.environ["DATA_DIR"], "copy_signals.csv"))))
-        self.assertEqual([r["reason"] for r in rows if r["status"] == "blocked"], ["elite_only", "elite_only"])
+        self.assertEqual(len(sells), 1)
+        allowed, why = ex.scout.entry_allowed(OTHER)                              # a scouted wallet still needs a verdict
+        self.assertFalse(allowed)
+        self.assertIn("elite_only", why)
 
     def test_elite_only_off_changes_nothing(self):
         executor, ex = self.make(SCOUT_ELITE_ONLY="0")
