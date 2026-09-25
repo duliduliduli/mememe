@@ -813,6 +813,7 @@ class PollTests(unittest.TestCase):
         self.assertEqual(wallets, ("a", "b", "c", "d"))
         self.assertEqual(minimums, {"a": 500.0, "c": 300.0, "d": 100.0})
         self.assertEqual(sizes, {"a": 0.5, "b": 0.25, "c": 2.0})
+        self.assertEqual(executor.parse_wallet_list("a, b, a")[0], ("a", "b"))       # listed twice, polled once
 
     def test_follow_sell_closes_our_copy(self):
         executor, ex = self.make()
