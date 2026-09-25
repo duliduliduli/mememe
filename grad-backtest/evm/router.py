@@ -1,9 +1,9 @@
 """Quotes and swaps on one chain.
 
-Two backends: the Uniswap Trading API (UNISWAP_API_KEY set) routes through Uniswap V2/V3/V4
-including the V4 pools memecoins graduate into on Robinhood Chain; without a key the lane
-falls back to the chain's on-chain V3 QuoterV2/SwapRouter02 and V2 router, which covers
-Base and BNB well and Robinhood Chain only for tokens with V2/V3 pools."""
+Backends: the Uniswap Trading API (UNISWAP_API_KEY set), and on-chain routing that needs no
+key: V3 QuoterV2/SwapRouter02, V2, and on chains with a V4 table (Robinhood Chain) Uniswap V4
+native-ETH pools through the V4Quoter and the Universal Router, which is where Robinhood
+Chain memecoins (Pons launches included) trade. The best quote across them wins."""
 from __future__ import annotations
 
 import time
@@ -12,6 +12,7 @@ from typing import Any, Callable
 
 import requests
 from eth_abi import decode as abi_decode, encode as abi_encode
+from eth_utils import keccak, to_checksum_address
 
 from .chains import ZERO, Chain
 from .rpc import Rpc, RpcError, encode_call, selector
@@ -19,6 +20,13 @@ from .rpc import Rpc, RpcError, encode_call, selector
 TRADING_API = "https://trade-api.gateway.uniswap.org/v1"
 ADDRESS_THIS = "0x0000000000000000000000000000000000000002"   # SwapRouter02: "send to the router"
 MAX_UINT = 2**256 - 1
+
+# Uniswap V4 through the Universal Router: command V4_SWAP, and the V4Router actions a
+# single-pool exact-input swap needs (v4-periphery Actions.sol).
+UR_V4_SWAP = 0x10
+V4_SWAP_EXACT_IN_SINGLE, V4_SETTLE_ALL, V4_TAKE_ALL = 0x06, 0x0C, 0x0F
+V4_POOL_KEY = "(address,address,uint24,int24,address)"
+V4_INITIALIZE_TOPIC = "0x" + keccak(text="Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)").hex()
 
 
 @dataclass
@@ -45,6 +53,10 @@ class Router:
         self.session = requests.Session()
         self.last_api_error = ""
         self._approved: set[str] = set()
+        self._v4_keys: dict[str, tuple[float, list[tuple[Any, ...]]]] = {}
+        # How far back to look for a token's V4 pools (Initialize events); ~11 days at 0.1 s.
+        import os
+        self.v4_lookback_blocks = int(os.getenv("EVM_V4_LOOKBACK_BLOCKS", "10000000"))
 
     # ---- quotes ----------------------------------------------------------
     def quote(self, token_in: str, token_out: str, amount_in: int) -> Quote | None:
@@ -58,7 +70,7 @@ class Router:
             except Exception as exc:                       # fall through to on-chain routing
                 best = None
                 self.last_api_error = str(exc)
-        for fn in (self._v3_quote, self._v2_quote):
+        for fn in (self._v3_quote, self._v2_quote, self._v4_quote):
             try:
                 q = fn(token_in, token_out, amount_in)
             except Exception:
@@ -66,6 +78,73 @@ class Router:
             if q and (best is None or q.amount_out > best.amount_out):
                 best = q
         return best
+
+    # ---- Uniswap V4 (native-coin pools) -----------------------------------
+    def v4_pools(self, token: str) -> list[tuple[Any, ...]]:
+        """PoolKeys (currency0, currency1, fee, tickSpacing, hooks) of the V4 pools pairing
+        `token` with the native coin, from the PoolManager's Initialize events; cached 10 min.
+        Hook pools count (Pons launches are V4 pools with a hook): the quoter and the swap
+        simulation decide whether one trades."""
+        c = self.chain
+        if not (c.v4_pool_manager and c.v4_quoter and c.universal_router):
+            return []
+        key = token.lower()
+        cached = self._v4_keys.get(key)
+        if cached and time.time() - cached[0] < 600:
+            return cached[1]
+        head = self.rpc.block_number()
+        start = max(1, head - self.v4_lookback_blocks)
+        padded = "0x" + token[2:].lower().rjust(64, "0")
+        zero = "0x" + "0" * 64
+        rows: list[dict[str, Any]] = []
+        # Native ETH is address(0), so it is always currency0 and the token currency1.
+        try:
+            rows = self.rpc.logs(start, head, [V4_INITIALIZE_TOPIC, None, zero, padded], address=c.v4_pool_manager)
+        except RpcError:
+            for a in range(start, head + 1, 2_000_000):
+                rows += self.rpc.logs(a, min(head, a + 1_999_999), [V4_INITIALIZE_TOPIC, None, zero, padded], address=c.v4_pool_manager)
+        keys = []
+        for entry in rows:
+            try:
+                fee, spacing, hooks = abi_decode(["uint24", "int24", "address", "uint160", "int24"], bytes.fromhex(entry["data"][2:]))[:3]
+            except Exception:
+                continue
+            keys.append((ZERO, to_checksum_address(token), int(fee), int(spacing), to_checksum_address(hooks)))
+        self._v4_keys[key] = (time.time(), keys)
+        return keys
+
+    def _v4_quote(self, token_in: str, token_out: str, amount_in: int) -> Quote | None:
+        if (token_in == ZERO) == (token_out == ZERO):
+            return None
+        token = token_out if token_in == ZERO else token_in
+        zero_for_one = token_in == ZERO
+        best: Quote | None = None
+        for pool in self.v4_pools(token):
+            data = encode_call("quoteExactInputSingle((" + V4_POOL_KEY + ",bool,uint128,bytes))",
+                               ["(" + V4_POOL_KEY + ",bool,uint128,bytes)"], [(pool, zero_for_one, amount_in, b"")])
+            try:
+                out = self.rpc.eth_call(self.chain.v4_quoter, data)
+                amount_out = abi_decode(["uint256", "uint256"], bytes.fromhex(out[2:]))[0]
+            except Exception:
+                continue                                    # no liquidity, or a hook refusing the quote
+            if amount_out > 0 and (best is None or amount_out > best.amount_out):
+                best = Quote("v4", token_in, token_out, amount_in, int(amount_out), {"key": list(pool), "zero_for_one": zero_for_one})
+        return best
+
+    def v4_calldata(self, quote: Quote, deadline: int) -> str:
+        """Universal Router execute(): V4_SWAP with SWAP_EXACT_IN_SINGLE, SETTLE_ALL (the input:
+        the attached ETH on a buy, pulled through Permit2 on a sell) and TAKE_ALL (the output,
+        at least min_out, to us)."""
+        pool = tuple(quote.detail["key"])
+        min_out = self.min_out(quote)
+        params = [abi_encode(["(" + V4_POOL_KEY + ",bool,uint128,uint128,bytes)"],
+                             [(pool, bool(quote.detail["zero_for_one"]), quote.amount_in, min_out, b"")]),
+                  abi_encode(["address", "uint256"], [quote.token_in, quote.amount_in]),
+                  abi_encode(["address", "uint256"], [quote.token_out, min_out])]
+        actions = bytes([V4_SWAP_EXACT_IN_SINGLE, V4_SETTLE_ALL, V4_TAKE_ALL])
+        swap_input = abi_encode(["bytes", "bytes[]"], [actions, params])
+        return encode_call("execute(bytes,bytes[],uint256)", ["bytes", "bytes[]", "uint256"],
+                           [bytes([UR_V4_SWAP]), [swap_input], deadline])
 
     def _api_headers(self) -> dict[str, str]:
         return {"x-api-key": self.api_key, "Content-Type": "application/json", "Accept": "application/json",
@@ -146,6 +225,8 @@ class Router:
             return self._api_execute(quote)
         if quote.kind == "v3":
             return self._v3_execute(quote)
+        if quote.kind == "v4":
+            return self._v4_execute(quote)
         return self._v2_execute(quote)
 
     def _approve(self, token: str, spender: str, amount: int) -> None:
@@ -207,6 +288,37 @@ class Router:
         unwrap = selector("unwrapWETH9(uint256,address)") + abi_encode(["uint256", "address"], [self.min_out(quote), self.wallet])
         data = encode_call("multicall(uint256,bytes[])", ["uint256", "bytes[]"], [deadline, [swap, unwrap]])
         return self.send({"to": self.chain.v3_router, "data": data, "value": 0})
+
+    def _permit2_allow(self, token: str, amount: int) -> None:
+        """A sell through the Universal Router pulls the tokens via Permit2: the token must
+        allow Permit2, and Permit2 must allow the router (an on-chain approve, no signature)."""
+        c = self.chain
+        self._approve(token, c.permit2, amount)
+        key = f"{token}:permit2:{c.universal_router}"
+        if key in self._approved:
+            return
+        out = self.rpc.eth_call(c.permit2, encode_call("allowance(address,address,address)", ["address", "address", "address"],
+                                                       [self.wallet, token, c.universal_router]))
+        allowed, expiration, _ = abi_decode(["uint160", "uint48", "uint48"], bytes.fromhex(out[2:]))
+        if allowed < amount or expiration < time.time() + 3600:
+            data = encode_call("approve(address,address,uint160,uint48)", ["address", "address", "uint160", "uint48"],
+                               [token, c.universal_router, 2**160 - 1, int(time.time()) + 30 * 86400])
+            self.send({"to": c.permit2, "data": data, "value": 0})
+        self._approved.add(key)
+
+    def _v4_execute(self, quote: Quote) -> dict[str, Any]:
+        c = self.chain
+        if quote.token_in != ZERO:
+            self._permit2_allow(quote.token_in, quote.amount_in)
+        tx = {"to": c.universal_router, "data": self.v4_calldata(quote, int(time.time()) + 120),
+              "value": quote.amount_in if quote.token_in == ZERO else 0}
+        # Simulate first: a hook that refuses the router, or a price that moved past the
+        # slippage limit, fails here for free instead of on-chain for gas.
+        try:
+            self.rpc.call("eth_call", [{"from": self.wallet, **{k: (hex(v) if k == "value" else v) for k, v in tx.items()}}, "latest"])
+        except RpcError as exc:
+            raise RpcError(f"v4 swap simulation failed: {exc}") from exc
+        return self.send(tx)
 
     def _v2_execute(self, quote: Quote) -> dict[str, Any]:
         deadline = int(time.time()) + 120

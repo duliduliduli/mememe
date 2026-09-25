@@ -487,7 +487,7 @@ def _evm_running() -> bool:
 
 def _evm_configured() -> bool:
     """The EVM copy lane runs when it has wallets to follow and (live) a signing key."""
-    if not os.getenv("EVM_COPY_WALLETS", "").strip():
+    if not os.getenv("EVM_COPY_WALLETS", "").strip() and os.getenv("EVM_SCOUT", "1") == "0":
         return False
     mode = (os.getenv("EVM_MODE") or os.getenv("EXECUTOR_MODE", "paper")).strip().lower()
     return mode != "live" or bool(os.getenv("EVM_PRIVATE_KEY", "").strip())
@@ -607,11 +607,23 @@ def evm_status(limit: int = 100) -> JSONResponse:
     })
 
 
+@app.get("/api/evm/scout")
+def evm_scout() -> JSONResponse:
+    """The EVM wallet scout (Robinhood Chain by default): runners scanned, wallets ranked by
+    realized profit across them, and the ones the lane copies."""
+    data = read_json("evm_scout.json") or {}
+    return JSONResponse({"live": data.get("live") or [], "last_cycle": data.get("last_cycle"),
+                         "ranked": (data.get("ranked") or [])[:100],
+                         "runners": [{k: v for k, v in info.items() if k != "rows"} | {"wallets": len(info.get("rows") or {})}
+                                     for info in (data.get("tokens") or {}).values()],
+                         "errors": (data.get("errors") or [])[-10:]})
+
+
 @app.post("/api/evm/start")
 def evm_start(request: Request) -> JSONResponse:
     _require_admin(request)
     if not _evm_configured():
-        raise HTTPException(400, "set EVM_COPY_WALLETS (and EVM_PRIVATE_KEY for live) first")
+        raise HTTPException(400, "set EVM_COPY_WALLETS or leave EVM_SCOUT on (and EVM_PRIVATE_KEY for live) first")
     if not _evm_running():
         _start_evm()
     return JSONResponse({"running": _evm_running()})
@@ -637,7 +649,7 @@ def maybe_autostart_evm() -> None:
         print("[server] EVM_AUTOSTART=0: EVM copy lane NOT started", flush=True)
         return
     if not _evm_configured():
-        print("[server] EVM copy lane NOT started (EVM_COPY_WALLETS empty, or live without EVM_PRIVATE_KEY)", flush=True)
+        print("[server] EVM copy lane NOT started (live without EVM_PRIVATE_KEY, or EVM_COPY_WALLETS empty with EVM_SCOUT=0)", flush=True)
         return
     if not _evm_running():
         _start_evm()
