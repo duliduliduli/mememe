@@ -124,8 +124,9 @@ class ScoutConfig:
         # Configured wallets that already failed as copy sources: they stay on the watchlist
         # (their buys feed confluence and paper data) but are never copied on their own.
         # Addresses or address prefixes. EC2f5DnH: buys too big for the pools, its exit is our
-        # stop. 498g1rVn: flips in 13 s. CxWRfadz: never buys >= $300.
-        self.copy_watch_only = tuple(w.strip() for w in os.getenv("COPY_WATCH_ONLY", "EC2f5DnH,498g1rVn,CxWRfadz").split(",") if w.strip())
+        # stop. CxWRfadz: mostly sub-$300 sprays. (498g1rVn was here for one 13 s flip; it is
+        # frankdegods, a +$363K/30d wallet averaging a 327 h hold, now copied in hold mode.)
+        self.copy_watch_only = tuple(w.strip() for w in os.getenv("COPY_WATCH_ONLY", "EC2f5DnH,CxWRfadz").split(",") if w.strip())
         # Sniper farms: a median hold under this many seconds rejects the wallet outright (not
         # copyable at our latency, not worth paper trading). Hold time above it is a score and
         # the SCOUT_MIN_MEDIAN_HOLD_MINUTES history gate, never a veto.

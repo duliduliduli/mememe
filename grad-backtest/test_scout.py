@@ -295,7 +295,7 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(cfg.promote_min_paper_fills, 8)
             self.assertEqual(cfg.demote_after_live_fills, 10)
             self.assertEqual(cfg.demote_idle_days, 7.0)
-            self.assertEqual(cfg.copy_watch_only, ("EC2f5DnH", "498g1rVn", "CxWRfadz"))
+            self.assertEqual(cfg.copy_watch_only, ("EC2f5DnH", "CxWRfadz"))
             self.assertEqual(cfg.live_loss_budget_usd, 25.0)
             self.assertTrue(cfg.fast_track)
             self.assertEqual(cfg.fast_track_min_history_days, 15.0)

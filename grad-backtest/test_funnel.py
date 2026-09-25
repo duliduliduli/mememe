@@ -285,6 +285,58 @@ class FunnelTests(unittest.TestCase):
         self.assertIn("gate_failures", report)
 
 
+class HoldModeTests(unittest.TestCase):
+    make, fake_market = test_scout.LaneTests.make, test_scout.LaneTests.fake_market
+    FRANK = "498g1rVnFcnjBjpfw1xyqA1WvgQXUU8RWuELjxkjAayQ"
+
+    def setup(self, **env):
+        env.setdefault("PAPER_BALANCE_USD", "200")
+        env.setdefault("COPY_WALLETS", f"{WALLET},{self.FRANK}")
+        executor, ex = self.make(**env)
+        ex.state["paper_balance_usd"] = 200.0
+        self.fake_market(ex)
+        return executor, ex
+
+    def test_frankdegods_is_copied_in_hold_mode_not_watch_only(self):
+        executor, ex = self.setup()
+        self.assertTrue(ex.scout.entry_allowed(self.FRANK)[0])
+        self.assertEqual(ex.copy_hold_mode(self.FRANK), (True, "COPY_HOLD_WALLETS"))
+        self.assertEqual(ex.copy_hold_mode(WALLET), (False, ""))
+        ex.copy_handle_event(self.FRANK, "fbuy", int(time.time()), tx(10.0, 5.0, 0, 1000, owner=self.FRANK), SOL, True)
+        pos = ex.state["positions"][0]
+        self.assertTrue(pos["hold_with_source"])
+        self.assertIsNone(pos["ladder"])
+        xcfg = ex.exit_cfg(pos)
+        self.assertEqual(xcfg.take_profit, float("inf"))
+        self.assertEqual(xcfg.stop_loss, 0.40)
+        self.assertEqual(xcfg.trailing_stop, 0.0)
+        self.assertEqual(xcfg.breakeven_arm, 0.0)
+        self.assertEqual(xcfg.time_stop_minutes, 7 * 1440)
+        basis = pos["position_usd"]
+        now = time.time()
+        # +100% then a 45% pullback from the peak, and a trip back to entry: nothing fires.
+        self.assertIsNone(executor.decide_exit(basis, basis * 2.0, now - 86400, now, xcfg, basis * 2.0))
+        self.assertIsNone(executor.decide_exit(basis, basis * 1.1, now - 86400, now, xcfg, basis * 2.0))
+        self.assertIsNone(executor.decide_exit(basis, basis * 0.99, now - 3 * 86400, now, xcfg, basis * 1.3))
+        self.assertEqual(executor.decide_exit(basis, basis * 0.59, now, now, xcfg, basis), "stop_loss")
+        # The wallet's own sells are the exit: a trim trims ours, a full sale closes it.
+        exits = []
+        ex.copy_execute_exit = lambda p, wallet, sig, fraction, target, sol_price, attempt=1: exits.append(target) or True
+        pos["last_value_usd"] = basis * 2
+        ex.copy_handle_event(self.FRANK, "ftrim", int(time.time()) + 5, tx(5.0, 6.0, 1000, 700, owner=self.FRANK), SOL, True)
+        ex.copy_handle_event(self.FRANK, "fsell", int(time.time()) + 6, tx(6.0, 9.0, 700, 0, owner=self.FRANK), SOL, True)
+        self.assertEqual(exits[-1], 0)
+        self.assertEqual(len(exits), 2)
+
+    def test_long_measured_hold_turns_hold_mode_on(self):
+        executor, ex = self.setup(COPY_HOLD_WALLETS="")
+        ex.state["gmgn_verdicts"] = {WALLET: {"verdict": "copy", "hold_hours": 40.0}}
+        self.assertEqual(ex.copy_hold_mode(WALLET), (True, "GMGN average hold 40h"))
+        ex.state["gmgn_verdicts"] = {WALLET: {"verdict": "copy", "hold_hours": 2.0}}
+        self.assertFalse(ex.copy_hold_mode(WALLET)[0])
+        self.assertFalse(ex.copy_hold_mode(self.FRANK)[0])                    # unlisted and unmeasured
+
+
 class OverlapTests(unittest.TestCase):
     def pools(self, now):
         def pool(mint, age_h, mcap):
