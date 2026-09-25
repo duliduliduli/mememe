@@ -225,9 +225,9 @@ class BuiltinDefaultsTests(unittest.TestCase):
         executor, p = fresh(COPY_WALLETS=f"{self.BIG}, {WALLET}")
         self.addCleanup(p.stop)
         cfg = executor.Config()
-        self.assertEqual((cfg.copy_wallet_min_usd[self.BIG], cfg.copy_wallet_size[self.BIG]), (300.0, 0.5))
+        self.assertEqual((cfg.copy_wallet_min_usd[self.BIG], cfg.copy_wallet_size[self.BIG]), (300.0, 1.0))
         self.assertNotIn(WALLET, cfg.copy_wallet_size)
-        self.assertEqual(cfg.copy_gmgn_gate, "enforce")         # GMGN "skip" wallets are not bought
+        self.assertEqual(cfg.copy_gmgn_gate, "shadow")          # configured wallets are always copied; GMGN only logs
 
     def test_terms_written_in_the_variable_still_win(self):
         executor, p = fresh(COPY_WALLETS=f"{self.BIG}:500:0.25")
@@ -302,7 +302,7 @@ class LaneTests(unittest.TestCase):
         self.addCleanup(p.stop)
         cfg = executor.Config()
         self.assertTrue(cfg.copy_only)
-        self.assertEqual(cfg.max_concurrent, 10)                # copy-only: 8% of the account, ten at once
+        self.assertEqual(cfg.max_concurrent, 15)                # copy-only: 8% of the account, fifteen at once
         self.assertAlmostEqual(cfg.account_fraction, 0.08)
         self.assertAlmostEqual(cfg.max_deployed_fraction, 0.80)
         self.assertFalse(cfg.copy_rotate)

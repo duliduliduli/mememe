@@ -384,17 +384,18 @@ class Config:
         # runner watchlist off: the only entries are mirrored buys. COPY_ONLY=0 runs all lanes.
         self.copy_only = os.getenv("COPY_ONLY", "1" if self.copy_wallets else "0") == "1" and bool(self.copy_wallets)
         if self.copy_only and os.getenv("MAX_CONCURRENT_POSITIONS") is None:
-            self.max_concurrent = 10
+            self.max_concurrent = 15
         if self.copy_only and os.getenv("ACCOUNT_FRACTION") is None:
             self.account_fraction = 0.08
-        # The copy funnel trades many small tickets: at most $8 a copy and a $10 daily stop,
-        # which counts open positions' unrealized loss as well as realized P&L.
+        # The copy funnel casts a wide net of small tickets: at most $5 a copy (the minimum
+        # position), up to 15 at once, and a $25 daily stop (about 14 stop-outs), which counts
+        # open positions' unrealized loss as well as realized P&L.
         if self.copy_only and os.getenv("MAX_POSITION_USD") is None:
-            self.max_position_usd = 8.0
+            self.max_position_usd = 5.0
         if self.copy_only and os.getenv("DAILY_LOSS_LIMIT_USD") is None:
-            self.daily_loss_limit_usd = 10.0
+            self.daily_loss_limit_usd = 25.0
         # Copy-only sizing: 8% of the whole account (free SOL plus open positions) per copy, up
-        # to ten at once, and never more than MAX_DEPLOYED_FRACTION of the account in positions.
+        # to fifteen at once, and never more than MAX_DEPLOYED_FRACTION of the account in positions.
         self.max_deployed_fraction = min(1.0, max(0.1, float(os.getenv("MAX_DEPLOYED_FRACTION", "0.80"))))
         # Each open position costs one Jupiter sell quote per check; the keyless Jupiter tier
         # answers a busy loop with 429s, which delays every exit. Copy positions ride for hours,
@@ -426,7 +427,9 @@ class Config:
         # GMGN marks skip, and lets them back in once a daily re-check rates them better (their
         # sells are always followed); "shadow" logs what it would block and mirrors anyway;
         # "off" ignores it.
-        self.copy_gmgn_gate = os.getenv("COPY_GMGN_GATE", "enforce").strip().lower()
+        # Only ever applied to the configured wallets, which the owner wants copied always: so
+        # the default only logs GMGN's verdict ("shadow"); "enforce" makes it block again.
+        self.copy_gmgn_gate = os.getenv("COPY_GMGN_GATE", "shadow").strip().lower()
         self.gmgn_refresh_hours = float(os.getenv("GMGN_REFRESH_HOURS", "24"))
         self.gmgn_retry_minutes = float(os.getenv("GMGN_RETRY_MINUTES", "60"))
         # Source-event bookkeeping: how many source transactions to decode per wallet per poll
@@ -472,6 +475,17 @@ class Config:
         # the way to -30%. Armed at +20%, not +15%: at +15% the floor wicked out 7M3gDRgo, a
         # slow winner, in the replay. 0 disables it.
         self.copy_breakeven_arm = max(0.0, float(os.getenv("COPY_BREAKEVEN_ARM", "0.20")))
+        # Hold mode for wallets that hold for many hours or days (frankdegods: average hold
+        # 327 h; BP doubled over four days). Our ladder, trail, breakeven floor and 24 h time
+        # stop sell such a position long before the wallet does, so a copy of a hold-mode
+        # wallet exits when the wallet sells (proportionally, its trims trim ours) and
+        # otherwise only on a wide stop or after COPY_HOLD_MAX_DAYS. A wallet is in hold mode
+        # when listed in COPY_HOLD_WALLETS (address or prefix), or when its measured hold (GMGN
+        # average or the scout's median) is at least COPY_HOLD_MIN_HOURS. 0 disables the auto rule.
+        self.copy_hold_wallets = tuple(w.strip() for w in os.getenv("COPY_HOLD_WALLETS", "498g1rVn").split(",") if w.strip())
+        self.copy_hold_min_hours = float(os.getenv("COPY_HOLD_MIN_HOURS", "12"))
+        self.copy_hold_stop_loss = min(0.95, max(0.05, float(os.getenv("COPY_HOLD_STOP_LOSS", "0.40"))))
+        self.copy_hold_max_days = float(os.getenv("COPY_HOLD_MAX_DAYS", "7"))
         self.copy_breakeven_floor = float(os.getenv("COPY_BREAKEVEN_FLOOR", "0.0"))
         # A followed wallet whose stack is large next to the pool takes the price down with it
         # when it leaves: EC2f5DnH's $5,300 and $18,800 buys were both stopped out at -33%
@@ -611,6 +625,7 @@ def save_state(state: dict[str, Any]) -> None:
     tmp.replace(STATE_FILE)
 
 
+ZERO_BALANCE_GRACE_SECONDS = 120.0   # an empty balance this soon after our buy is RPC lag, not a sale
 JEV_CALL_COLUMNS = ["ts", "key", "questions", "route", "latency_ms", "input_tokens", "output_tokens", "answers", "error"]
 
 
@@ -711,7 +726,7 @@ def valid_solana_address(address: str) -> bool:
 # calls for it. 498g1rVn: the biggest winner and the biggest loser of the ledger (13 positions,
 # -$20), with many small buys; only its $300+ conviction buys are copied, at half size.
 BUILTIN_WALLET_TERMS: dict[str, tuple[float, float]] = {
-    "498g1rVnFcnjBjpfw1xyqA1WvgQXUU8RWuELjxkjAayQ": (300.0, 0.5),
+    "498g1rVnFcnjBjpfw1xyqA1WvgQXUU8RWuELjxkjAayQ": (300.0, 1.0),   # frankdegods, copied in hold mode
 }
 
 
@@ -2878,6 +2893,14 @@ class Executor:
         if prefix == "copy":
             cfg.breakeven_arm = self.cfg.copy_breakeven_arm
             cfg.breakeven_floor = self.cfg.copy_breakeven_floor
+        if pos.get("hold_with_source"):
+            # The wallet's sells are the exits; only a wide stop and a long time stop remain.
+            cfg.take_profit = float("inf")
+            cfg.stop_loss = self.cfg.copy_hold_stop_loss
+            cfg.trailing_stop = 0.0
+            cfg.breakeven_arm = 0.0
+            cfg.time_stop_minutes = self.cfg.copy_hold_max_days * 1440
+            return cfg
         if pos.get("ladder"):
             pending = [r for r in pos["ladder"] if not r.get("done")]
             if pending or self.cfg.copy_runner_trail <= 0:
@@ -2946,6 +2969,23 @@ class Executor:
                 self.copy_fetch_and_handle(wallet, entry["signature"], entry.get("blockTime"), sol_price, allow_buys)
             if inbox:
                 log(f"COPY {wallet[:8]}: {len(inbox)} discovered event(s) still queued for the next poll")
+
+    def copy_hold_mode(self, wallet: str) -> tuple[bool, str]:
+        """Is `wallet` copied in hold mode, and why: listed in COPY_HOLD_WALLETS, or its measured
+        hold (GMGN's average, else the scout's median) is at least COPY_HOLD_MIN_HOURS."""
+        cfg = self.cfg
+        if any(wallet == w or (len(w) < 32 and wallet.startswith(w)) for w in cfg.copy_hold_wallets):
+            return True, "COPY_HOLD_WALLETS"
+        if cfg.copy_hold_min_hours <= 0:
+            return False, ""
+        hours = ((self.state.get("gmgn_verdicts") or {}).get(wallet) or {}).get("hold_hours")
+        source = "GMGN average hold"
+        if hours is None and getattr(self, "scout", None) is not None:
+            seconds = self.scout.median_hold_seconds(wallet)
+            hours, source = (seconds / 3600.0 if seconds is not None else None), "median hold"
+        if hours is not None and float(hours) >= cfg.copy_hold_min_hours:
+            return True, f"{source} {float(hours):.0f}h"
+        return False, ""
 
     def copy_poll_round(self, wallets: list[str]) -> list[str]:
         """The followed wallets polled this round. Up to COPY_POLL_WALLETS_PER_POLL all of them
@@ -3140,12 +3180,15 @@ class Executor:
             blocked("no_slot")
             return
         label = "adding to a coin it holds" if is_add else ("first buy of this coin" if pre == 0 else f"first buy (dust {pre_pct:.1f}% left over)")
-        log(f"COPY {wallet[:8]} bought {mint} for ${usd:,.0f} ({label}); mirroring")
+        hold, hold_why = self.copy_hold_mode(wallet)
+        log(f"COPY {wallet[:8]} bought {mint} for ${usd:,.0f} ({label}); mirroring"
+            + (f" in hold mode ({hold_why}): exits follow its sells, stop -{self.cfg.copy_hold_stop_loss:.0%}" if hold else ""))
         record_copy_signal({**signal, "status": "attempted", "mirrored": 1, "reason": "mirrored"})
         self.last_skip = None
         self.enter_with_retry({"mint": mint, "graduated_ts": int(block_time or now_ts()), "enter_at": now_ts(),
                                "copy": wallet, "copy_buy_usd": round(usd), "copy_signature": sig,
-                               "copy_tokens": bought, "copy_size": wallet_size, "copy_scouted": scouted}, sol_price)
+                               "copy_tokens": bought, "copy_size": wallet_size, "copy_scouted": scouted,
+                               "copy_hold": hold}, sol_price)
         # The attempt is only a fill once the position exists with this source signature.
         pos = next((p for p in self.state["positions"] if p.get("copy_signature") == sig), None)
         if pos:
@@ -3792,7 +3835,9 @@ class Executor:
                 "position_id": uuid.uuid4().hex[:16],
                 "entry_tokens": tokens,
                 "entry_basis_usd": size_usd,
-                "ladder": [dict(r, done=False) for r in self.cfg.copy_ladder] if copied and self.cfg.copy_ladder else None,
+                "ladder": ([dict(r, done=False) for r in self.cfg.copy_ladder]
+                           if copied and self.cfg.copy_ladder and not item.get("copy_hold") else None),
+                "hold_with_source": bool(item.get("copy_hold")) or None,
             }
         )
         save_state(self.state)
@@ -3837,6 +3882,12 @@ class Executor:
             mb = 0.0  # too small to be worth the rent it would lock
         if self.cfg.mode == "live":
             amount = self.sellable(mint, int(pos["tokens"]))
+            age = now_ts() - float(pos.get("opened_ts") or 0)
+            if amount <= 0 and age < ZERO_BALANCE_GRACE_SECONDS and pos.get("buy_signature") not in ("adopted", ""):
+                # Seconds after our own buy the RPC can still show an empty balance. Closing
+                # now would book the whole position as lost (3qm8L: -100% one second after
+                # entry, which tripped the daily stop); fail instead, and the exit is retried.
+                raise RuntimeError(f"bought {age:.0f}s ago and the tokens are not visible on-chain yet; retrying the exit")
             if amount <= 0:
                 # A previous sell most likely landed after our confirmation timeout. Record the
                 # close at the last quoted value so the trade log stays complete, and flag it.
@@ -4552,7 +4603,8 @@ class Executor:
             log(line)
         stamp = utc_iso()
         self.state["gmgn_verdicts"] = {r["wallet"]: {"verdict": r["verdict"], "why": r["why"], "evaluated_at": stamp,
-                                                     "window_days": r.get("period_days", 30)} for r in payload}
+                                                     "window_days": r.get("period_days", 30),
+                                                     "hold_hours": r.get("hold_hours")} for r in payload}
         self.state["gmgn_success_ts"] = now_ts()
         bad = [r["wallet"][:8] for r in payload if r["verdict"] == "skip"]
         if bad:

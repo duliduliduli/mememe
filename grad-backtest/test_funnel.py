@@ -100,6 +100,34 @@ class FunnelTests(unittest.TestCase):
         self.assertEqual(len(live), 1)
         self.assertEqual(sorted(live[0]["convergence_wallets"]), sorted([OTHER, THIRD]))
 
+    def test_a_member_sale_before_our_entry_does_not_close_the_live_position(self):
+        executor, ex = self.setup()
+        self.seed(ex, OTHER, state="shadow")
+        self.seed(ex, THIRD, state="shadow")
+        now = time.time()
+        self.buy(ex.scout, OTHER, "a", ts=now - 20)
+        self.buy(ex.scout, THIRD, "b", ts=now - 10)
+        live = [p for p in ex.state["positions"] if p.get("convergence")]
+        self.assertEqual(len(live), 1)
+        closed = []
+        ex.copy_execute_exit = lambda pos, wallet, sig, fraction, target, sol_price, attempt=1: closed.append(wallet) or True
+        ex.scout.shadow_follow_sell(THIRD, MINT, 1.0, SOL, "old-sell", int(now - 120))   # sold before we bought
+        self.assertEqual(closed, [])
+        ex.scout.shadow_follow_sell(THIRD, MINT, 1.0, SOL, "new-sell", int(now + 5))
+        self.assertEqual(closed, [THIRD])
+
+    def test_an_empty_balance_right_after_our_buy_is_retried_not_booked_as_a_loss(self):
+        executor, ex = self.setup()
+        ex.cfg.mode = "live"
+        pos = {"mint": MINT, "tokens": 1000, "position_usd": 8.0, "peak_usd": 8.0, "opened_ts": time.time() - 2,
+               "opened_at": "t", "copy": WALLET, "buy_signature": "sig"}
+        ex.state["positions"] = [pos]
+        ex.sellable = lambda mint, tracked: 0
+        with self.assertRaises(RuntimeError):
+            ex.close_position(pos, "copy_sell", SOL)
+        self.assertEqual(ex.state["positions"], [pos])
+        self.assertEqual(ex.state["daily"]["realized_pnl_usd"], 0.0)
+
     # -- scout: hold time and reject counts ---------------------------------------------------
     def test_hold_time_is_a_five_minute_gate_and_only_sniper_farms_are_rejected(self):
         executor, ex = self.setup()
@@ -120,26 +148,34 @@ class FunnelTests(unittest.TestCase):
         executor, ex = self.setup()
         cand = self.seed(ex, WALLET, state="shadow")
         cand["history"]["metrics_30d"]["median_hold_minutes"] = 0.1              # 6 s median hold
-        allowed, why = ex.scout.entry_allowed(WALLET)
+        self.assertTrue(ex.scout.entry_allowed(WALLET)[0])                       # the owner's wallet: always copied
+        scouted = self.seed(ex, OTHER, state="live")
+        scouted["history"]["metrics_30d"]["median_hold_minutes"] = 0.1
+        allowed, why = ex.scout.entry_allowed(OTHER)
         self.assertFalse(allowed)
         self.assertIn("sniper", why)
 
-    # -- promote / demote ---------------------------------------------------------------------
-    def test_a_configured_wallet_red_after_ten_fills_is_demoted_and_its_sells_still_followed(self):
+    def test_a_rejected_wallet_opens_no_new_paper_trades(self):
         executor, ex = self.setup()
-        for _ in range(9):
+        cand = self.seed(ex, OTHER, state="shadow")
+        self.buy(ex.scout, OTHER, "before")
+        self.assertEqual(len(ex.scout.st["positions"]), 1)
+        cand["state"] = "rejected"
+        self.buy(ex.scout, OTHER, "after", mint="Other")
+        self.assertEqual(len(ex.scout.st["positions"]), 1)                     # the open one still follows its sells
+        self.assertNotIn("Other", ex.scout.st.get("recent_buys") or {})
+
+    # -- promote / demote ---------------------------------------------------------------------
+    def test_a_configured_wallet_red_for_us_is_still_always_copied(self):
+        executor, ex = self.setup()
+        for _ in range(15):
             ex.note_copy_pnl({"copy": WALLET}, -1.0, closed=True)
-        self.assertTrue(ex.scout.entry_allowed(WALLET)[0])                       # nine fills: not yet judged
-        ex.note_copy_pnl({"copy": WALLET}, -0.5)                                 # a moon bag is P&L, not a fill
         self.assertTrue(ex.scout.entry_allowed(WALLET)[0])
-        ex.note_copy_pnl({"copy": WALLET}, -1.0, closed=True)
-        allowed, why = ex.scout.entry_allowed(WALLET)
-        self.assertFalse(allowed)
-        self.assertIn("red for us", why)
+        self.assertEqual(ex.scout.st["live"][WALLET]["fills"], 15)               # still tracked, for the report
         entered = []
         ex.enter_with_retry = lambda item, sol_price: entered.append(item)
         ex.copy_handle_event(WALLET, "buy1", int(time.time()), tx(10.0, 5.0, 0, 1000), SOL, True)
-        self.assertEqual(entered, [])
+        self.assertEqual(len(entered), 1)
         ex.state["positions"] = [{"mint": MINT, "tokens": 1000, "position_usd": 8.0, "last_value_usd": 8.0, "peak_usd": 8.0,
                                   "opened_ts": time.time() - 600, "opened_at": "t", "copy": WALLET, "buy_signature": "b"}]
         exits = []
@@ -147,7 +183,7 @@ class FunnelTests(unittest.TestCase):
         ex.copy_handle_event(WALLET, "sell1", int(time.time()), tx(5.0, 9.0, 1000, 0), SOL, True)
         self.assertEqual(exits, [(WALLET, 0)])
         report = scout.funnel_report(ex.scout.st, ex.scout.cfg, time.time(), [WALLET])
-        self.assertEqual(report["live_set"]["configured"][0]["status"], "demoted")
+        self.assertEqual(report["live_set"]["configured"][0]["status"], "always_copied")
 
     def test_a_green_wallet_is_not_demoted_after_ten_fills(self):
         executor, ex = self.setup()
@@ -165,7 +201,7 @@ class FunnelTests(unittest.TestCase):
         self.assertIn(OTHER, ex.scout.watchlist())
 
     def test_paper_green_promotes_and_coming_back_needs_new_paper_fills(self):
-        executor, ex = self.setup(SCOUT_LIVE="1", SCOUT_LIVE_LOSS_BUDGET_USD="50")
+        executor, ex = self.setup(SCOUT_LIVE="1", SCOUT_LIVE_LOSS_BUDGET_USD="50", SCOUT_REQUIRE_PNL_7D="1")
         cand = self.seed(ex, OTHER, state="shadow")
         cand["stats"]["7d"]["realized_profit"] = -5.0                           # no history route
         ex.scout.evaluate_all()
@@ -206,17 +242,37 @@ class FunnelTests(unittest.TestCase):
         live = [c for c in ex.scout.st["candidates"].values() if c["state"] == "live"]
         self.assertEqual(len(live), 1)                                          # the configured wallet holds the other seat
 
+    def test_screened_out_wallet_is_rejected_evicted_and_not_tracked_again(self):
+        executor, ex = self.setup()
+        lane, now = ex.scout, time.time()
+        lane.st["candidates"]["Loser1"] = {"address": "Loser1", "state": "discovered", "state_since": now, "discovered_at": now,
+                                           "sources": [], "rank_snapshots": [], "lifecycle": [], "last_refresh": now,
+                                           "screen": {"ok": False, "why": "quick screen: realized +120 USD in 30d (need 500)"},
+                                           "stats": {"30d": {"realized_profit": 120.0}}}
+        lane.evaluate_all()
+        self.assertEqual(lane.st["candidates"]["Loser1"]["state"], "rejected")
+        self.assertEqual(lane.evictable()[0], "Loser1")                          # rejected wallets give up their slot first
+        lane.evict("Loser1")
+        self.assertNotIn("Loser1", lane.st["candidates"])
+        self.assertTrue(lane.recently_rejected("Loser1"))
+        lane._result = ("ok", {"candidates": {"Loser1": {"sources": [{"source": "smartmoney", "ts": now}]}}})
+        lane.apply_discovery()
+        self.assertNotIn("Loser1", lane.st["candidates"])                        # the feed mentioning it again changes nothing
+        lane.st["rejected_seen"]["Loser1"] = now - 8 * DAY                       # after SCOUT_REJECT_MEMORY_DAYS it gets another look
+        self.assertFalse(lane.recently_rejected("Loser1"))
+
     # -- sizing, daily stop, polling ----------------------------------------------------------
     def test_funnel_defaults_and_daily_stop_counting_open_losses(self):
         executor, ex = self.setup()
-        self.assertEqual(ex.cfg.max_position_usd, 8.0)
-        self.assertEqual(ex.cfg.daily_loss_limit_usd, 10.0)
-        ex.state["daily"]["realized_pnl_usd"] = -3.0
+        self.assertEqual(ex.cfg.max_position_usd, 5.0)
+        self.assertEqual(ex.cfg.daily_loss_limit_usd, 25.0)
+        self.assertEqual(ex.cfg.max_concurrent, 15)
+        ex.state["daily"]["realized_pnl_usd"] = -18.0
         ex.state["positions"] = [{"mint": "m1", "tokens": 1, "position_usd": 10.0, "last_value_usd": 2.5, "peak_usd": 10.0,
                                   "opened_ts": time.time(), "opened_at": "t", "copy": WALLET},
                                  {"mint": "m2", "tokens": 1, "position_usd": 10.0, "last_value_usd": 30.0, "peak_usd": 30.0,
                                   "opened_ts": time.time(), "opened_at": "t", "copy": WALLET}]
-        self.assertEqual(ex.daily_pnl_usd(), -10.5)                              # the winner does not offset the loser
+        self.assertEqual(ex.daily_pnl_usd(), -25.5)                              # the winner does not offset the loser
         skips = []
         ex.skip = lambda mint, reason: skips.append(reason)
         ex.try_enter({"mint": "m3", "graduated_ts": time.time(), "enter_at": time.time(), "copy": WALLET, "copy_buy_usd": 500}, SOL)
@@ -245,6 +301,58 @@ class FunnelTests(unittest.TestCase):
         self.assertEqual(f["live_set"]["max"], 40)
         self.assertTrue(any(r["wallet"] == OTHER for r in f["paper_pnl_by_wallet"]))
         self.assertIn("gate_failures", report)
+
+
+class HoldModeTests(unittest.TestCase):
+    make, fake_market = test_scout.LaneTests.make, test_scout.LaneTests.fake_market
+    FRANK = "498g1rVnFcnjBjpfw1xyqA1WvgQXUU8RWuELjxkjAayQ"
+
+    def setup(self, **env):
+        env.setdefault("PAPER_BALANCE_USD", "200")
+        env.setdefault("COPY_WALLETS", f"{WALLET},{self.FRANK}")
+        executor, ex = self.make(**env)
+        ex.state["paper_balance_usd"] = 200.0
+        self.fake_market(ex)
+        return executor, ex
+
+    def test_frankdegods_is_copied_in_hold_mode_not_watch_only(self):
+        executor, ex = self.setup()
+        self.assertTrue(ex.scout.entry_allowed(self.FRANK)[0])
+        self.assertEqual(ex.copy_hold_mode(self.FRANK), (True, "COPY_HOLD_WALLETS"))
+        self.assertEqual(ex.copy_hold_mode(WALLET), (False, ""))
+        ex.copy_handle_event(self.FRANK, "fbuy", int(time.time()), tx(10.0, 5.0, 0, 1000, owner=self.FRANK), SOL, True)
+        pos = ex.state["positions"][0]
+        self.assertTrue(pos["hold_with_source"])
+        self.assertIsNone(pos["ladder"])
+        xcfg = ex.exit_cfg(pos)
+        self.assertEqual(xcfg.take_profit, float("inf"))
+        self.assertEqual(xcfg.stop_loss, 0.40)
+        self.assertEqual(xcfg.trailing_stop, 0.0)
+        self.assertEqual(xcfg.breakeven_arm, 0.0)
+        self.assertEqual(xcfg.time_stop_minutes, 7 * 1440)
+        basis = pos["position_usd"]
+        now = time.time()
+        # +100% then a 45% pullback from the peak, and a trip back to entry: nothing fires.
+        self.assertIsNone(executor.decide_exit(basis, basis * 2.0, now - 86400, now, xcfg, basis * 2.0))
+        self.assertIsNone(executor.decide_exit(basis, basis * 1.1, now - 86400, now, xcfg, basis * 2.0))
+        self.assertIsNone(executor.decide_exit(basis, basis * 0.99, now - 3 * 86400, now, xcfg, basis * 1.3))
+        self.assertEqual(executor.decide_exit(basis, basis * 0.59, now, now, xcfg, basis), "stop_loss")
+        # The wallet's own sells are the exit: a trim trims ours, a full sale closes it.
+        exits = []
+        ex.copy_execute_exit = lambda p, wallet, sig, fraction, target, sol_price, attempt=1: exits.append(target) or True
+        pos["last_value_usd"] = basis * 2
+        ex.copy_handle_event(self.FRANK, "ftrim", int(time.time()) + 5, tx(5.0, 6.0, 1000, 700, owner=self.FRANK), SOL, True)
+        ex.copy_handle_event(self.FRANK, "fsell", int(time.time()) + 6, tx(6.0, 9.0, 700, 0, owner=self.FRANK), SOL, True)
+        self.assertEqual(exits[-1], 0)
+        self.assertEqual(len(exits), 2)
+
+    def test_long_measured_hold_turns_hold_mode_on(self):
+        executor, ex = self.setup(COPY_HOLD_WALLETS="")
+        ex.state["gmgn_verdicts"] = {WALLET: {"verdict": "copy", "hold_hours": 40.0}}
+        self.assertEqual(ex.copy_hold_mode(WALLET), (True, "GMGN average hold 40h"))
+        ex.state["gmgn_verdicts"] = {WALLET: {"verdict": "copy", "hold_hours": 2.0}}
+        self.assertFalse(ex.copy_hold_mode(WALLET)[0])
+        self.assertFalse(ex.copy_hold_mode(self.FRANK)[0])                    # unlisted and unmeasured
 
 
 class OverlapTests(unittest.TestCase):
@@ -278,9 +386,46 @@ class OverlapTests(unittest.TestCase):
         ranked = scout.overlap_rank(traders, cfg)
         self.assertEqual([(r["address"], r["hits"]) for r in ranked], [("A", 3), ("B", 2)])
 
+    def test_quick_screen_spends_the_full_pull_only_on_profitable_non_snipers(self):
+        now = time.time()
+        cfg = test_scout.cfg_with(SCOUT_OVERLAP="0", SCOUT_ENRICH_PER_CYCLE="5")
+        stats = {"Loser": (120.0, 3600), "Sniper": (9000.0, 20), "Winner": (4000.0, 7200)}
+
+        class Client:
+            pause_seconds = 0
+            def smart_money(self, chain, limit): return [{"maker": a} for a in stats]
+            def kol(self, chain, limit): return []
+            def market_rank(self, chain, limit): return []
+            def top_traders(self, chain, token, tag=None, limit=20): return []
+            def wallet_stats(self, chain, wallets, period):
+                realized, hold = stats[wallets[0]]
+                return [{"realized_profit": realized, "pnl_stat": {"token_num": 20, "avg_holding_period": hold,
+                                                                   "pnl_2x_5x_num": 3, "pnl_gt_5x_num": 1}}]
+
+        enriched = []
+        with mock.patch.object(scout, "enrich_wallet", lambda client, cfg, a, now, m, b: (enriched.append(a), ({}, 1))[1]):
+            out = scout.discover_and_enrich(Client(), cfg, {}, [], [], now, 300.0)
+        cands = out["candidates"]
+        self.assertEqual(enriched, ["Winner"])
+        self.assertEqual((out["screened"], out["enriched"]), (3, 1))
+        self.assertFalse(cands["Loser"]["screen"]["ok"])
+        self.assertIn("need 500", cands["Loser"]["screen"]["why"])
+        self.assertEqual(cands["Loser"]["last_refresh"], now)                    # screened counts as looked at
+        self.assertIn("sniper", cands["Sniper"]["screen"]["why"])
+        self.assertTrue(cands["Winner"]["screen"]["ok"])
+        self.assertIn("20% of tokens 2x+", cands["Winner"]["screen"]["why"])   # the jackpot rate
+        self.assertEqual(cands["Loser"]["stats"]["30d"]["jackpot_rate"], 0.2)
+        # A wallet that passed before but was not fully enriched is not screened again.
+        enriched.clear()
+        known = {"Winner": {"state": "discovered", "screen": {"ok": True}}}
+        with mock.patch.object(scout, "screen_wallet", side_effect=AssertionError("screened twice")), \
+                mock.patch.object(scout, "enrich_wallet", lambda client, cfg, a, now, m, b: (enriched.append(a), ({}, 1))[1]):
+            scout.discover_and_enrich(Client(), test_scout.cfg_with(SCOUT_OVERLAP="0", SCOUT_SCREEN_PER_CYCLE="0"), known, [], [], now, 300.0)
+        self.assertIn("Winner", enriched)
+
     def test_discovery_feeds_overlap_finds_into_the_watchlist_first(self):
         now = time.time()
-        cfg = test_scout.cfg_with(SCOUT_OVERLAP="1", SCOUT_ENRICH_PER_CYCLE="1")
+        cfg = test_scout.cfg_with(SCOUT_OVERLAP="1", SCOUT_ENRICH_PER_CYCLE="1", SCOUT_SCREEN_PER_CYCLE="0")
 
         class Client:
             pause_seconds = 0
@@ -389,7 +534,7 @@ class JevGateTests(unittest.TestCase):
         state = self.calls[0]["state"]
         self.assertEqual(state["mint"], MINT)
         self.assertEqual(state["source_wallet"], WALLET)
-        self.assertEqual(state["our_ticket_usd"], 8.0)
+        self.assertEqual(state["our_ticket_usd"], 5.0)
         self.assertIn("round_trip_pct", state)
         rows = list(csv.DictReader(open(os.path.join(os.environ["DATA_DIR"], "jev_calls.csv"))))
         self.assertIn('"skip"', rows[-1]["answers"])

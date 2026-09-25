@@ -247,9 +247,12 @@ class GateTests(unittest.TestCase):
         self.assertFalse(ev["qualified"])
 
     def test_bad_tags_and_open_losses(self):
-        cand = good_candidate(WALLET, tags=["bundler"])
+        cand = good_candidate(WALLET, tags=["wash_trader"])
         ev = scout.evaluate_candidate(cand, scout.ScoutConfig(), NOW, 300.0)
         self.assertEqual(ev["gates"]["tags"]["status"], "fail")
+        for insider in ("bundler", "rat_trader"):                               # profitable insiders are copied, not rejected
+            ev = scout.evaluate_candidate(good_candidate(WALLET, tags=[insider]), scout.ScoutConfig(), NOW, 300.0)
+            self.assertEqual(ev["gates"]["tags"]["status"], "pass")
         cand = good_candidate(WALLET)
         cand["holdings"]["open_loss_usd"] = 5000.0                               # more open losses than 30d realized
         ev = scout.evaluate_candidate(cand, scout.ScoutConfig(), NOW, 300.0)
@@ -291,18 +294,23 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(cfg.max_candidates, 400)
             self.assertEqual(cfg.live_size, 1.0)
             self.assertEqual(cfg.max_open_positions, 0)
-            self.assertEqual(cfg.min_median_hold_minutes, 5.0)
-            self.assertEqual(cfg.promote_min_paper_fills, 8)
+            self.assertEqual(cfg.min_median_hold_minutes, 2.0)
+            self.assertEqual(cfg.promote_min_paper_fills, 5)
+            self.assertEqual(cfg.max_best_token_share, 0.6)
+            self.assertFalse(cfg.require_pnl_7d)
+            self.assertEqual((cfg.fast_track_min_episodes_30d, cfg.fast_track_min_tokens_30d), (10, 6))
+            self.assertEqual((cfg.discovery_hours, cfg.enrich_per_cycle, cfg.screen_per_cycle), (1.0, 30, 80))
+            self.assertEqual(cfg.screen_min_profit_usd, 500.0)
             self.assertEqual(cfg.demote_after_live_fills, 10)
             self.assertEqual(cfg.demote_idle_days, 7.0)
-            self.assertEqual(cfg.copy_watch_only, ("EC2f5DnH", "498g1rVn", "CxWRfadz"))
+            self.assertEqual(cfg.copy_watch_only, ())
             self.assertEqual(cfg.live_loss_budget_usd, 25.0)
             self.assertTrue(cfg.fast_track)
             self.assertEqual(cfg.fast_track_min_history_days, 15.0)
             self.assertEqual(cfg.fast_track_dense_episodes, 30)
             self.assertEqual(cfg.fast_track_recent_days, 7.0)
-            self.assertEqual(cfg.discovery_hours, 2.0)
-            self.assertEqual(cfg.enrich_per_cycle, 12)
+            self.assertEqual(cfg.discovery_hours, 1.0)
+            self.assertEqual(cfg.enrich_per_cycle, 30)
             self.assertEqual(cfg.pause_seconds, 2.0)
             self.assertEqual(cfg.rate_limit_cooldown_hours, 0.25)
             self.assertEqual(cfg.tripwire_trades, 10)
@@ -400,7 +408,7 @@ class LaneTests(unittest.TestCase):
         self.assertEqual(ex.scout.st["candidates"][OTHER]["state"], "paused")
 
     def test_demotion_when_a_gate_stops_passing(self):
-        executor, ex = self.make(SCOUT_LIVE="1", SCOUT_LIVE_LOSS_BUDGET_USD="50")
+        executor, ex = self.make(SCOUT_LIVE="1", SCOUT_LIVE_LOSS_BUDGET_USD="50", SCOUT_REQUIRE_PNL_7D="1")
         cand = self.seed(ex, OTHER, state="live")
         ex.scout.st["trades"] = []                                                # the paper route is not holding it either
         cand["stats"]["7d"]["realized_profit"] = -5.0
@@ -454,24 +462,19 @@ class LaneTests(unittest.TestCase):
         rows = list(__import__("csv").DictReader(open(os.path.join(os.environ["DATA_DIR"], "copy_signals.csv"))))
         self.assertEqual([r["reason"] for r in rows if r["status"] == "blocked"], ["scout_slots"])
 
-    def test_stale_elite_only_blocks_buys_but_never_sells(self):
+    def test_elite_only_never_gates_the_owners_configured_wallets(self):
         executor, ex = self.make(SCOUT_ELITE_ONLY="1")
-        self.seed(ex, WALLET, state="qualified", evaluated_at=time.time() - 3 * DAY, configured=True)
+        self.seed(ex, WALLET, state="shadow", evaluated_at=time.time() - 3 * DAY, configured=True)
         entered, sells = [], []
         ex.enter_with_retry = lambda item, sol_price: entered.append(item)
         ex.copy_handle_sell = lambda *a, **k: sells.append(a)
         ex.copy_handle_event(WALLET, "buy1", int(time.time()), tx(10.0, 5.0, 0, 1000), SOL, True)
-        self.assertEqual(entered, [])                                             # stale qualification: no new buy
+        self.assertEqual(len(entered), 1)                                         # configured: always copied
         ex.copy_handle_event(WALLET, "sell1", int(time.time()), tx(5.0, 9.0, 1000, 0), SOL, True)
-        self.assertEqual(len(sells), 1)                                           # sells are always followed
-        ex.scout.st["candidates"][WALLET]["evaluation"]["evaluated_at"] = time.time()
-        ex.copy_handle_event(WALLET, "buy2", int(time.time()), tx(10.0, 5.0, 0, 1000), SOL, True)
-        self.assertEqual(len(entered), 1)                                         # fresh: mirrored
-        ex.scout.st["candidates"][WALLET]["state"] = "shadow"
-        ex.copy_handle_event(WALLET, "buy3", int(time.time()), tx(10.0, 5.0, 0, 1000), SOL, True)
-        self.assertEqual(len(entered), 1)                                         # not qualified: blocked
-        rows = list(__import__("csv").DictReader(open(os.path.join(os.environ["DATA_DIR"], "copy_signals.csv"))))
-        self.assertEqual([r["reason"] for r in rows if r["status"] == "blocked"], ["elite_only", "elite_only"])
+        self.assertEqual(len(sells), 1)
+        allowed, why = ex.scout.entry_allowed(OTHER)                              # a scouted wallet still needs a verdict
+        self.assertFalse(allowed)
+        self.assertIn("elite_only", why)
 
     def test_elite_only_off_changes_nothing(self):
         executor, ex = self.make(SCOUT_ELITE_ONLY="0")
@@ -672,7 +675,7 @@ class LaneTests(unittest.TestCase):
 
     # -- fast track --------------------------------------------------------------------------
     def test_fast_track_qualifies_on_history_alone_but_never_promotes_with_the_switch_off(self):
-        executor, ex = self.make(SCOUT_FAST_TRACK="1")
+        executor, ex = self.make(SCOUT_FAST_TRACK="1", SCOUT_REQUIRE_PNL_7D="1")
         cand = self.seed(ex, OTHER, state="shadow")
         cand["rank_snapshots"] = []                                               # no leaderboard evidence
         cand["holdings"] = None                                                   # holdings need signed auth
@@ -900,7 +903,7 @@ class DiscoveryTests(unittest.TestCase):
             def top_traders(self, chain, token, tag=None, limit=20):
                 return [{"address": OTHER, "profit": 5, "transfer_in": False}, {"address": "Susp", "profit": 9, "is_suspicious": True}]
             def wallet_stats(self, chain, wallets, period):
-                return [{"realized_profit": 100.0, "realized_profit_pnl": 0.1, "buy": 10, "sell": 8, "bought_cost": 1000.0, "sold_income": 1100.0,
+                return [{"realized_profit": 1000.0, "realized_profit_pnl": 0.1, "buy": 10, "sell": 8, "bought_cost": 1000.0, "sold_income": 1100.0,
                          "last_timestamp": int(NOW), "pnl_stat": {"token_num": 4, "winrate": 0.5, "avg_holding_period": 3600},
                          "common": {"tags": ["smart_degen"], "tag_rank": {"smart_degen": 0}, "twitter_username": "", "followers_count": 0,
                                     "fund_from_address": "Funder", "created_token_count": 0}}]
