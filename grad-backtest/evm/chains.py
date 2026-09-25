@@ -25,6 +25,12 @@ class Chain:
     explorer: str
     gas_reserve_native: float      # keep this much native for gas
     price_chain: str = ""          # price the native token on this chain instead (same asset)
+    # Uniswap V4: the singleton PoolManager, a V4Quoter bound to it, the Universal Router most
+    # swaps go through, and Permit2. Empty: no V4 routing on this chain.
+    v4_pool_manager: str = ""
+    v4_quoter: str = ""
+    universal_router: str = ""
+    permit2: str = ""
     extra: dict[str, str] = field(default_factory=dict)
 
 
@@ -38,10 +44,16 @@ DEFAULTS: dict[str, Chain] = {
     "robinhood": Chain(
         key="robinhood", chain_id=4663, rpc_url="https://rpc.mainnet.chain.robinhood.com",
         native_symbol="ETH", wrapped_native="0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
-        stable="0x5fc5360d0400a0fd4f2af552add042d716f1d168", stable_decimals=6, block_seconds=0.25,   # USDG
+        stable="0x5fc5360d0400a0fd4f2af552add042d716f1d168", stable_decimals=6, block_seconds=0.1,    # USDG; ~10 blocks a second (measured)
         v3_quoter="0x33e885ed0ec9bf04ecfb19341582aadcb4c8a9e7", v3_router="0xcaf681a66d020601342297493863e78c959e5cb2",
-        v3_fees=(500, 3000, 10000), v2_router="0x89e5db8b5aa49aa85ac63f691524311aeb649eba",
+        v3_fees=(100, 500, 2500, 3000, 10000), v2_router="0x89e5db8b5aa49aa85ac63f691524311aeb649eba",
         explorer="https://robinhoodchain.blockscout.com/tx/", gas_reserve_native=0.002,
+        # Every memecoin pool we checked (Uniswap V4 and Pons, which is V4 with a hook) lives in
+        # this PoolManager; the router is the one most of its swaps come through.
+        v4_pool_manager="0x8366a39cc670b4001a1121b8f6a443a643e40951",
+        v4_quoter="0x6492C2e9340A6Cc1b12963D4723D819Af5B3CC5F",
+        universal_router="0x8876789976dEcBfCbBbe364623C63652db8C0904",
+        permit2="0x000000000022D473030F116dDEE9F6B43aC78BA3",
     ),
     "base": Chain(
         key="base", chain_id=8453, rpc_url="https://mainnet.base.org,https://base-rpc.publicnode.com",
@@ -94,7 +106,8 @@ def load_chains(keys: list[str]) -> dict[str, Chain]:
         if key_alchemy and key in ALCHEMY_NETWORKS:
             chain.rpc_url = f"https://{ALCHEMY_NETWORKS[key]}.g.alchemy.com/v2/{key_alchemy}," + chain.rpc_url
         prefix = f"EVM_{key.upper()}_"
-        for name in ("rpc_url", "v3_quoter", "v3_router", "v2_router", "wrapped_native", "stable"):
+        for name in ("rpc_url", "v3_quoter", "v3_router", "v2_router", "wrapped_native", "stable",
+                     "v4_pool_manager", "v4_quoter", "universal_router", "permit2"):
             value = os.getenv(prefix + name.upper())
             if value:
                 setattr(chain, name, value.strip())

@@ -1914,7 +1914,12 @@ def candidate_report(st: dict[str, Any], cfg: ScoutConfig, now: float) -> dict[s
 def configured_wallets_from_env() -> list[str]:
     """COPY_WALLETS as the executor reads it (address, or address:min[:size]), for read-only
     reports that do not construct an executor."""
-    return [w.split(":")[0].strip() for w in os.getenv("COPY_WALLETS", "").split(",") if w.split(":")[0].strip()]
+    out: list[str] = []
+    for w in os.getenv("COPY_WALLETS", "").split(","):
+        address = w.split(":")[0].strip()
+        if address and address not in out:
+            out.append(address)
+    return out
 
 
 def funnel_report(st: dict[str, Any], cfg: ScoutConfig, now: float, configured: list[str] | None = None,

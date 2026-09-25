@@ -45,7 +45,10 @@ class FakeRpc:
                 continue
             ok = True
             for i, t in enumerate(topics):
-                if t is not None and entry["topics"][i].lower() != t.lower():
+                if t is None:
+                    continue
+                wanted = [x.lower() for x in t] if isinstance(t, list) else [t.lower()]
+                if len(entry["topics"]) <= i or entry["topics"][i].lower() not in wanted:
                     ok = False
             if ok:
                 out.append(entry)
@@ -119,7 +122,7 @@ class WatchTests(unittest.TestCase):
         pos = self.ln.state["positions"][0]
         self.assertEqual(pos["copy"], WALLET)
         self.assertAlmostEqual(pos["copy_buy_usd"], 300)          # 100_000 * 0.000001 ETH * $3000
-        self.assertAlmostEqual(pos["position_usd"], 16.0)          # 8% of $200 paper equity
+        self.assertAlmostEqual(pos["position_usd"], 5.0)           # 8% of $200 paper equity, capped at the $5 default
         self.assertIn("0xnew", self.ln.state["copy_seen"]["base"])
         self.assertNotIn("0xold", self.ln.state["copy_seen"]["base"])
         self.ln._last_poll = 0

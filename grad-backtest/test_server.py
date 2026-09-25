@@ -32,7 +32,7 @@ class ServerTests(unittest.TestCase):
         self.assertNotIn("never", str(body))
 
     def test_evm_status_reports_unconfigured_lane(self):
-        with mock.patch.dict(os.environ, {"EVM_COPY_WALLETS": "", "EVM_PRIVATE_KEY": ""}):
+        with mock.patch.dict(os.environ, {"EVM_COPY_WALLETS": "", "EVM_PRIVATE_KEY": "", "EVM_SCOUT": "0"}):
             resp = self.client.get("/api/evm")
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
@@ -40,6 +40,8 @@ class ServerTests(unittest.TestCase):
         self.assertFalse(body["running"])
         with mock.patch.dict(os.environ, {"EVM_COPY_WALLETS": "0x1111111111111111111111111111111111111111", "EXECUTOR_MODE": "live", "EVM_PRIVATE_KEY": ""}):
             self.assertFalse(server._evm_configured())              # live needs a key
+        with mock.patch.dict(os.environ, {"EVM_COPY_WALLETS": "", "EVM_MODE": "paper", "EVM_SCOUT": "1"}):
+            self.assertTrue(server._evm_configured())               # the scout finds the wallets itself
         with mock.patch.dict(os.environ, {"EVM_COPY_WALLETS": "0x1111111111111111111111111111111111111111", "EXECUTOR_MODE": "paper", "EVM_PRIVATE_KEY": ""}):
             self.assertTrue(server._evm_configured())
 

@@ -59,7 +59,11 @@ class Rpc:
                 if data.get("error"):
                     err = data["error"]
                     message = str(err.get("message") or err)
-                    if "rate" in message.lower() or "limit" in message.lower() or err.get("code") == 429:
+                    # "logs matched by query exceeds limit of 10000" is a too-wide query, not a
+                    # rate limit: it is raised to the caller, which narrows the range.
+                    low = message.lower()
+                    if "rate" in low or "too many requests" in low or err.get("code") == 429 or (
+                            "limit" in low and "exceed" not in low and "logs" not in low):
                         raise RpcError("429 rate limited")
                     raise RpcError(f"{method}: {message}")
                 return data.get("result")

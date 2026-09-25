@@ -743,7 +743,8 @@ def parse_wallet_list(spec: str) -> tuple[tuple[str, ...], dict[str, float], dic
         address = parts[0]
         if not address:
             continue
-        wallets.append(address)
+        if address not in wallets:              # a wallet listed twice is still one wallet, polled once
+            wallets.append(address)
         minimum = parts[1] if len(parts) > 1 else ""
         size = parts[2] if len(parts) > 2 else ""
         try:

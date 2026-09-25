@@ -22,7 +22,7 @@ COPY data/graduations.example.csv data/
 
 # Catch missing runtime modules during the image build instead of after
 # Railway has already started the web server and autostarted the executor.
-RUN python -c "import bundle_analysis, executor, mm.paper, mm.live, evm.lane, gmgn, jev, scout"
+RUN python -c "import bundle_analysis, executor, mm.paper, mm.live, evm.lane, evm.scout, gmgn, jev, scout"
 
 ENV PYTHONUNBUFFERED=1
 # All scripts read/write here; mount a Railway volume at /data to persist

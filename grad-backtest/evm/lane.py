@@ -18,12 +18,14 @@ from eth_utils import to_checksum_address
 from .chains import ZERO, Chain, load_chains
 from .rpc import TRANSFER_TOPIC, Rpc, RpcError, pad_address, topic_address, transfers_in_receipt
 from .router import Quote, Router
+from .scout import Scout, ScoutConfig
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 STATE_FILE = DATA_DIR / "evm_state.json"
 TRADES_FILE = DATA_DIR / "evm_trades.csv"
 LOG_FILE = DATA_DIR / "evm.log"
 STOP_FLAG = DATA_DIR / "evm.stop"
+SCOUT_FILE = DATA_DIR / "evm_scout.json"
 PANIC_FLAG = DATA_DIR / "evm.panic"
 
 
@@ -80,11 +82,12 @@ class Config:
         self.wallet_size = {to_checksum_address(w): s for w, s in raw_sizes.items()}
         # Sizing: the same rules as the Solana lane, applied to this lane's own equity.
         self.account_fraction = float(env("ACCOUNT_FRACTION", "0.08"))
-        self.max_position_usd = float(env("MAX_POSITION_USD", "20"))
+        # The same small tickets as the Solana copy funnel unless set: $5 a copy, $25 daily stop.
+        self.max_position_usd = float(env("EVM_MAX_POSITION_USD") or env("MAX_POSITION_USD") or "5")
         self.min_position_usd = float(env("MIN_POSITION_USD", "5"))
         self.max_concurrent = int(env("MAX_CONCURRENT_POSITIONS", "10"))
         self.max_deployed_fraction = min(1.0, max(0.1, float(env("MAX_DEPLOYED_FRACTION", "0.80"))))
-        self.daily_loss_limit_usd = float(env("DAILY_LOSS_LIMIT_USD", "0"))
+        self.daily_loss_limit_usd = float(env("EVM_DAILY_LOSS_LIMIT_USD") or env("DAILY_LOSS_LIMIT_USD") or "25")
         self.paper_balance_usd = float(env("PAPER_BALANCE_USD", "500"))
         # Copy rules and exits: shared names with the Solana lane so one setting rules both.
         self.copy_min_buy_usd = float(env("COPY_MIN_BUY_USD", "300"))
@@ -145,6 +148,10 @@ class Lane:
             signer = (lambda permit: self._sign_permit(permit)) if self.account else None
             self.routers[key] = Router(chain, self.rpcs[key], self.address, cfg.api_key, cfg.slippage_pct, send, signer)
         self.state: dict[str, Any] = self.load_state()
+        self.scout: Scout | None = None
+        scout_cfg = ScoutConfig()
+        if scout_cfg.enabled and scout_cfg.chain in self.chains:
+            self.scout = Scout(scout_cfg, self.rpcs[scout_cfg.chain], SCOUT_FILE, log=log)
         self._price_cache: dict[str, tuple[float, float]] = {}
         self._last_manage = 0.0
         self._last_poll = 0.0
@@ -293,9 +300,23 @@ class Lane:
         return round(size, 2), ""
 
     # ---- copy watching ---------------------------------------------------
+    def wallets_for(self, key: str) -> list[str]:
+        """EVM_COPY_WALLETS on every chain, plus the scout's live wallets on its chain."""
+        out = list(self.cfg.wallets)
+        if self.scout is not None and key == self.scout.cfg.chain:
+            out += [w for w in self.scout.live_wallets() if w not in out]
+        return out
+
+    def min_buy_usd(self, wallet: str) -> float:
+        if wallet in self.cfg.wallet_min_usd:
+            return self.cfg.wallet_min_usd[wallet]
+        if wallet not in self.cfg.wallets and self.scout is not None:
+            return self.scout.cfg.min_buy_usd
+        return self.cfg.copy_min_buy_usd
+
     def poll_wallets(self) -> None:
         cfg = self.cfg
-        if not cfg.wallets or now_ts() - self._last_poll < cfg.copy_poll_seconds:
+        if not any(self.wallets_for(k) for k in self.chains) or now_ts() - self._last_poll < cfg.copy_poll_seconds:
             return
         self._last_poll = now_ts()
         for key, chain in self.chains.items():
@@ -306,12 +327,15 @@ class Lane:
 
     def _poll_chain(self, key: str, chain: Chain) -> None:
         cfg, rpc = self.cfg, self.rpcs[key]
+        wallets = self.wallets_for(key)
+        if not wallets:
+            return
         head = rpc.block_number()
         last = int(self.state["last_block"].get(key) or 0)
         window = max(1, int(cfg.copy_max_tx_age_seconds / chain.block_seconds))
         if last <= 0:
             start = max(1, head - window)
-            log(f"{key}: watching {len(cfg.wallets)} wallet(s) from block {start} (head {head})")
+            log(f"{key}: watching {len(wallets)} wallet(s) from block {start} (head {head})")
         else:
             start = last + 1
         if start > head:
@@ -319,13 +343,20 @@ class Lane:
         if head - start > cfg.log_scan_blocks:
             start = head - cfg.log_scan_blocks
         seen_all = self.state["copy_seen"].setdefault(key, [])
-        events: dict[str, dict[str, Any]] = {}
-        for wallet in cfg.wallets:
-            padded = pad_address(wallet)
-            for topics, side in (([TRANSFER_TOPIC, None, padded], "in"), ([TRANSFER_TOPIC, padded], "out")):
+        events: dict[tuple[str, str], dict[str, Any]] = {}
+        by_topic = {pad_address(w): w for w in wallets}
+        # One query per side for up to 50 wallets (topics OR-match), not two per wallet: a
+        # public RPC answers a poll of dozens of wallets every few seconds this way.
+        for i in range(0, len(wallets), 50):
+            padded = [pad_address(w) for w in wallets[i:i + 50]]
+            for topics, side, slot in (([TRANSFER_TOPIC, None, padded], "in", 2), ([TRANSFER_TOPIC, padded], "out", 1)):
                 for entry in rpc.logs(start, head, topics):
                     tx_hash = entry.get("transactionHash")
-                    if not tx_hash or tx_hash in seen_all:
+                    entry_topics = entry.get("topics") or []
+                    if not tx_hash or tx_hash in seen_all or len(entry_topics) <= slot:
+                        continue
+                    wallet = by_topic.get("0x" + entry_topics[slot][-64:].lower())
+                    if wallet is None:
                         continue
                     token = to_checksum_address(entry["address"])
                     if token.lower() in (chain.wrapped_native.lower(), chain.stable.lower()):
@@ -334,10 +365,10 @@ class Lane:
                         amount = int(entry.get("data") or "0x0", 16)
                     except ValueError:
                         continue
-                    ev = events.setdefault(tx_hash, {"wallet": wallet, "block": int(entry["blockNumber"], 16), "deltas": {}})
+                    ev = events.setdefault((tx_hash, wallet), {"wallet": wallet, "block": int(entry["blockNumber"], 16), "deltas": {}})
                     ev["deltas"][token] = ev["deltas"].get(token, 0) + (amount if side == "in" else -amount)
         self.state["last_block"][key] = head
-        for tx_hash, ev in sorted(events.items(), key=lambda kv: kv[1]["block"]):
+        for (tx_hash, _), ev in sorted(events.items(), key=lambda kv: kv[1]["block"]):
             seen_all.append(tx_hash)
             del seen_all[:-500]
             age = (head - ev["block"]) * chain.block_seconds
@@ -395,7 +426,7 @@ class Lane:
         if usd <= 0:
             log(f"COPY {key} {wallet[:8]} received {symbol} ({token[:10]}) with no sell route; ignored")
             return
-        minimum = cfg.wallet_min_usd.get(wallet, cfg.copy_min_buy_usd)
+        minimum = self.min_buy_usd(wallet)
         if usd < minimum:
             log(f"COPY {key} {wallet[:8]} bought {symbol} for ~${usd:,.0f} < ${minimum:,.0f} minimum; ignored")
             return
@@ -633,6 +664,8 @@ class Lane:
 
     def run_cycle(self) -> None:
         roll_daily(self.state)
+        if self.scout is not None:
+            self.scout.maybe_run()
         panic = PANIC_FLAG.exists()
         draining = STOP_FLAG.exists() or panic
         self.state["draining"] = draining
@@ -656,6 +689,7 @@ class Lane:
             f"slippage={cfg.slippage_pct:.0f}% round_trip>={cfg.min_round_trip_pct:.0f}% "
             f"{'rotate' if cfg.copy_rotate else 'no-rotate'} {'follow-sells' if cfg.copy_follow_sells else 'own-exits'} "
             f"daily_loss_limit=${cfg.daily_loss_limit_usd}")
+        log("wallet scout: " + (self.scout.cfg.describe() if self.scout is not None else "off"))
         if cfg.mode == "live":
             log(f"live wallet: {self.address} (burner only!)")
         for key, chain in self.chains.items():
@@ -670,7 +704,7 @@ class Lane:
             log(f"resuming {len(self.state['positions'])} open position(s) from state: "
                 + ", ".join(f"{p['chain']} {p['symbol']}" for p in self.state["positions"]))
         if cfg.mode == "live" and not cfg.api_key:
-            log("NOTE: UNISWAP_API_KEY not set; Robinhood Chain tokens in Uniswap V4 pools (most launchpad graduates) cannot be routed")
+            log("NOTE: UNISWAP_API_KEY not set; routing on-chain: Uniswap V4 native-ETH pools (Pons and V4 launches), V3 and V2")
         self.save_state()
 
     def run(self) -> None:
@@ -689,7 +723,7 @@ class Lane:
 
 def main() -> None:
     cfg = Config()
-    if not cfg.wallets:
-        log("EVM_COPY_WALLETS is empty; nothing to follow. Exiting.")
+    if not cfg.wallets and not ScoutConfig().enabled:
+        log("EVM_COPY_WALLETS is empty and the wallet scout is off (EVM_SCOUT=0); nothing to follow. Exiting.")
         sys.exit(0)
     Lane(cfg).run()
