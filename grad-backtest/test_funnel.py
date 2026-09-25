@@ -201,7 +201,7 @@ class FunnelTests(unittest.TestCase):
         self.assertIn(OTHER, ex.scout.watchlist())
 
     def test_paper_green_promotes_and_coming_back_needs_new_paper_fills(self):
-        executor, ex = self.setup(SCOUT_LIVE="1", SCOUT_LIVE_LOSS_BUDGET_USD="50")
+        executor, ex = self.setup(SCOUT_LIVE="1", SCOUT_LIVE_LOSS_BUDGET_USD="50", SCOUT_REQUIRE_PNL_7D="1")
         cand = self.seed(ex, OTHER, state="shadow")
         cand["stats"]["7d"]["realized_profit"] = -5.0                           # no history route
         ex.scout.evaluate_all()
@@ -242,17 +242,37 @@ class FunnelTests(unittest.TestCase):
         live = [c for c in ex.scout.st["candidates"].values() if c["state"] == "live"]
         self.assertEqual(len(live), 1)                                          # the configured wallet holds the other seat
 
+    def test_screened_out_wallet_is_rejected_evicted_and_not_tracked_again(self):
+        executor, ex = self.setup()
+        lane, now = ex.scout, time.time()
+        lane.st["candidates"]["Loser1"] = {"address": "Loser1", "state": "discovered", "state_since": now, "discovered_at": now,
+                                           "sources": [], "rank_snapshots": [], "lifecycle": [], "last_refresh": now,
+                                           "screen": {"ok": False, "why": "quick screen: realized +120 USD in 30d (need 500)"},
+                                           "stats": {"30d": {"realized_profit": 120.0}}}
+        lane.evaluate_all()
+        self.assertEqual(lane.st["candidates"]["Loser1"]["state"], "rejected")
+        self.assertEqual(lane.evictable()[0], "Loser1")                          # rejected wallets give up their slot first
+        lane.evict("Loser1")
+        self.assertNotIn("Loser1", lane.st["candidates"])
+        self.assertTrue(lane.recently_rejected("Loser1"))
+        lane._result = ("ok", {"candidates": {"Loser1": {"sources": [{"source": "smartmoney", "ts": now}]}}})
+        lane.apply_discovery()
+        self.assertNotIn("Loser1", lane.st["candidates"])                        # the feed mentioning it again changes nothing
+        lane.st["rejected_seen"]["Loser1"] = now - 8 * DAY                       # after SCOUT_REJECT_MEMORY_DAYS it gets another look
+        self.assertFalse(lane.recently_rejected("Loser1"))
+
     # -- sizing, daily stop, polling ----------------------------------------------------------
     def test_funnel_defaults_and_daily_stop_counting_open_losses(self):
         executor, ex = self.setup()
-        self.assertEqual(ex.cfg.max_position_usd, 8.0)
-        self.assertEqual(ex.cfg.daily_loss_limit_usd, 10.0)
-        ex.state["daily"]["realized_pnl_usd"] = -3.0
+        self.assertEqual(ex.cfg.max_position_usd, 5.0)
+        self.assertEqual(ex.cfg.daily_loss_limit_usd, 25.0)
+        self.assertEqual(ex.cfg.max_concurrent, 15)
+        ex.state["daily"]["realized_pnl_usd"] = -18.0
         ex.state["positions"] = [{"mint": "m1", "tokens": 1, "position_usd": 10.0, "last_value_usd": 2.5, "peak_usd": 10.0,
                                   "opened_ts": time.time(), "opened_at": "t", "copy": WALLET},
                                  {"mint": "m2", "tokens": 1, "position_usd": 10.0, "last_value_usd": 30.0, "peak_usd": 30.0,
                                   "opened_ts": time.time(), "opened_at": "t", "copy": WALLET}]
-        self.assertEqual(ex.daily_pnl_usd(), -10.5)                              # the winner does not offset the loser
+        self.assertEqual(ex.daily_pnl_usd(), -25.5)                              # the winner does not offset the loser
         skips = []
         ex.skip = lambda mint, reason: skips.append(reason)
         ex.try_enter({"mint": "m3", "graduated_ts": time.time(), "enter_at": time.time(), "copy": WALLET, "copy_buy_usd": 500}, SOL)
@@ -366,9 +386,46 @@ class OverlapTests(unittest.TestCase):
         ranked = scout.overlap_rank(traders, cfg)
         self.assertEqual([(r["address"], r["hits"]) for r in ranked], [("A", 3), ("B", 2)])
 
+    def test_quick_screen_spends_the_full_pull_only_on_profitable_non_snipers(self):
+        now = time.time()
+        cfg = test_scout.cfg_with(SCOUT_OVERLAP="0", SCOUT_ENRICH_PER_CYCLE="5")
+        stats = {"Loser": (120.0, 3600), "Sniper": (9000.0, 20), "Winner": (4000.0, 7200)}
+
+        class Client:
+            pause_seconds = 0
+            def smart_money(self, chain, limit): return [{"maker": a} for a in stats]
+            def kol(self, chain, limit): return []
+            def market_rank(self, chain, limit): return []
+            def top_traders(self, chain, token, tag=None, limit=20): return []
+            def wallet_stats(self, chain, wallets, period):
+                realized, hold = stats[wallets[0]]
+                return [{"realized_profit": realized, "pnl_stat": {"token_num": 20, "avg_holding_period": hold,
+                                                                   "pnl_2x_5x_num": 3, "pnl_gt_5x_num": 1}}]
+
+        enriched = []
+        with mock.patch.object(scout, "enrich_wallet", lambda client, cfg, a, now, m, b: (enriched.append(a), ({}, 1))[1]):
+            out = scout.discover_and_enrich(Client(), cfg, {}, [], [], now, 300.0)
+        cands = out["candidates"]
+        self.assertEqual(enriched, ["Winner"])
+        self.assertEqual((out["screened"], out["enriched"]), (3, 1))
+        self.assertFalse(cands["Loser"]["screen"]["ok"])
+        self.assertIn("need 500", cands["Loser"]["screen"]["why"])
+        self.assertEqual(cands["Loser"]["last_refresh"], now)                    # screened counts as looked at
+        self.assertIn("sniper", cands["Sniper"]["screen"]["why"])
+        self.assertTrue(cands["Winner"]["screen"]["ok"])
+        self.assertIn("20% of tokens 2x+", cands["Winner"]["screen"]["why"])   # the jackpot rate
+        self.assertEqual(cands["Loser"]["stats"]["30d"]["jackpot_rate"], 0.2)
+        # A wallet that passed before but was not fully enriched is not screened again.
+        enriched.clear()
+        known = {"Winner": {"state": "discovered", "screen": {"ok": True}}}
+        with mock.patch.object(scout, "screen_wallet", side_effect=AssertionError("screened twice")), \
+                mock.patch.object(scout, "enrich_wallet", lambda client, cfg, a, now, m, b: (enriched.append(a), ({}, 1))[1]):
+            scout.discover_and_enrich(Client(), test_scout.cfg_with(SCOUT_OVERLAP="0", SCOUT_SCREEN_PER_CYCLE="0"), known, [], [], now, 300.0)
+        self.assertIn("Winner", enriched)
+
     def test_discovery_feeds_overlap_finds_into_the_watchlist_first(self):
         now = time.time()
-        cfg = test_scout.cfg_with(SCOUT_OVERLAP="1", SCOUT_ENRICH_PER_CYCLE="1")
+        cfg = test_scout.cfg_with(SCOUT_OVERLAP="1", SCOUT_ENRICH_PER_CYCLE="1", SCOUT_SCREEN_PER_CYCLE="0")
 
         class Client:
             pause_seconds = 0
@@ -477,7 +534,7 @@ class JevGateTests(unittest.TestCase):
         state = self.calls[0]["state"]
         self.assertEqual(state["mint"], MINT)
         self.assertEqual(state["source_wallet"], WALLET)
-        self.assertEqual(state["our_ticket_usd"], 8.0)
+        self.assertEqual(state["our_ticket_usd"], 5.0)
         self.assertIn("round_trip_pct", state)
         rows = list(csv.DictReader(open(os.path.join(os.environ["DATA_DIR"], "jev_calls.csv"))))
         self.assertIn('"skip"', rows[-1]["answers"])

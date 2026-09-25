@@ -302,7 +302,7 @@ class LaneTests(unittest.TestCase):
         self.addCleanup(p.stop)
         cfg = executor.Config()
         self.assertTrue(cfg.copy_only)
-        self.assertEqual(cfg.max_concurrent, 10)                # copy-only: 8% of the account, ten at once
+        self.assertEqual(cfg.max_concurrent, 15)                # copy-only: 8% of the account, fifteen at once
         self.assertAlmostEqual(cfg.account_fraction, 0.08)
         self.assertAlmostEqual(cfg.max_deployed_fraction, 0.80)
         self.assertFalse(cfg.copy_rotate)

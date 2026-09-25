@@ -384,17 +384,18 @@ class Config:
         # runner watchlist off: the only entries are mirrored buys. COPY_ONLY=0 runs all lanes.
         self.copy_only = os.getenv("COPY_ONLY", "1" if self.copy_wallets else "0") == "1" and bool(self.copy_wallets)
         if self.copy_only and os.getenv("MAX_CONCURRENT_POSITIONS") is None:
-            self.max_concurrent = 10
+            self.max_concurrent = 15
         if self.copy_only and os.getenv("ACCOUNT_FRACTION") is None:
             self.account_fraction = 0.08
-        # The copy funnel trades many small tickets: at most $8 a copy and a $10 daily stop,
-        # which counts open positions' unrealized loss as well as realized P&L.
+        # The copy funnel casts a wide net of small tickets: at most $5 a copy (the minimum
+        # position), up to 15 at once, and a $25 daily stop (about 14 stop-outs), which counts
+        # open positions' unrealized loss as well as realized P&L.
         if self.copy_only and os.getenv("MAX_POSITION_USD") is None:
-            self.max_position_usd = 8.0
+            self.max_position_usd = 5.0
         if self.copy_only and os.getenv("DAILY_LOSS_LIMIT_USD") is None:
-            self.daily_loss_limit_usd = 10.0
+            self.daily_loss_limit_usd = 25.0
         # Copy-only sizing: 8% of the whole account (free SOL plus open positions) per copy, up
-        # to ten at once, and never more than MAX_DEPLOYED_FRACTION of the account in positions.
+        # to fifteen at once, and never more than MAX_DEPLOYED_FRACTION of the account in positions.
         self.max_deployed_fraction = min(1.0, max(0.1, float(os.getenv("MAX_DEPLOYED_FRACTION", "0.80"))))
         # Each open position costs one Jupiter sell quote per check; the keyless Jupiter tier
         # answers a busy loop with 429s, which delays every exit. Copy positions ride for hours,
