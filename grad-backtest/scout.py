@@ -1313,7 +1313,7 @@ class ScoutLane:
         usd = swap["sol"] * sol_price + swap.get("stable_usd", 0.0)
         age = self.now() - int(block_time) if block_time else 0.0
         if swap["side"] == "sell":
-            self.shadow_follow_sell(wallet, swap["mint"], float(swap.get("fraction") or 1.0), sol_price, sig)
+            self.shadow_follow_sell(wallet, swap["mint"], float(swap.get("fraction") or 1.0), sol_price, sig, block_time)
             return
         self.shadow_handle_buy(wallet, sig, block_time, swap, usd, age, sol_price)
 
@@ -1571,14 +1571,24 @@ class ScoutLane:
     def convergence_summary(self) -> dict[str, Any]:
         return convergence_report(self.st, self.cfg)
 
-    def shadow_follow_sell(self, wallet: str, mint: str, fraction: float, sol_price: float, sig: str) -> None:
+    def shadow_follow_sell(self, wallet: str, mint: str, fraction: float, sol_price: float, sig: str,
+                           block_time: Any = None) -> None:
         cfg = self.ex.cfg
+
+        def predates(pos: dict[str, Any], opened_key: str) -> bool:
+            # A sale made before we entered belongs to the member's earlier episode (it
+            # bought and flipped while we were still deciding); it does not end our position.
+            return bool(block_time) and int(block_time) < float(pos.get(opened_key) or 0) - 30
+
         # A live convergence position exits on the first member's full sell, like its shadow.
         # Its members are scout wallets the production copy poll does not watch, so this is
         # the only place their sells are seen.
         if fraction >= cfg.copy_full_sell_fraction:
             for pos in list(self.ex.state["positions"]):
                 if pos.get("convergence") and pos.get("mint") == mint and wallet in (pos.get("convergence_wallets") or []):
+                    if predates(pos, "opened_ts"):
+                        self.log(f"CONVERGENCE {mint}: member {wallet[:8]} sold before our entry; own exits apply")
+                        continue
                     self.log(f"CONVERGENCE {mint}: member {wallet[:8]} sold {fraction:.0%}; closing the live position")
                     self.ex.copy_execute_exit(pos, wallet, sig, fraction, 0, sol_price)
         for pos in list(self.st["positions"]):
@@ -1587,7 +1597,7 @@ class ScoutLane:
             if pos["wallet"] == CONVERGENCE:
                 # The group's first full exit ends the convergence: the same rule production
                 # applies to any followed wallet selling a coin it holds.
-                if wallet in (pos.get("wallets") or []) and fraction >= cfg.copy_full_sell_fraction:
+                if wallet in (pos.get("wallets") or []) and fraction >= cfg.copy_full_sell_fraction and not predates(pos, "opened_ts"):
                     pos["exit_wallet"] = wallet
                     self.shadow_exit(pos, 1.0, "convergence_member_sell", sol_price)
                 continue

@@ -100,6 +100,34 @@ class FunnelTests(unittest.TestCase):
         self.assertEqual(len(live), 1)
         self.assertEqual(sorted(live[0]["convergence_wallets"]), sorted([OTHER, THIRD]))
 
+    def test_a_member_sale_before_our_entry_does_not_close_the_live_position(self):
+        executor, ex = self.setup()
+        self.seed(ex, OTHER, state="shadow")
+        self.seed(ex, THIRD, state="shadow")
+        now = time.time()
+        self.buy(ex.scout, OTHER, "a", ts=now - 20)
+        self.buy(ex.scout, THIRD, "b", ts=now - 10)
+        live = [p for p in ex.state["positions"] if p.get("convergence")]
+        self.assertEqual(len(live), 1)
+        closed = []
+        ex.copy_execute_exit = lambda pos, wallet, sig, fraction, target, sol_price, attempt=1: closed.append(wallet) or True
+        ex.scout.shadow_follow_sell(THIRD, MINT, 1.0, SOL, "old-sell", int(now - 120))   # sold before we bought
+        self.assertEqual(closed, [])
+        ex.scout.shadow_follow_sell(THIRD, MINT, 1.0, SOL, "new-sell", int(now + 5))
+        self.assertEqual(closed, [THIRD])
+
+    def test_an_empty_balance_right_after_our_buy_is_retried_not_booked_as_a_loss(self):
+        executor, ex = self.setup()
+        ex.cfg.mode = "live"
+        pos = {"mint": MINT, "tokens": 1000, "position_usd": 8.0, "peak_usd": 8.0, "opened_ts": time.time() - 2,
+               "opened_at": "t", "copy": WALLET, "buy_signature": "sig"}
+        ex.state["positions"] = [pos]
+        ex.sellable = lambda mint, tracked: 0
+        with self.assertRaises(RuntimeError):
+            ex.close_position(pos, "copy_sell", SOL)
+        self.assertEqual(ex.state["positions"], [pos])
+        self.assertEqual(ex.state["daily"]["realized_pnl_usd"], 0.0)
+
     # -- scout: hold time and reject counts ---------------------------------------------------
     def test_hold_time_is_a_five_minute_gate_and_only_sniper_farms_are_rejected(self):
         executor, ex = self.setup()

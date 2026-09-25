@@ -611,6 +611,7 @@ def save_state(state: dict[str, Any]) -> None:
     tmp.replace(STATE_FILE)
 
 
+ZERO_BALANCE_GRACE_SECONDS = 120.0   # an empty balance this soon after our buy is RPC lag, not a sale
 JEV_CALL_COLUMNS = ["ts", "key", "questions", "route", "latency_ms", "input_tokens", "output_tokens", "answers", "error"]
 
 
@@ -3837,6 +3838,12 @@ class Executor:
             mb = 0.0  # too small to be worth the rent it would lock
         if self.cfg.mode == "live":
             amount = self.sellable(mint, int(pos["tokens"]))
+            age = now_ts() - float(pos.get("opened_ts") or 0)
+            if amount <= 0 and age < ZERO_BALANCE_GRACE_SECONDS and pos.get("buy_signature") not in ("adopted", ""):
+                # Seconds after our own buy the RPC can still show an empty balance. Closing
+                # now would book the whole position as lost (3qm8L: -100% one second after
+                # entry, which tripped the daily stop); fail instead, and the exit is retried.
+                raise RuntimeError(f"bought {age:.0f}s ago and the tokens are not visible on-chain yet; retrying the exit")
             if amount <= 0:
                 # A previous sell most likely landed after our confirmation timeout. Record the
                 # close at the last quoted value so the trade log stays complete, and flag it.
