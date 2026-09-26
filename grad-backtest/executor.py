@@ -295,6 +295,13 @@ class Config:
         # 0 for either disables it.
         self.moon_bag_trail_arm_x = max(0.0, float(os.getenv("MOON_BAG_TRAIL_ARM_X", "3")))
         self.moon_bag_trail = min(0.95, max(0.0, float(os.getenv("MOON_BAG_TRAIL", "0.40"))))
+        # A bag whose sell keeps failing (a drained pool, a simulation error) would otherwise be
+        # re-quoted and re-attempted every MOON_BAG_CHECK_SECONDS forever, spending the shared
+        # Jupiter budget that exits need. Back off exponentially instead. 0 disables the backoff.
+        self.moon_bag_sell_retry_seconds = max(0.0, float(os.getenv("MOON_BAG_SELL_RETRY_SECONDS", "900")))
+        self.moon_bag_sell_retry_max_seconds = max(
+            self.moon_bag_sell_retry_seconds, float(os.getenv("MOON_BAG_SELL_RETRY_MAX_SECONDS", "86400"))
+        )
         # A bag worth less than MIN_MOON_BAG_USD is not worth its own rent (0.002 SOL) and is
         # sold with the rest. A bag that has fallen to MOON_BAG_DEAD_PCT of the value it was kept
         # at is burned and its account closed: the rent is worth more than the tokens.
@@ -513,6 +520,19 @@ class Config:
         self.copy_hold_profit_ratchet = parse_profit_ratchet(
             os.getenv("COPY_HOLD_PROFIT_RATCHET", "1.00:0.40,2.50:1.50,5.00:3.20")
         )
+        # Never queue or decode a source event older than this. A buy older than
+        # COPY_MAX_TX_AGE_SECONDS can never be mirrored, and a sell older than the longest a
+        # position can live cannot apply to anything we could still hold -- so decoding it only
+        # spends RPC and log budget that exits need. Without this, copy_backfill paging a
+        # hyperactive wallet queued ~15,000 events up to 43 days old and ground through them at
+        # about 24 a minute for hours, every one ending in "too late to mirror".
+        # The exception is an adopted position: its acquisition time is unknown and it does follow
+        # an old sale, so the horizon defaults to the longest a position can live rather than
+        # something tighter. 0 disables it and restores decoding everything.
+        self.copy_max_event_age_seconds = max(0.0, float(
+            os.getenv("COPY_MAX_EVENT_AGE_SECONDS", "")
+            or max(self.copy_time_stop_minutes * 60.0, self.copy_hold_max_days * 86400.0)
+        ))
         # A followed wallet whose stack is large next to the pool takes the price down with it
         # when it leaves: EC2f5DnH's $5,300 and $18,800 buys were both stopped out at -33%
         # within seconds of its sell, with nothing we could have done at our latency. Before
@@ -850,6 +870,12 @@ def ratchet_floor_gain(steps: list[dict[str, float]], peak_gain: float) -> float
 
 def ratchet_text(steps: list[dict[str, float]]) -> str:
     return ",".join("+{:g}%->+{:g}%".format(s["peak"] * 100, s["floor"] * 100) for s in steps) or "off"
+
+
+def event_before_cutoff(block_time: Any, cutoff: float | None) -> bool:
+    """Is a source event older than the copy horizon? An undated event is never treated as stale:
+    without a timestamp there is no proof it cannot still be acted on."""
+    return bool(cutoff is not None and block_time and int(block_time) < cutoff)
 
 
 STABLE_MINTS = {
@@ -3036,6 +3062,9 @@ class Executor:
             # Discovery and decoding are separate steps. Every unseen row goes into a durable
             # per-wallet inbox first (so a moved cursor or a restart can never lose it), then the
             # inbox is worked oldest-first under the decode budget.
+            horizon = cfg.copy_max_event_age_seconds
+            cutoff = now_ts() - horizon if horizon > 0 else None
+            self.prune_copy_inbox(wallet, cutoff, horizon)
             inbox = self.state.setdefault("copy_inbox", {}).setdefault(wallet, [])
             queued = {e["signature"] for e in inbox}
             for row in reversed(rows):
@@ -3046,7 +3075,10 @@ class Executor:
                 del seen[:-1000]
                 if row.get("err"):
                     continue
-                inbox.append({"signature": sig, "blockTime": row.get("blockTime")})
+                block_time = row.get("blockTime")
+                if event_before_cutoff(block_time, cutoff):
+                    continue
+                inbox.append({"signature": sig, "blockTime": block_time})
                 queued.add(sig)
             inbox.sort(key=lambda e: int(e.get("blockTime") or 0))
             budget = cfg.copy_decode_budget
@@ -3056,6 +3088,20 @@ class Executor:
                 self.copy_fetch_and_handle(wallet, entry["signature"], entry.get("blockTime"), sol_price, allow_buys)
             if inbox:
                 log(f"COPY {wallet[:8]}: {len(inbox)} discovered event(s) still queued for the next poll")
+
+    def prune_copy_inbox(self, wallet: str, cutoff: float | None, horizon: float) -> None:
+        """Drop queued source events that can no longer be acted on, so an inherited backlog or a
+        backfill that paged deep into history is discarded instead of decoded for hours. An event
+        with no timestamp is kept: it cannot be proved stale."""
+        if cutoff is None:
+            return
+        inbox = (self.state.get("copy_inbox") or {}).get(wallet) or []
+        kept = [e for e in inbox if not event_before_cutoff(e.get("blockTime"), cutoff)]
+        if len(kept) == len(inbox):
+            return
+        log(f"COPY {wallet[:8]}: dropped {len(inbox) - len(kept)} queued event(s) older than "
+            f"{horizon / 86400:.0f}d; too old to mirror or to apply to a position we could hold")
+        self.state.setdefault("copy_inbox", {})[wallet] = kept
 
     def copy_hold_mode(self, wallet: str) -> tuple[bool, str]:
         """Is `wallet` copied in hold mode, and why: listed in COPY_HOLD_WALLETS, or its measured
@@ -4492,22 +4538,41 @@ class Executor:
             trailing = (kept > 0 and self.cfg.moon_bag_trail > 0 and self.cfg.moon_bag_trail_arm_x > 0
                         and trail_peak >= kept * self.cfg.moon_bag_trail_arm_x
                         and value <= trail_peak * (1.0 - self.cfg.moon_bag_trail))
-            if kept > 0 and value >= kept * self.cfg.moon_bag_target_x:
+            target_hit = kept > 0 and value >= kept * self.cfg.moon_bag_target_x
+            if (target_hit or trailing) and not self.moon_bag_sell_due(bag):
+                continue        # backing off after a failed sell; the valuation above is still recorded
+            if target_hit:
                 try:
                     proceeds = self.sell_bag(bag, "moon_bags", "moon_bag_target", sol_price, quote)
                     log(f"MOONBAG TARGET {bag['mint']}: worth ${value:,.2f} = {value / kept:.0f}x the ${kept:.2f} kept; sold for ${proceeds:,.2f}")
                 except Exception as exc:
-                    log(f"WARN moon bag {bag['mint']} hit {value / kept:.0f}x but sell failed: {describe_error(exc)}")
+                    self.moon_bag_sell_failed(bag, exc)
             elif trailing:
                 try:
                     proceeds = self.sell_bag(bag, "moon_bags", "moon_bag_trail", sol_price, quote)
                     log(f"MOONBAG TRAIL {bag['mint']}: peaked at ${trail_peak:,.2f} ({trail_peak / kept:.1f}x the ${kept:.2f} kept), "
                         f"fell {1 - value / trail_peak:.0%}; sold for ${proceeds:,.2f}")
                 except Exception as exc:
-                    log(f"WARN moon bag {bag['mint']} trail hit but sell failed: {describe_error(exc)}")
+                    self.moon_bag_sell_failed(bag, exc)
             elif kept > 0 and self.cfg.moon_bag_dead_pct > 0 and value < kept * self.cfg.moon_bag_dead_pct / 100:
                 self.burn_dead_bag(bag, value)
         save_state(self.state)
+
+    def moon_bag_sell_due(self, bag: dict[str, Any]) -> bool:
+        """Is a bag out of its post-failure backoff? Always true when nothing has failed."""
+        if self.cfg.moon_bag_sell_retry_seconds <= 0:
+            return True
+        return now_ts() >= float(bag.get("sell_retry_ts") or 0.0)
+
+    def moon_bag_sell_failed(self, bag: dict[str, Any], exc: Exception) -> None:
+        """Record a failed bag sell and back off exponentially, so one undeliverable bag cannot
+        spend the Jupiter budget every check for the rest of the deployment."""
+        bag["sell_failures"] = int(bag.get("sell_failures") or 0) + 1
+        base = self.cfg.moon_bag_sell_retry_seconds
+        delay = min(base * (2 ** (bag["sell_failures"] - 1)), self.cfg.moon_bag_sell_retry_max_seconds)
+        bag["sell_retry_ts"] = now_ts() + delay
+        log(f"WARN moon bag {bag['mint']} sell failed ({bag['sell_failures']}x), "
+            f"next attempt in {delay / 60:.0f}m: {describe_error(exc)}")
 
     def burn_dead_bag(self, bag: dict[str, Any], value: float) -> None:
         """A bag worth a few cents is not worth a swap; burn it and take the rent back."""
