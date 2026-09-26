@@ -18,6 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # omitted from the container by an outdated hand-maintained file list.
 COPY grad-backtest/*.py ./
 COPY grad-backtest/mm mm
+COPY grad-backtest/evm evm
 RUN cd mm/sidecar && npm ci --omit=dev --no-audit --no-fund && node -e "require('@meteora-ag/dlmm')"
 COPY grad-backtest/static static
 COPY grad-backtest/data/graduations.example.csv data/
