@@ -1032,7 +1032,9 @@ class LadderTests(unittest.TestCase):
         self.assertEqual(xcfg.take_profit, float("inf"))
         self.assertEqual(xcfg.trailing_stop, 0.40)
         self.assertEqual(executor.tp_text(4.0, xcfg), "tp_value=none(runner, trail 40%)")
-        self.assertEqual(executor.stop_text(4.0, 7.6, xcfg), "sl_value=$4.00(breakeven)")
+        # The profit ratchet's first step (+56% peak -> +20% floor) locks $4.80, above the $4.00
+        # breakeven floor, so it is the stop this runner is actually on.
+        self.assertEqual(executor.stop_text(4.0, 7.6, xcfg), "sl_value=$4.80(ratchet +20%)")
         at(0.10)                                       # 10x: nothing caps the runner
         self.assertIn(pos, ex.state["positions"])
         at(0.065)                                      # 35% off its peak: still riding

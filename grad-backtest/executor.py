@@ -274,6 +274,8 @@ class Config:
         # Breakeven floor, off for every lane except copy (see COPY_BREAKEVEN_ARM).
         self.breakeven_arm = 0.0
         self.breakeven_floor = 0.0
+        # Ratcheting profit floor, off for every lane except copy (see COPY_PROFIT_RATCHET).
+        self.profit_ratchet: list[dict[str, float]] = []
         # Never sell the whole position: a slice stays in the wallet in case the token runs
         # after the exit. MOON_BAG=0 restores full exits.
         # 10% of a winning exit is the lottery ticket: 28 bags kept from losing exits in one
@@ -487,6 +489,30 @@ class Config:
         self.copy_hold_stop_loss = min(0.95, max(0.05, float(os.getenv("COPY_HOLD_STOP_LOSS", "0.40"))))
         self.copy_hold_max_days = float(os.getenv("COPY_HOLD_MAX_DAYS", "7"))
         self.copy_breakeven_floor = float(os.getenv("COPY_BREAKEVEN_FLOOR", "0.0"))
+        # Ratcheting profit floor: once a copied position has been up `peak`, it never exits below
+        # `floor`. The single breakeven step above only ever protects entry, so a coin that ran to
+        # +150% and died still gave all of it back; and hold mode (COPY_HOLD_WALLETS) disabled both
+        # the breakeven floor and the trailing stop, leaving a position that follows a wallet's
+        # sells with nothing but a -COPY_HOLD_STOP_LOSS backstop for COPY_HOLD_MAX_DAYS. The ratchet
+        # is monotonic in the peak and sets no take-profit, so it protects a gain that already
+        # happened without ever selling a runner for a fixed multiple.
+        #
+        # The first step sits at +56% on purpose: that is the measured line from the first 38 copied
+        # positions, every one of which that passed +56% ended a winner, and none that stalled below
+        # +30% came back. Flooring below it would shake out the runners COPY_RUNNER_TRAIL exists to
+        # ride (HhcfXbZ2 went 12x). Above it the ratchet only ever locks more than the trail does,
+        # since decide_exit keeps whichever floor is higher. Empty disables it.
+        # NOTE: these steps are a hypothesis anchored to that 38-position sample, not a fitted
+        # optimum. Re-derive them from live_trades.csv before treating them as tuned.
+        self.copy_profit_ratchet = parse_profit_ratchet(
+            os.getenv("COPY_PROFIT_RATCHET", "0.56:0.20,1.20:0.70,2.50:1.50,5.00:3.20")
+        )
+        # Hold mode gets a wider ratchet: a wallet that holds for days (frankdegods averages 327 h)
+        # swings far more than a scalped copy, so the floor only engages after a genuine run. It
+        # still refuses to hand a doubled position back down to a loss.
+        self.copy_hold_profit_ratchet = parse_profit_ratchet(
+            os.getenv("COPY_HOLD_PROFIT_RATCHET", "1.00:0.40,2.50:1.50,5.00:3.20")
+        )
         # A followed wallet whose stack is large next to the pool takes the price down with it
         # when it leaves: EC2f5DnH's $5,300 and $18,800 buys were both stopped out at -33%
         # within seconds of its sell, with nothing we could have done at our latency. Before
@@ -783,6 +809,47 @@ def parse_sell_ladder(spec: str) -> list[dict[str, float]]:
 
 def ladder_text(rungs: list[dict[str, float]]) -> str:
     return ",".join("{:g}x:{:g}%".format(r["x"], r["pct"]) for r in rungs) or "off"
+
+
+def parse_profit_ratchet(spec: str) -> list[dict[str, float]]:
+    """"0.35:0.10,0.6:0.3" -> [{"peak": 0.35, "floor": 0.1}, ...]: once a position has been up
+    `peak` from its basis it never exits below `floor`. Both are fractions of the basis (a "%"
+    suffix divides by 100). Sorted by peak; a step whose floor is not strictly below its own peak
+    is dropped, since it would fire the moment the peak is set. Empty disables the ratchet.
+
+    This is the monotonic form of the breakeven floor: it protects a gain that already happened
+    without capping the upside, so a runner is never sold for a fixed multiple."""
+    steps = []
+    for part in str(spec or "").split(","):
+        if ":" not in part:
+            continue
+        peak_text, floor_text = part.split(":", 1)
+
+        def gain(text: str) -> float:
+            text = text.strip()
+            value = float(text[:-1]) / 100.0 if text.endswith("%") else float(text)
+            return value
+
+        try:
+            peak, floor = gain(peak_text), gain(floor_text)
+        except ValueError:
+            continue
+        if peak > 0 and 0 <= floor < peak:
+            steps.append({"peak": peak, "floor": floor})
+    return sorted(steps, key=lambda s: s["peak"])
+
+
+def ratchet_floor_gain(steps: list[dict[str, float]], peak_gain: float) -> float | None:
+    """The gain the ratchet locks in at this peak, or None while it is unarmed."""
+    floor = None
+    for step in steps:
+        if peak_gain >= step["peak"]:
+            floor = step["floor"] if floor is None else max(floor, step["floor"])
+    return floor
+
+
+def ratchet_text(steps: list[dict[str, float]]) -> str:
+    return ",".join("+{:g}%->+{:g}%".format(s["peak"] * 100, s["floor"] * 100) for s in steps) or "off"
 
 
 STABLE_MINTS = {
@@ -1265,6 +1332,13 @@ def decide_exit(
     if (breakeven_arm > 0 and peak_usd and peak_usd >= entry_usd * (1.0 + breakeven_arm)
             and current_usd <= entry_usd * (1.0 + float(getattr(cfg, "breakeven_floor", 0.0) or 0.0))):
         return "breakeven_stop"
+    # The ratchet is the multi-step form of that floor and stays armed in hold mode, where the
+    # breakeven floor is deliberately off. Checked after the trail so a crash names the higher stop.
+    ratchet = getattr(cfg, "profit_ratchet", None) or []
+    if ratchet and peak_usd and entry_usd > 0:
+        floor_gain = ratchet_floor_gain(ratchet, peak_usd / entry_usd - 1.0)
+        if floor_gain is not None and current_usd <= entry_usd * (1.0 + floor_gain):
+            return "profit_floor"
     if now - opened_ts >= cfg.time_stop_minutes * 60:
         return "time_stop"
     return None
@@ -1278,15 +1352,22 @@ def tp_text(basis: float, cfg: Config) -> str:
 
 
 def stop_text(basis: float, peak: float, cfg: Config) -> str:
-    """The stop a position is actually on, for the POSITION log line: the stop loss, or the
-    breakeven floor once the position has been up far enough to arm it."""
+    """The stop a position is actually on, for the POSITION log line: the stop loss, or the highest
+    armed profit floor sitting above it (the breakeven step, then the ratchet)."""
     stop = basis * (1.0 - cfg.stop_loss)
+    label = ""
     arm = float(getattr(cfg, "breakeven_arm", 0.0) or 0.0)
     if arm > 0 and peak >= basis * (1.0 + arm):
         floor = basis * (1.0 + float(getattr(cfg, "breakeven_floor", 0.0) or 0.0))
         if floor > stop:
-            return f"sl_value=${floor:.2f}(breakeven)"
-    return f"sl_value=${stop:.2f}"
+            stop, label = floor, "breakeven"
+    peak_gain = (peak / basis - 1.0) if basis > 0 else 0.0
+    ratchet_gain = ratchet_floor_gain(getattr(cfg, "profit_ratchet", None) or [], peak_gain)
+    if ratchet_gain is not None:
+        floor = basis * (1.0 + ratchet_gain)
+        if floor > stop:
+            stop, label = floor, "ratchet +{:g}%".format(ratchet_gain * 100)
+    return f"sl_value=${stop:.2f}({label})" if label else f"sl_value=${stop:.2f}"
 
 
 class Rpc:
@@ -2894,12 +2975,17 @@ class Executor:
         if prefix == "copy":
             cfg.breakeven_arm = self.cfg.copy_breakeven_arm
             cfg.breakeven_floor = self.cfg.copy_breakeven_floor
+            cfg.profit_ratchet = self.cfg.copy_profit_ratchet
         if pos.get("hold_with_source"):
-            # The wallet's sells are the exits; only a wide stop and a long time stop remain.
+            # The wallet's sells are the exits; of our own machinery only the wide stop, the long
+            # time stop and the profit ratchet remain. The ratchet is what makes hold mode safe: it
+            # still never caps the upside or sells before the wallet does on the way up, but a pop
+            # that the wallet rides back down cannot turn into a loss.
             cfg.take_profit = float("inf")
             cfg.stop_loss = self.cfg.copy_hold_stop_loss
             cfg.trailing_stop = 0.0
             cfg.breakeven_arm = 0.0
+            cfg.profit_ratchet = self.cfg.copy_hold_profit_ratchet
             cfg.time_stop_minutes = self.cfg.copy_hold_max_days * 1440
             return cfg
         if pos.get("ladder"):

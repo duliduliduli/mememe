@@ -332,9 +332,14 @@ class HoldModeTests(unittest.TestCase):
         self.assertEqual(xcfg.time_stop_minutes, 7 * 1440)
         basis = pos["position_usd"]
         now = time.time()
-        # +100% then a 45% pullback from the peak, and a trip back to entry: nothing fires.
+        # +100% and still there: nothing fires. Then a 45% pullback from that peak, which the hold
+        # ratchet (COPY_HOLD_PROFIT_RATCHET, first step +100% peak -> +40% floor) refuses to give
+        # back: following a wallet's sells is not a licence to ride a doubled position into a loss.
         self.assertIsNone(executor.decide_exit(basis, basis * 2.0, now - 86400, now, xcfg, basis * 2.0))
-        self.assertIsNone(executor.decide_exit(basis, basis * 1.1, now - 86400, now, xcfg, basis * 2.0))
+        self.assertEqual(executor.decide_exit(basis, basis * 1.1, now - 86400, now, xcfg, basis * 2.0),
+                         "profit_floor")
+        # A +30% peak is below the hold ratchet's first step, so a trip back to entry still rides:
+        # a wallet that holds for days swings through that without the position being a lost cause.
         self.assertIsNone(executor.decide_exit(basis, basis * 0.99, now - 3 * 86400, now, xcfg, basis * 1.3))
         self.assertEqual(executor.decide_exit(basis, basis * 0.59, now, now, xcfg, basis), "stop_loss")
         # The wallet's own sells are the exit: a trim trims ours, a full sale closes it.
