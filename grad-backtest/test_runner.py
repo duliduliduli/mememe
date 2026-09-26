@@ -49,6 +49,10 @@ class WatchlistTests(unittest.TestCase):
         self.addCleanup(p.stop)
         ex = executor.Executor(executor.Config())
         ex.rpc.token_supply_details = lambda mint: (1_000_000_000.0, 6, 1_000_000_000 * 10 ** 6)
+        # The dead-tape gate reads the chain; these tests price the watchlist from a stubbed feed
+        # and must stay offline, so the tape is unreadable and the gate has to fail open. The
+        # gate's own behaviour is covered in test_tape_gate.py.
+        ex.rpc.tape_activity = lambda mint, window_seconds, limit=50: None
         return executor, ex
 
     def test_watch_is_bounded_and_deduplicated(self):

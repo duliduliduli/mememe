@@ -368,6 +368,23 @@ class Config:
         self.runner_stop_loss = float(os.getenv("RUNNER_STOP_LOSS", "0.30"))
         self.runner_trailing_stop = float(os.getenv("RUNNER_TRAILING_STOP", "0.25"))
         self.runner_time_stop_minutes = float(os.getenv("RUNNER_TIME_STOP_MINUTES", "240"))
+        # Band and momentum are both read off one Jupiter price sample a minute, and on a thin
+        # pool a single buy moves that sample: the price feed cannot tell a crowd from one wallet
+        # with $500. So an entry also has to show a live tape — RUNNER_MIN_TAPE_TXS successful
+        # transactions touching the mint inside RUNNER_TAPE_WINDOW_SECONDS — counted from
+        # signature metadata alone (one getSignaturesForAddress per token, no bodies) and only
+        # for a token already in band with momentum, at most RUNNER_TAPE_BUDGET reads a cycle so
+        # the lane never competes with the exits for provider budget. A read that raises, or a
+        # node that answers with no signature data at all, is logged and the entry allowed: a
+        # provider hiccup must not silently switch the runner lane off, which is what failing
+        # closed would do. A genuinely dead token answers with OLD rows, so the two are separable.
+        self.runner_min_tape_txs = max(0, int(os.getenv("RUNNER_MIN_TAPE_TXS", "8")))
+        self.runner_tape_window_seconds = max(30.0, float(os.getenv("RUNNER_TAPE_WINDOW_SECONDS", "300")))
+        self.runner_tape_budget = max(0, int(os.getenv("RUNNER_TAPE_BUDGET", "3")))
+        # Unique buying wallets instead of transactions, which one wallet spamming itself passes.
+        # Counting them needs the transaction bodies (~limit/RPC_BATCH_SIZE batched calls a
+        # token), an order of magnitude more than the signature count, so it is opt-in.
+        self.runner_tape_unique_buyers = max(0, int(os.getenv("RUNNER_TAPE_UNIQUE_BUYERS", "0")))
         self.jupiter_price_url = os.getenv("JUPITER_PRICE_URL", "https://lite-api.jup.ag/price/v3").rstrip("/")
         # Copy mode: mirror the buys of chosen wallets. COPY_WALLETS lists their addresses; each
         # is polled every COPY_POLL_SECONDS for new signatures and every new transaction is
@@ -1655,6 +1672,35 @@ class Rpc:
                 break
         return count
 
+    def tape_activity(self, mint: str, window_seconds: float, limit: int = 50) -> dict[str, Any] | None:
+        """Successful transactions touching `mint` in the last `window_seconds`, from signature
+        metadata only: one call, no bodies, which is what makes it cheap enough to ask about a
+        token every time the runner lane considers buying it. Rows come newest first, so a page
+        that reaches back past the window is an exact count and one that is still full of
+        in-window rows is a lower bound (`complete` says which) — enough for a floor, since the
+        limit is always well above it. None when no row carried a blockTime, including an empty
+        page: a dead token answers with OLD rows, so "no data at all" means the read is unusable
+        rather than that nobody traded."""
+        since = now_ts() - window_seconds
+        page = self.call("getSignaturesForAddress", [mint, {"limit": limit, "commitment": "confirmed"}])
+        if not isinstance(page, list):
+            raise RuntimeError("mint signature data incomplete")
+        times = [float(r["blockTime"]) for r in page if isinstance(r, dict) and r.get("blockTime") is not None]
+        if not times:
+            return None
+        txs = sum(
+            1 for r in page
+            if isinstance(r, dict) and r.get("err") is None and r.get("blockTime") is not None
+            and float(r["blockTime"]) >= since - 2
+        )
+        return {
+            "tx_count": txs,
+            "window_seconds": window_seconds,
+            "newest_ts": max(times),
+            "oldest_ts": min(times),
+            "complete": len(page) < limit or min(times) < since - 2,
+        }
+
     def creator_profile(self, creator: str, mint: str, before_ts: float) -> dict[str, Any]:
         """Prior Pump.fun launches by this creator, from a bounded sample of its history before
         this launch, cached for a day. Counts verified Create instructions only, so it never
@@ -1711,6 +1757,40 @@ class Rpc:
         are ignored: the pool's vault drains on every buy and the BOOST burn empties a vault.
         None when no wallet has sold."""
         exclude = exclude or set()
+        net = self._token_balance_deltas(self._mint_transaction_bodies(mint, since_ts, limit), mint)
+        sellers = {owner: -delta for owner, delta in net.items() if delta < 0 and owner not in exclude}
+        if not sellers or supply_raw <= 0:
+            return None
+        candidates = sorted(sellers.items(), key=lambda item: item[1], reverse=True)[:10]
+        accounts = self.call(
+            "getMultipleAccounts", [[owner for owner, _ in candidates], {"encoding": "base64"}]
+        ).get("value") or []
+        for (owner, sold), acct in zip(candidates, accounts):
+            program = acct["owner"] if acct else SYSTEM_PROGRAM
+            if program == SYSTEM_PROGRAM:
+                return owner, sold / supply_raw * 100
+        return None
+
+    def unique_buyers_since(self, mint: str, since_ts: float, limit: int = 40) -> int | None:
+        """Distinct plain wallets whose `mint` balance grew in a successful transaction since
+        `since_ts`. Unlike the signature count this costs the transaction bodies, so it is only
+        worth asking of a token that is already about to be bought. Program-owned accounts are
+        dropped because the pool's vault RECEIVES tokens on every sell: keeping it would read one
+        dump as a crowd of buyers. None when there was nothing to decode, which a caller should
+        treat as unknown rather than as zero."""
+        bodies = self._mint_transaction_bodies(mint, since_ts, limit)
+        if not bodies:
+            return None
+        buyers = sorted(o for o, delta in self._token_balance_deltas(bodies, mint).items() if delta > 0)
+        if not buyers:
+            return 0
+        accounts = self.call("getMultipleAccounts", [buyers, {"encoding": "base64"}]).get("value") or []
+        return sum(1 for acct in accounts if (acct["owner"] if acct else SYSTEM_PROGRAM) == SYSTEM_PROGRAM)
+
+    def _mint_transaction_bodies(self, mint: str, since_ts: float, limit: int) -> list[Any]:
+        """Decoded bodies of the successful transactions that touched `mint` since `since_ts`:
+        one signature page plus about `limit`/RPC_BATCH_SIZE batched getTransaction calls, the
+        expensive half of any tape read."""
         page = self.call("getSignaturesForAddress", [mint, {"limit": limit, "commitment": "confirmed"}])
         if not isinstance(page, list):
             raise RuntimeError("mint signature data incomplete")
@@ -1719,8 +1799,6 @@ class Rpc:
             if isinstance(r, dict) and r.get("signature") and r.get("err") is None
             and (r.get("blockTime") or 0) >= since_ts - 2
         ]
-        if not rows:
-            return None
         calls = [
             ("getTransaction", [r["signature"], {"encoding": "jsonParsed", "commitment": "confirmed",
                                                 "maxSupportedTransactionVersion": MAX_TX_VERSION}])
@@ -1732,6 +1810,10 @@ class Rpc:
                 calls[start:start + self.cfg.rpc_batch_size],
                 timeout=self.cfg.bundle_lookup_timeout_ms / 1000 * 2,
             ))
+        return bodies
+
+    def _token_balance_deltas(self, bodies: list[Any], mint: str) -> dict[str, int]:
+        """Net raw `mint` change per owning wallet across decoded transaction bodies."""
         net: dict[str, int] = {}
         for body in bodies:
             if not isinstance(body, dict):
@@ -1751,18 +1833,7 @@ class Rpc:
                     balances[idx] = (owner, pre, amount)
             for owner, pre, post in balances.values():
                 net[owner] = net.get(owner, 0) + (post - pre)
-        sellers = {owner: -delta for owner, delta in net.items() if delta < 0 and owner not in exclude}
-        if not sellers or supply_raw <= 0:
-            return None
-        candidates = sorted(sellers.items(), key=lambda item: item[1], reverse=True)[:10]
-        accounts = self.call(
-            "getMultipleAccounts", [[owner for owner, _ in candidates], {"encoding": "base64"}]
-        ).get("value") or []
-        for (owner, sold), acct in zip(candidates, accounts):
-            program = acct["owner"] if acct else SYSTEM_PROGRAM
-            if program == SYSTEM_PROGRAM:
-                return owner, sold / supply_raw * 100
-        return None
+        return net
 
     def plain_wallet_holders(
         self, mint: str, exclude: set[str] | None = None, limit: int = 20
@@ -2979,11 +3050,87 @@ class Executor:
         if not candidates:
             return
         candidates.sort(key=lambda c: -c[0])
-        for gain_pct, w, mcap in candidates[: cfg.max_entries_per_cycle]:
-            log(f"RUNNER {w['mint']}: market cap ${mcap:,.0f} in band, +{gain_pct:.0f}% over {cfg.runner_momentum_minutes:.0f}m; entering")
+        gate = cfg.runner_min_tape_txs > 0
+        reads = cfg.runner_tape_budget if cfg.runner_tape_budget > 0 else len(candidates)
+        entered = 0
+        for gain_pct, w, mcap in candidates:
+            if entered >= cfg.max_entries_per_cycle:
+                break
+            tape_note = "tape=off"
+            if gate:
+                # A token already refused for a dead tape is not read again until its window has
+                # moved on: at one check a minute it would otherwise eat the whole budget and
+                # starve the live token ranked below it, which is the one worth buying.
+                if now - float(w.get("tape_refused_ts") or 0) < cfg.runner_tape_window_seconds:
+                    continue
+                if reads <= 0:
+                    log(f"RUNNER {w['mint']}: tape budget of {cfg.runner_tape_budget} read(s) a cycle spent; holding the entry")
+                    continue
+                reads -= 1
+                allowed, tape_note = self.runner_tape(w["mint"])
+                if not allowed:
+                    w["tape_refused_ts"] = now
+                    continue
+            entered += 1
+            log(f"RUNNER {w['mint']}: market cap ${mcap:,.0f} in band, +{gain_pct:.0f}% over "
+                f"{cfg.runner_momentum_minutes:.0f}m ({tape_note}); entering")
             watch.remove(w)
             self.enter_with_retry({"mint": w["mint"], "graduated_ts": int(w["graduated_ts"]), "enter_at": now, "runner": True,
                                    "runner_market_cap_usd": round(mcap), "runner_gain_pct": round(gain_pct, 1)}, sol_price)
+
+    def runner_tape(self, mint: str) -> tuple[bool, str]:
+        """Dead-tape verdict for a runner already in band with momentum: (allowed, note for the
+        entry log). One getSignaturesForAddress, no bodies, and only for a token about to enter,
+        so the gate costs at most RUNNER_TAPE_BUDGET calls a check and can never delay an exit.
+        Fails open: a read that raises, or a node that answers with no signature data, is logged
+        and the entry allowed, because a provider hiccup must not quietly switch the runner lane
+        off — which is exactly what refusing on an unreadable tape would do."""
+        cfg = self.cfg
+        if cfg.runner_min_tape_txs <= 0:
+            return True, "tape=off"
+        if now_ts() < float(getattr(self, "_provider_cooldown_until", 0.0)):
+            log(f"WARN RUNNER {mint}: RPC providers cooling down, tape unread; allowing the entry")
+            return True, "tape=provider-cooldown"
+        # The page has to reach well past the floor, or a busy tape would be cut off at the page
+        # edge and counted as dead.
+        limit = min(1000, max(25, cfg.runner_min_tape_txs * 3))
+        try:
+            tape = self.rpc.tape_activity(mint, cfg.runner_tape_window_seconds, limit=limit)
+        except Exception as exc:
+            log(f"WARN RUNNER {mint}: tape read failed ({describe_error(exc)}); allowing the entry")
+            return True, "tape=unreadable"
+        if tape is None:
+            log(f"WARN RUNNER {mint}: tape read returned no signature data; allowing the entry")
+            return True, "tape=no-data"
+        txs = int(tape.get("tx_count") or 0)
+        note = f"tape={txs}tx/{cfg.runner_tape_window_seconds:.0f}s{'' if tape.get('complete') else '+'}"
+        if txs < cfg.runner_min_tape_txs:
+            log(f"RUNNER {mint}: dead tape, {txs} successful transaction(s) in the last "
+                f"{cfg.runner_tape_window_seconds:.0f}s < {cfg.runner_min_tape_txs}; not entering")
+            return False, note
+        if cfg.runner_tape_unique_buyers > 0:
+            buyers = self.runner_unique_buyers(mint)
+            if buyers is not None:
+                note += f" buyers={buyers}"
+                if buyers < cfg.runner_tape_unique_buyers:
+                    log(f"RUNNER {mint}: {buyers} unique buying wallet(s) in the last "
+                        f"{cfg.runner_tape_window_seconds:.0f}s < {cfg.runner_tape_unique_buyers}; not entering")
+                    return False, note
+        return True, note
+
+    def runner_unique_buyers(self, mint: str) -> int | None:
+        """Distinct buying wallets behind a runner's tape, or None when they cannot be counted,
+        which the caller treats as a pass: the bodies cost a batched getTransaction per
+        RPC_BATCH_SIZE signatures, and losing that budget must not lose an entry the signature
+        count already cleared."""
+        try:
+            buyers = self.rpc.unique_buyers_since(mint, now_ts() - self.cfg.runner_tape_window_seconds)
+        except Exception as exc:
+            log(f"WARN RUNNER {mint}: unique-buyer read failed ({describe_error(exc)}); allowing the entry")
+            return None
+        if buyers is None:
+            log(f"WARN RUNNER {mint}: no transaction bodies to count unique buyers; allowing the entry")
+        return buyers
 
     def exit_cfg(self, pos: dict[str, Any]) -> "Config":
         """Exit thresholds for a position: runner and copied positions use their own settings."""
@@ -4799,6 +4946,9 @@ class Executor:
             f"runner={'only' if self.cfg.runner_only else ('on' if self.cfg.runner_enabled else 'off')}"
             f"(${self.cfg.runner_min_market_cap_usd:,.0f}-${self.cfg.runner_max_market_cap_usd:,.0f} "
             f"+{self.cfg.runner_min_gain_pct:.0f}%/{self.cfg.runner_momentum_minutes:.0f}m watch={self.cfg.runner_watch_hours:.0f}h "
+            f"tape>={self.cfg.runner_min_tape_txs}tx/{self.cfg.runner_tape_window_seconds:.0f}s"
+            f"(budget {self.cfg.runner_tape_budget or 'uncapped'}"
+            f"{f', buyers>={self.cfg.runner_tape_unique_buyers}' if self.cfg.runner_tape_unique_buyers > 0 else ''}) "
             f"tp=+{self.cfg.runner_take_profit:.0%} sl=-{self.cfg.runner_stop_loss:.0%} trail={self.cfg.runner_trailing_stop:.0%} "
             f"time_stop={self.cfg.runner_time_stop_minutes:.0f}m) "
             f"copy={'only,' if self.cfg.copy_only else ''}{len(self.cfg.copy_wallets)}wallets(min${self.cfg.copy_min_buy_usd:,.0f} "
