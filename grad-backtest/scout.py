@@ -119,6 +119,14 @@ class ScoutConfig:
         # Promotion on paper results: this many closed paper trades (baseline and 20 s stress
         # quotes), net positive at both, and a trade inside DEMOTE_IDLE_DAYS.
         self.promote_min_paper_fills = _env_int("PROMOTE_MIN_PAPER_FILLS", 5)
+        # The stress quote is the honest one -- it re-prices the entry 20s late, which is what we
+        # actually pay. Requiring only that the *stressed* trades net positive let a wallet
+        # promote on one lucky stress quote out of thirty baseline fills, and a wallet with no
+        # stress quote at all was judged on the baseline alone. This is the minimum number of
+        # closed paper fills that must carry a stress quote before the paper route can promote.
+        # Set it equal to PROMOTE_MIN_PAPER_FILLS for the strict reading; it defaults lower so a
+        # Jupiter 429 storm (which is what makes stress re-quotes fail) cannot stall the funnel.
+        self.promote_min_stress_fills = _env_int("PROMOTE_MIN_STRESS_FILLS", 3)
         # Demotion on our own results: after this many of our closed positions from a wallet
         # with a negative net, or no source trade in DEMOTE_IDLE_DAYS, it leaves the live set.
         self.demote_after_live_fills = _env_int("DEMOTE_AFTER_LIVE_FILLS", 10)
@@ -173,6 +181,13 @@ class ScoutConfig:
         self.quote_budget = _env_int("SCOUT_QUOTE_BUDGET", 6)                  # Jupiter quotes per poll
         self.stress_seconds = _env_float("SCOUT_STRESS_SECONDS", 20)
         self.fee_usd = _env_float("SCOUT_FEE_USD", 0.05)                       # network + priority fee per swap; quotes carry route fees and impact
+        # Token-account rent (~0.002 SOL) is charged on entry and only comes back if the reclaim
+        # lands, which it does not always. Shadow trades ignored it entirely, so every shadow P&L
+        # was optimistic by about 5% of a $5 ticket -- large enough to flip a marginal wallet's
+        # promotion. Charged one way, with no reclaim credited: when this number gates live money
+        # it is better to under-promote than to promote on a cost model that left a real cost out.
+        # 0 restores the old model.
+        self.rent_usd = _env_float("SCOUT_RENT_USD", 0.25)
         self.enrich_per_cycle = _env_int("SCOUT_ENRICH_PER_CYCLE", 30)
         # Quick screen before the full history pull: one 30d wallet_stats call (3 units instead
         # of about 90). A new wallet with less realized profit than this over 30 days, or an
@@ -923,11 +938,17 @@ class ScoutLane:
                 "stress_fills": len(stressed)}
 
     def paper_green(self, wallet: str, since: float | None = None) -> tuple[bool, str]:
-        """The paper route into the live set: enough closed paper fills, net positive at the
-        baseline quote and at the 20 s stress quote (when stress quotes exist)."""
+        """The paper route into the live set: enough closed paper fills, enough of them carrying a
+        20 s stress quote to be evidence rather than luck, and net positive at both the baseline
+        quote and the stress quote."""
         rec = self.paper_record(wallet, since)
         if rec["fills"] < self.cfg.promote_min_paper_fills:
             return False, f"{rec['fills']} paper fills (need {self.cfg.promote_min_paper_fills})"
+        # Checked before the stress P&L: with no stress quotes at all net_stress_usd is None, so
+        # this clause is the only thing standing between a baseline-only record and promotion.
+        if self.cfg.promote_min_stress_fills > 0 and rec["stress_fills"] < self.cfg.promote_min_stress_fills:
+            return False, (f"{rec['stress_fills']} of {rec['fills']} paper fills carry a 20s stress quote "
+                           f"(need {self.cfg.promote_min_stress_fills})")
         if rec["net_base_usd"] <= 0:
             return False, f"paper net {rec['net_base_usd']:+.2f} USD over {rec['fills']} fills"
         if rec["net_stress_usd"] is not None and rec["net_stress_usd"] <= 0:
@@ -1447,7 +1468,7 @@ class ScoutLane:
             return None
         pos = {"id": f"{wallet[:8]}:{sig[:16]}", "wallet": wallet, "mint": mint, "signature": sig, "source_usd": round(usd),
                "opened_ts": self.now(), "source_ts": int(block_time) if block_time else None, "latency_s": round(age, 1),
-               "size_usd": size, "cost_usd": round(size + self.cfg.fee_usd, 4), "tokens": tokens, "entry_tokens": tokens,
+               "size_usd": size, "cost_usd": round(size + self.cfg.fee_usd + self.cfg.rent_usd, 4), "tokens": tokens, "entry_tokens": tokens,
                "entry_basis_usd": size, "position_usd": size, "tokens_stress": None, "stress_due_ts": self.now() + self.cfg.stress_seconds,
                "stress_attempts": 0, "entry_price_impact_pct": impact, "entry_round_trip_pct": round(round_trip, 1),
                "ladder": [dict(r) for r in cfg.copy_ladder], "peak_usd": size, "last_value_usd": size, "realized_usd": 0.0,
@@ -1891,6 +1912,7 @@ def candidate_report(st: dict[str, Any], cfg: ScoutConfig, now: float) -> dict[s
     # Which filter keeps wallets out: every deciding gate that failed, counted over the
     # candidates not in the live set, plus what rejected the rejected ones.
     gate_failures: dict[str, int] = defaultdict(int)
+    gate_missing: dict[str, int] = defaultdict(int)
     rejected_by: dict[str, int] = defaultdict(int)
     for c in (st.get("candidates") or {}).values():
         ev = c.get("evaluation") or {}
@@ -1898,11 +1920,20 @@ def candidate_report(st: dict[str, Any], cfg: ScoutConfig, now: float) -> dict[s
             continue
         for name in ev.get("failed") or []:
             gate_failures[name] += 1
+        # `missing` rejects exactly as hard as `failed` (qualified = not failed and not
+        # missing_deciding), and it is what kills a wallet with no evidence at all -- a thin
+        # history, no episode with a first buy over the copy minimum, no leaderboard rank, no
+        # signed key for holdings. Counting only failures is how ~200 wallets came to look
+        # "unqualified on merit" when the deciding gates had never been answered.
+        for name in ev.get("missing") or []:
+            gate_missing[name] += 1
         if c.get("state") == "rejected":
             gates = ev.get("gates") or {}
             name = next((n for n in ("tags", "risk_flags", "sniper") if (gates.get(n) or {}).get("status") == "fail"), "other")
             rejected_by[name] += 1
-    return {"gate_failures": dict(sorted(gate_failures.items(), key=lambda kv: -kv[1])), "rejected_by": dict(rejected_by),
+    return {"gate_failures": dict(sorted(gate_failures.items(), key=lambda kv: -kv[1])),
+            "gate_missing": dict(sorted(gate_missing.items(), key=lambda kv: -kv[1])),
+            "rejected_by": dict(rejected_by),
             "policy_version": policy_key(cfg), "mode": cfg.mode, "live_switch": cfg.live, "elite_only": cfg.elite_only,
             "track": "fast" if cfg.fast_track else "full", "live_loss_budget_usd": cfg.live_loss_budget_usd,
             "counts": dict(counts), "candidates": rows, "shadow_positions": st.get("positions", []),
